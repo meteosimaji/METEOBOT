@@ -112,6 +112,8 @@ class MusicPlayer:
         self._playlist_loading: bool = False
 
         self.last_channel_id: int | None = None
+        self._connect_lock = asyncio.Lock()
+        self._auto_leave_task: asyncio.Task | None = None
 
     def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
         task = asyncio.create_task(coro)
@@ -124,20 +126,74 @@ class MusicPlayer:
 
         task.add_done_callback(_done)
 
-    async def join(self, channel: discord.VoiceChannel) -> None:
-        if self.voice and self.voice.channel and self.voice.channel.id == channel.id:
+    def sync_voice_client(self) -> None:
+        """Adopt an existing guild voice_client if we lost reference."""
+
+        vc = getattr(self.guild, "voice_client", None)
+        if vc and vc.is_connected():
+            if not self.voice or not self.voice.is_connected():
+                self.voice = vc
+            ch = getattr(vc, "channel", None)
+            if ch:
+                self.last_channel_id = ch.id
+
+    async def _safe_voice_play(self, source: discord.AudioSource, *, after) -> None:
+        """Play on the voice client, retrying once if it disconnects mid-call."""
+
+        self.sync_voice_client()
+        if not self.voice or not self.voice.is_connected():
+            self.voice = None
+            if not await self.ensure_connected():
+                raise VoiceConnectionError("Not connected to voice (ensure_connected failed)")
+
+        try:
+            self.voice.play(source, after=after)  # type: ignore[union-attr]
             return
-        if self.voice:
-            await self.voice.move_to(channel)
-            log.info("Moved to voice channel %s", channel.id)
-        else:
+        except discord.ClientException as exc:
+            if "Not connected to voice" not in str(exc):
+                raise
+
+        log.warning("Not connected at voice.play(); reconnecting once and retrying")
+        self.voice = None
+        if not await self.ensure_connected():
+            raise VoiceConnectionError("Not connected to voice after retry")
+        self.voice.play(source, after=after)  # type: ignore[union-attr]
+
+    async def join(self, channel: discord.VoiceChannel) -> None:
+        async with self._connect_lock:
+            self.last_channel_id = channel.id
+
+            # If we still hold a disconnected VoiceClient, drop it to avoid stale state.
+            if self.voice and not self.voice.is_connected():
+                try:
+                    await self.voice.disconnect(force=True)
+                except Exception:
+                    pass
+                self.voice = None
+
+            # Already connected to the correct channel.
+            if (
+                self.voice
+                and self.voice.channel
+                and self.voice.channel.id == channel.id
+                and self.voice.is_connected()
+            ):
+                return
+
+            # Connected elsewhere: move.
+            if self.voice and self.voice.is_connected():
+                await self.voice.move_to(channel)
+                log.info("Moved to voice channel %s", channel.id)
+                return
+
             try:
-                self.voice = await channel.connect()
+                self.voice = await channel.connect(reconnect=True, timeout=15.0, self_deaf=True)
             except (asyncio.TimeoutError, discord.DiscordException) as exc:
                 log.exception("Failed to connect to voice channel %s", channel.id)
                 raise VoiceConnectionError(f"Failed to connect to voice channel {channel.id}") from exc
+
             log.info("Joined voice channel %s", channel.id)
-        self.last_channel_id = channel.id
+            self._request_auto_leave_check()
 
     def create_source(self, track: Track, *, seek: float = 0.0) -> discord.AudioSource:
         """Create a Discord AudioSource from a Track.
@@ -260,9 +316,15 @@ class MusicPlayer:
 
     async def play_next(self) -> None:
         async with self._play_lock:
+            if self.voice and not self.voice.is_connected():
+                log.warning("VoiceClient exists but is disconnected; resetting and reconnecting")
+                self.voice = None
+                if not await self.ensure_connected():
+                    return
             if self.voice is None:
                 if not await self.ensure_connected():
                     return
+            self._cancel_auto_leave_task()
             if self.voice.is_playing() or self.voice.is_paused():
                 return
 
@@ -280,6 +342,8 @@ class MusicPlayer:
                 log.info("Queue ended")
                 if self.auto_leave and not self._playlist_loading:
                     await self.cleanup()
+                else:
+                    self._request_auto_leave_check()
                 return
 
             log.info("Now playing: %s (%s)", track.title, track.page_url)
@@ -294,7 +358,11 @@ class MusicPlayer:
                 loop = self.bot.loop
                 loop.call_soon_threadsafe(self._spawn, self.after_play(e))
 
-            self.voice.play(source, after=_after)
+            try:
+                await self._safe_voice_play(source, after=_after)
+            except VoiceConnectionError:
+                log.error("Failed to start playback: voice connection unavailable")
+                return
 
     async def after_play(self, error: Exception | None) -> None:
         if self.ignore_after:
@@ -403,10 +471,15 @@ class MusicPlayer:
             loop = self.bot.loop
             loop.call_soon_threadsafe(self._spawn, self.after_play(e))
 
-        self.voice.play(source, after=_after_seek)
-        return True
+        try:
+            await self._safe_voice_play(source, after=_after_seek)
+            return True
+        except Exception:
+            log.exception("Seek failed during playback restart")
+            return False
 
     async def cleanup(self) -> None:
+        self._cancel_auto_leave_task()
         if self.voice:
             try:
                 await self.voice.disconnect()
@@ -414,9 +487,68 @@ class MusicPlayer:
                 pass
             self.voice = None
             log.info("Disconnected from voice channel")
+        self.queue.clear()
+        self.current = None
         self.offset = 0.0
         self.started_at = 0.0
-        players.pop(self.guild.id, None)
+        # Keep the player instance so existing views continue to operate.
+
+    def _cancel_auto_leave_task(self) -> None:
+        if self._auto_leave_task:
+            self._auto_leave_task.cancel()
+            self._auto_leave_task = None
+
+    def _request_auto_leave_check(self, *, delay: float = 90.0) -> None:
+        """Schedule an auto-leave if idle and allowed.
+
+        Leaves after ``delay`` seconds only when:
+        - auto_leave is enabled
+        - connected and not playing/paused
+        - queue is empty
+        - no non-bot members remain in the channel (or channel missing)
+        """
+
+        self._cancel_auto_leave_task()
+
+        if not self.auto_leave:
+            return
+
+        if not self.voice or not self.voice.is_connected():
+            return
+
+        if self.voice.is_playing() or self.voice.is_paused():
+            return
+
+        if self.queue:
+            return
+
+        async def _auto_leave_loop() -> None:
+            me = asyncio.current_task()
+            try:
+                while True:
+                    await asyncio.sleep(delay)
+                    if self._playlist_loading:
+                        continue
+                    if not self.auto_leave:
+                        return
+                    if not self.voice or not self.voice.is_connected():
+                        return
+                    if self.voice.is_playing() or self.voice.is_paused():
+                        return
+                    if self.queue:
+                        return
+                    channel = getattr(self.voice, "channel", None)
+                    members = getattr(channel, "members", []) if channel else []
+                    non_bots = [m for m in members if not getattr(m, "bot", False)]
+                    if non_bots:
+                        continue
+                    await self.cleanup()
+                    return
+            finally:
+                if self._auto_leave_task is me:
+                    self._auto_leave_task = None
+
+        self._auto_leave_task = asyncio.create_task(_auto_leave_loop())
 
 
 players: dict[int, MusicPlayer] = {}
@@ -434,7 +566,9 @@ def get_player(bot: commands.Bot, guild: discord.Guild | int) -> MusicPlayer:
 
     if guild_id not in players:
         players[guild_id] = MusicPlayer(bot, guild_obj)
-    return players[guild_id]
+    player = players[guild_id]
+    player.sync_voice_client()
+    return player
 
 
 async def yt_search(query: str) -> Track:

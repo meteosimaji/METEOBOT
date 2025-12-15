@@ -86,6 +86,7 @@ BOT_INVOKE_ALLOWLIST = {
     "leave",
     "now",
     "pause",
+    "play",
     "playq",
     "queue",
     "resume",
