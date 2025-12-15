@@ -95,6 +95,7 @@ BOT_INVOKE_ALLOWLIST = {
     "stop",
     "tune",
 }
+LLM_ALLOW_REQUIRED_ARG = {"play", "playq", "seek", "tune"}
 DENY_BASENAMES = {
     ".env",
     ".env.local",
@@ -1550,7 +1551,9 @@ class Ask(commands.Cog):
 
         return True
 
-    def _get_single_optional_param(self, command: commands.Command) -> inspect.Parameter | None:
+    def _get_single_arg_param(
+        self, command: commands.Command, *, allow_required: bool
+    ) -> inspect.Parameter | None:
         try:
             sig = inspect.signature(command.callback)
         except (TypeError, ValueError):
@@ -1568,7 +1571,7 @@ class Ask(commands.Cog):
         first = params[0]
         if first.kind in {first.VAR_POSITIONAL, first.VAR_KEYWORD}:
             return None
-        if first.default is first.empty:
+        if first.default is first.empty and not allow_required:
             return None
 
         for extra in params[1:]:
@@ -1649,7 +1652,7 @@ class Ask(commands.Cog):
                 "name": "bot_invoke",
                 "description": (
                     "Safely run a bot command in the current channel. "
-                    "Supports a single optional argument for commands that accept one, "
+                    "Supports a single argument for commands that accept one, "
                     "like /help or /userinfo. "
                     "Destructive or moderation commands (e.g., purge) are blocked for the LLM."
                 ),
@@ -1670,7 +1673,7 @@ class Ask(commands.Cog):
                                 "can take that value here."
                             ),
                             "default": "",
-                            "maxLength": 150,
+                            "maxLength": 400,
                         },
                     },
                     "required": ["name", "arg"],
@@ -1717,16 +1720,17 @@ class Ask(commands.Cog):
         usage = command.usage or ""
         usage_text = f"/{command.qualified_name}" + (f" {usage}" if usage else "")
         can_run, can_run_reason = await self._can_run_command(ctx, command)
-        single_optional_param = self._get_single_optional_param(command)
+        root_name = command.qualified_name.split()[0]
+        allow_required = root_name in LLM_ALLOW_REQUIRED_ARG
+        single_param = self._get_single_arg_param(command, allow_required=allow_required)
 
         if name == "bot_commands":
-            root_name = command.qualified_name.split()[0]
             llm_allowed = (
                 can_run
                 and root_name in BOT_INVOKE_ALLOWLIST
                 and root_name not in LLM_BLOCKED_COMMANDS
                 and category not in LLM_BLOCKED_CATEGORIES
-                and (self._is_noarg_command(command) or single_optional_param is not None)
+                and (self._is_noarg_command(command) or single_param is not None)
             )
 
             return {
@@ -1750,7 +1754,7 @@ class Ask(commands.Cog):
                     else "not_allowlisted"
                     if root_name not in BOT_INVOKE_ALLOWLIST
                     else "arguments_not_supported"
-                    if not (self._is_noarg_command(command) or single_optional_param is not None)
+                    if not (self._is_noarg_command(command) or single_param is not None)
                     else ""
                 ),
             }
@@ -1758,7 +1762,6 @@ class Ask(commands.Cog):
         if not can_run:
             return {"ok": False, "error": "no_permission", "reason": can_run_reason}
 
-        root_name = command.qualified_name.split()[0]
         if root_name not in BOT_INVOKE_ALLOWLIST:
             return {
                 "ok": False,
@@ -1766,7 +1769,7 @@ class Ask(commands.Cog):
                 "reason": "not_allowlisted",
             }
 
-        allow_args = single_optional_param is not None
+        allow_args = single_param is not None
 
         raw_arg = args.get("arg") or ""
         arg = raw_arg.strip()
@@ -1778,18 +1781,25 @@ class Ask(commands.Cog):
                 "reason": "destructive_or_moderation",
             }
 
-        if arg and (single_optional_param is None or not allow_args):
+        if arg and (single_param is None or not allow_args):
             return {
                 "ok": False,
                 "error": "arguments_not_supported",
                 "reason": "Command does not accept arguments. Use arg:'' for this command.",
             }
 
+        if not arg and single_param is not None and single_param.default is inspect._empty:
+            return {
+                "ok": False,
+                "error": "missing_argument",
+                "reason": f"/{root_name} requires an argument.",
+            }
+
         history_after = self._history_after(ctx)
 
         if arg:
             try:
-                converted = await self._convert_single_optional(ctx, single_optional_param, arg)
+                converted = await self._convert_single_optional(ctx, single_param, arg)
             except TypeError:
                 return {
                     "ok": False,
@@ -1804,7 +1814,7 @@ class Ask(commands.Cog):
                 }
 
             try:
-                await ctx.invoke(command, **{single_optional_param.name: converted})
+                await ctx.invoke(command, **{single_param.name: converted})
                 ran = f"{command.qualified_name} {arg}".strip()
                 response: dict[str, Any] = {"ok": True, "ran": ran}
                 messages = await self._collect_bot_messages(ctx, after=history_after)
@@ -1818,7 +1828,7 @@ class Ask(commands.Cog):
                     "reason": str(exc) or exc.__class__.__name__,
                 }
 
-        if not (self._is_noarg_command(command) or single_optional_param is not None):
+        if not (self._is_noarg_command(command) or single_param is not None):
             return {"ok": False, "error": "arguments_not_supported"}
 
         try:
