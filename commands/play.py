@@ -107,6 +107,8 @@ async def _ensure_joined(ctx: commands.Context) -> tuple[bool, object]:
     player = get_player(ctx.bot, ctx.guild)  # type: ignore[arg-type]
     try:
         await player.join(ctx.author.voice.channel)  # type: ignore[arg-type]
+        if not player.voice or not player.voice.is_connected():
+            return False, "Voice connection failed (disconnected immediately). Try again or check your network/firewall."
     except (VoiceConnectionError, asyncio.TimeoutError):
         return False, "Couldn't join your voice channel."
     return True, player
@@ -240,15 +242,17 @@ class Play(commands.Cog):
             player = res  # type: ignore[assignment]
 
             first: Track | None = None
-            await player.start_playlist()
             count = 0
-            for title, src in accepted:
-                track = Track(url=src, title=title, duration=0.0, page_url=src)
-                await player.add(track, from_playlist=True)
-                count += 1
-                if first is None:
-                    first = track
-            await player.end_playlist()
+            await player.start_playlist()
+            try:
+                for title, src in accepted:
+                    track = Track(url=src, title=title, duration=0.0, page_url=src)
+                    await player.add(track, from_playlist=True)
+                    count += 1
+                    if first is None:
+                        first = track
+            finally:
+                await player.end_playlist()
 
             if count == 1 and first:
                 embed = discord.Embed(
@@ -337,21 +341,22 @@ class Play(commands.Cog):
             count = 0
             first: Track | None = None
             message: discord.Message | None = None
-            async for track in result:  # type: ignore[assignment]
-                await player.add(track, from_playlist=True)
-                count += 1
-                if count == 1:
-                    first = track
-                    embed = discord.Embed(
-                        title="🎵 Added to Queue",
-                        description=f"[{track.title}]({track.page_url})",
-                        color=0x1DB954,
-                    )
-                    if track.duration:
-                        embed.add_field(name="Duration", value=humanize_delta(track.duration))
-                    message = await ctx.reply(embed=embed, mention_author=False)
-
-            await player.end_playlist()
+            try:
+                async for track in result:  # type: ignore[assignment]
+                    await player.add(track, from_playlist=True)
+                    count += 1
+                    if count == 1:
+                        first = track
+                        embed = discord.Embed(
+                            title="🎵 Added to Queue",
+                            description=f"[{track.title}]({track.page_url})",
+                            color=0x1DB954,
+                        )
+                        if track.duration:
+                            embed.add_field(name="Duration", value=humanize_delta(track.duration))
+                        message = await ctx.reply(embed=embed, mention_author=False)
+            finally:
+                await player.end_playlist()
             if count == 0:
                 return await safe_reply(ctx, "No tracks found.", ephemeral=True, mention_author=False)
             if count > 1 and message and first:

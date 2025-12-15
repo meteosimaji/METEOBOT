@@ -28,6 +28,7 @@ class ControlView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Ensure only listeners in the same voice channel can press controls."""
+        self.player.sync_voice_client()
         user = interaction.user
         if not user or not getattr(user, "voice", None) or not user.voice or not user.voice.channel:
             await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
@@ -53,6 +54,7 @@ class ControlView(discord.ui.View):
                 await asyncio.sleep(delay)
                 if not self.message or self.is_finished():
                     break
+                self.player.sync_voice_client()
                 if not self.player.voice or not self.player.voice.is_connected():
                     break
                 self.update_labels()
@@ -86,6 +88,7 @@ class ControlView(discord.ui.View):
         self.stop()
 
     def update_labels(self) -> None:
+        self.player.sync_voice_client()
         self.btn_autoleave.label = f"Auto Leave: {'On' if self.player.auto_leave else 'Off'}"
         self.btn_loop.label = f"Loop: {self.player.loop.capitalize()}"
         self.btn_pause.label = "Resume" if self.player.voice and self.player.voice.is_paused() else "Pause"
@@ -95,10 +98,15 @@ class ControlView(discord.ui.View):
 
     @discord.ui.button(label="Auto Leave", style=discord.ButtonStyle.secondary)
     async def btn_autoleave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.sync_voice_client()
         if not interaction.response.is_done():
             await interaction.response.defer()
         self.player.auto_leave = not self.player.auto_leave
         log.info("%s toggled auto leave to %s", interaction.user, self.player.auto_leave)
+        if self.player.auto_leave:
+            self.player._request_auto_leave_check()
+        else:
+            self.player._cancel_auto_leave_task()
         self.update_labels()
         try:
             await interaction.message.edit(embed=make_queue_embed(self.player), view=self)
@@ -107,6 +115,7 @@ class ControlView(discord.ui.View):
 
     @discord.ui.button(label="Loop", style=discord.ButtonStyle.secondary)
     async def btn_loop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.sync_voice_client()
         if not interaction.response.is_done():
             await interaction.response.defer()
         if self.player.loop == "none":
@@ -124,6 +133,7 @@ class ControlView(discord.ui.View):
 
     @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary)
     async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.sync_voice_client()
         if not interaction.response.is_done():
             await interaction.response.defer()
         if self.player.voice and self.player.voice.is_paused():
@@ -139,14 +149,17 @@ class ControlView(discord.ui.View):
 
     @discord.ui.button(label="Speed", style=discord.ButtonStyle.secondary)
     async def btn_speed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.sync_voice_client()
         await interaction.response.send_modal(SpeedModal(self))
 
     @discord.ui.button(label="Pitch", style=discord.ButtonStyle.secondary)
     async def btn_pitch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.sync_voice_client()
         await interaction.response.send_modal(PitchModal(self))
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
     async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.sync_voice_client()
         if not interaction.response.is_done():
             await interaction.response.defer()
         await self.player.skip()
@@ -159,6 +172,7 @@ class ControlView(discord.ui.View):
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
     async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.sync_voice_client()
         if not interaction.response.is_done():
             await interaction.response.defer()
         await self.player.stop()
@@ -172,6 +186,7 @@ class ControlView(discord.ui.View):
 
     @discord.ui.button(label="Remove", style=discord.ButtonStyle.danger)
     async def btn_remove(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.player.sync_voice_client()
         if not self.player.queue:
             return await interaction.response.send_message("Queue is empty.", ephemeral=True)
         view = RemoveView(self.player, self)
@@ -263,6 +278,7 @@ class RemoveView(discord.ui.View):
         self.add_item(self.select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        self.player.sync_voice_client()
         user = interaction.user
         if not user or not getattr(user, "voice", None) or not user.voice or not user.voice.channel:
             await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
