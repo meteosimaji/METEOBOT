@@ -9,13 +9,29 @@
 ## Commands
 - `ask` — Ask the AI anything; attach up to three images (about 3MB max each, i.e., ~3,000,000 bytes, including images on the message you replied to) for analysis, and it will note the current time, tap web search plus a read-only shell for repo context, and use a code interpreter for calculations. Oversized images are automatically resized/compressed toward the limit. Admins can pick action `reset` to clear channel history while non-admin reset requests are treated as normal questions. Reply-based image pickup works best with prefix commands/mentions; slash commands rely on explicitly attached files.
 - `help` — Browse commands and events or get detailed help.
+- `join` / `leave` — Join or leave your voice channel (no queue changes).
 - `messages` — Show recent messages in the current channel.
+- `now` — Show the current track with a progress bar.
+- `pause` / `resume` — Pause or resume playback.
 - `ping` — Check the bot's responsiveness with style and speed!
+- `play` — Queue music by URL or search phrase (YouTube/Spotify/Niconico). Prefix usage also supports file attachments.
+- `playq` — LLM-safe variant of `play` (single optional arg).
 - `purge` — Bulk delete messages using flexible filters.
+- `queue` — Show interactive queue panel (pause/resume, loop, skip, stop, remove, speed/pitch).
+- `seek` — Seek within the current track (e.g. `1:23`, `+30`, `-10`).
 - `serverinfo` — Display a polished snapshot of the current server.
 - `settime` — Configure a server's timezone with interactive buttons.
+- `skip` — Skip the current track.
+- `stop` — Stop playback and clear the queue.
+- `tune` — Set speed and pitch (`/tune 1.2 0.9`).
 - `uptime` — Show how long the bot has been running.
 - `userinfo` — Show a member's profile with timestamps and roles.
+
+### Music prerequisites
+- Install **FFmpeg** and ensure `ffmpeg` is on PATH (required for audio decoding).
+- Install Python deps: `yt-dlp` and `PyNaCl` (voice).
+- Grant the bot **Connect** and **Speak** permissions in voice channels.
+- Enable the **Voice States** intent (and any other intents your host requires) so the bot can see voice joins.
 
 Prefix commands work with either the configured `BOT_PREFIX` or by mentioning the bot (for example, `@Bot ping`). Messages that start with a bot mention or reply to the bot will fall back to `ask` when they are not recognized as commands.
 

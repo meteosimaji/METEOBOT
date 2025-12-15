@@ -77,6 +77,23 @@ FLAG_REQUIRES_VALUE: dict[str, set[str]] = {
 PATTERN_ARG_COUNT: dict[str, int] = {"find": 1, "grep": 1, "rg": 1}
 LLM_BLOCKED_COMMANDS = {"purge", "ask"}
 LLM_BLOCKED_CATEGORIES = {"Moderation"}
+BOT_INVOKE_ALLOWLIST = {
+    # General helpers
+    "help",
+    "userinfo",
+    # Music controls
+    "join",
+    "leave",
+    "now",
+    "pause",
+    "playq",
+    "queue",
+    "resume",
+    "seek",
+    "skip",
+    "stop",
+    "tune",
+}
 DENY_BASENAMES = {
     ".env",
     ".env.local",
@@ -1544,16 +1561,22 @@ class Ask(commands.Cog):
             if p.name not in {"self", "ctx", "interaction", "context"}
         ]
 
-        if len(params) != 1:
+        if not params:
             return None
 
-        param = params[0]
-        if param.kind in {param.VAR_POSITIONAL, param.VAR_KEYWORD}:
+        first = params[0]
+        if first.kind in {first.VAR_POSITIONAL, first.VAR_KEYWORD}:
             return None
-        if param.default is param.empty:
+        if first.default is first.empty:
             return None
 
-        return param
+        for extra in params[1:]:
+            if extra.kind in {extra.VAR_POSITIONAL, extra.VAR_KEYWORD}:
+                return None
+            if extra.default is extra.empty:
+                return None
+
+        return first
 
     async def _convert_single_optional(
         self, ctx: commands.Context, param: inspect.Parameter, raw: str
@@ -1699,6 +1722,7 @@ class Ask(commands.Cog):
             root_name = command.qualified_name.split()[0]
             llm_allowed = (
                 can_run
+                and root_name in BOT_INVOKE_ALLOWLIST
                 and root_name not in LLM_BLOCKED_COMMANDS
                 and category not in LLM_BLOCKED_CATEGORIES
                 and (self._is_noarg_command(command) or single_optional_param is not None)
@@ -1722,6 +1746,8 @@ class Ask(commands.Cog):
                     if root_name in LLM_BLOCKED_COMMANDS
                     else "blocked_category"
                     if category in LLM_BLOCKED_CATEGORIES
+                    else "not_allowlisted"
+                    if root_name not in BOT_INVOKE_ALLOWLIST
                     else "arguments_not_supported"
                     if not (self._is_noarg_command(command) or single_optional_param is not None)
                     else ""
@@ -1732,6 +1758,14 @@ class Ask(commands.Cog):
             return {"ok": False, "error": "no_permission", "reason": can_run_reason}
 
         root_name = command.qualified_name.split()[0]
+        if root_name not in BOT_INVOKE_ALLOWLIST:
+            return {
+                "ok": False,
+                "error": "restricted_for_llm",
+                "reason": "not_allowlisted",
+            }
+
+        allow_args = single_optional_param is not None
 
         raw_arg = args.get("arg") or ""
         arg = raw_arg.strip()
@@ -1743,7 +1777,7 @@ class Ask(commands.Cog):
                 "reason": "destructive_or_moderation",
             }
 
-        if arg and single_optional_param is None:
+        if arg and (single_optional_param is None or not allow_args):
             return {
                 "ok": False,
                 "error": "arguments_not_supported",
