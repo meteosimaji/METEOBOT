@@ -1,0 +1,2385 @@
+import asyncio
+import base64
+import contextlib
+import difflib
+import importlib
+import inspect
+import json
+import logging
+import os
+import re
+import shlex
+import types
+from io import BytesIO
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Union, get_args, get_origin
+from urllib.parse import urlparse
+
+import discord
+from discord import AppCommandType, app_commands
+from discord.app_commands.errors import CommandAlreadyRegistered
+from discord.ext import commands
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+from utils import BOT_PREFIX, build_suggestions, defer_interaction
+from cogs.settime import fmt_ofs, get_guild_offset
+
+log = logging.getLogger(__name__)
+
+_openai_module = importlib.import_module("openai")
+OpenAI = getattr(_openai_module, "OpenAI")
+AsyncOpenAI = getattr(_openai_module, "AsyncOpenAI", None)
+
+DENY_META_CHARS = re.compile(r"[;&><`]")
+ALLOWED_CMDS = {
+    "cat",
+    "diff",
+    "find",
+    "grep",
+    "head",
+    "lines",
+    "ls",
+    "rg",
+    "stat",
+    "tree",
+    "tail",
+    "wc",
+}
+
+MAX_IMAGE_BYTES = 3_000_000
+MAX_IMAGE_DIM = 2048
+ALLOWED_FLAGS: dict[str, set[str]] = {
+    "cat": {"-n"},
+    "diff": {"-u"},
+    "find": {"-m"},
+    "grep": {"-n", "-i", "-m", "-C", "-A", "-B"},
+    "head": {"-n"},
+    "lines": {"-s", "-e"},
+    "ls": {"-l", "-la", "-al", "-a", "-lh"},
+    "rg": {"-n", "-i", "-m", "-C", "-A", "-B"},
+    "stat": set(),
+    "tree": {"-L", "-a"},
+    "tail": {"-n"},
+    "wc": {"-l", "-w", "-c"},
+}
+FLAG_REQUIRES_VALUE: dict[str, set[str]] = {
+    "find": {"-m"},
+    "grep": {"-m", "-C", "-A", "-B"},
+    "rg": {"-m", "-C", "-A", "-B"},
+    "head": {"-n"},
+    "lines": {"-s", "-e"},
+    "tree": {"-L"},
+    "tail": {"-n"},
+}
+PATTERN_ARG_COUNT: dict[str, int] = {"find": 1, "grep": 1, "rg": 1}
+LLM_BLOCKED_COMMANDS = {"purge", "ask"}
+LLM_BLOCKED_CATEGORIES = {"Moderation"}
+DENY_BASENAMES = {
+    ".env",
+    ".env.local",
+    ".envrc",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".git-credentials",
+    "id_rsa",
+    "id_rsa.pub",
+    "credentials.json",
+    "secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    "secrets.env",
+    "secrets.txt",
+    "private.key",
+    "private.pem",
+}
+
+
+@dataclass
+class ShellPolicy:
+    root_dir: Path
+    hard_timeout_sec: float = 10.0
+    max_bytes: int = 200_000
+    max_commands: int = 1
+    max_files_scanned: int = 5_000
+    max_total_bytes_scanned: int = 5_000_000
+    max_depth: int = 6
+
+
+class ReadOnlyShellExecutor:
+    def __init__(self, policy: ShellPolicy) -> None:
+        self.p = policy
+        self.root = policy.root_dir.resolve()
+
+    def _parse_args(self, cmd: str, args: list[str]) -> tuple[set[str], dict[str, str], list[str]]:
+        flags: set[str] = set()
+        values: dict[str, str] = {}
+        positionals: list[str] = []
+        requires = FLAG_REQUIRES_VALUE.get(cmd, set())
+
+        idx = 0
+        while idx < len(args):
+            token = args[idx]
+            if token.startswith("-"):
+                flags.add(token)
+                if token in requires:
+                    if idx + 1 >= len(args):
+                        raise ValueError(f"{cmd}: flag '{token}' requires a value")
+                    values[token] = args[idx + 1]
+                    idx += 2
+                    continue
+                idx += 1
+                continue
+
+            positionals.append(token)
+            idx += 1
+
+        return flags, values, positionals
+
+    def _is_safe_path(self, candidate: str) -> bool:
+        if candidate.startswith(("/", "\\")) or ":" in candidate:
+            return False
+        parts = Path(candidate).parts
+        if ".." in parts:
+            return False
+        if any(part == ".git" for part in parts):
+            return False
+        resolved = (self.root / candidate).resolve()
+        try:
+            rel = resolved.relative_to(self.root)
+        except Exception:
+            return False
+        if any(part == ".git" for part in rel.parts):
+            return False
+        if resolved.name in DENY_BASENAMES:
+            return False
+        return True
+
+    def _validate(self, cmd: str) -> str | None:
+        if DENY_META_CHARS.search(cmd):
+            return "Denied: meta characters are not allowed."
+
+        parts = shlex.split(cmd)
+        if not parts:
+            return "Denied: empty command."
+
+        command = parts[0]
+        if command not in ALLOWED_CMDS:
+            return f"Denied: command '{command}' is not allowed."
+
+        allowed_flags = ALLOWED_FLAGS.get(command, set())
+        flags_require_value = FLAG_REQUIRES_VALUE.get(command, set())
+        pattern_budget = PATTERN_ARG_COUNT.get(command, 0)
+        saw_path = False
+        path_args: list[str] = []
+
+        idx = 1
+        while idx < len(parts):
+            arg = parts[idx]
+            if arg.startswith("-"):
+                if arg not in allowed_flags:
+                    return f"Denied: flag '{arg}' is not allowed for {command}."
+                if arg in flags_require_value:
+                    if idx + 1 >= len(parts):
+                        return f"Denied: flag '{arg}' requires a value."
+                    value = parts[idx + 1]
+                    if not value.isdigit():
+                        return f"Denied: flag '{arg}' value must be a non-negative integer."
+                    idx += 2
+                    continue
+                idx += 1
+                continue
+
+            if pattern_budget > 0:
+                pattern_budget -= 1
+                idx += 1
+                continue
+
+            if arg in DENY_BASENAMES or Path(arg).name in DENY_BASENAMES:
+                return f"Denied: access to '{arg}' is not allowed."
+            if any(char in arg for char in ["*", "?", "{", "}"]):
+                return "Denied: glob patterns are not allowed."
+            if not self._is_safe_path(arg):
+                return f"Denied: path '{arg}' is out of root."
+            resolved_arg = (self.root / arg).resolve()
+            if command == "cat":
+                with contextlib.suppress(OSError):
+                    if resolved_arg.stat().st_size > self.p.max_bytes:
+                        return (
+                            f"Denied: file '{arg}' is too large to cat (>"
+                            f"{self.p.max_bytes} bytes)."
+                        )
+
+            path_args.append(arg)
+            saw_path = True
+
+            idx += 1
+
+        if command in {"rg", "grep"}:
+            if not saw_path:
+                return "Denied: provide an explicit search path for grep/rg."
+            if "-m" not in parts:
+                return "Denied: include -m <limit> to bound grep/rg output."
+
+        if command == "tree":
+            if "-L" not in parts:
+                return "Denied: tree requires -L <depth> to limit traversal."
+            if not path_args:
+                return "Denied: provide a root path for tree."
+
+        if command == "diff":
+            if len(path_args) != 2:
+                return "Denied: diff expects exactly two file paths."
+
+        if command == "find":
+            if pattern_budget > 0:
+                return "Denied: provide a search pattern for find."
+            if not saw_path:
+                return "Denied: provide an explicit search path for find."
+            if "-m" not in parts:
+                return "Denied: include -m <limit> to bound find output."
+
+        if command == "lines":
+            if "-s" not in parts or "-e" not in parts:
+                return "Denied: lines requires -s <start> and -e <end>."
+            if not path_args:
+                return "Denied: provide a file path for lines."
+            try:
+                start_idx = int(parts[parts.index("-s") + 1])
+                end_idx = int(parts[parts.index("-e") + 1])
+                if start_idx < 1 or end_idx < 1:
+                    return "Denied: lines range must be 1-based."
+                if start_idx > end_idx:
+                    return "Denied: start line must be less than or equal to end line."
+            except Exception:
+                return "Denied: lines range must be numeric."
+
+        return None
+
+    def _run_builtin_sync(self, cmd: str) -> dict[str, Any]:
+        parts = shlex.split(cmd)
+        if not parts:
+            return {
+                "stdout": "",
+                "stderr": "Denied: empty command.",
+                "outcome": {"type": "exit", "exit_code": 1},
+            }
+
+        name = parts[0]
+        args = parts[1:]
+
+        def trunc(text: str) -> str:
+            data = text.encode("utf-8", errors="replace")
+            if len(data) <= self.p.max_bytes:
+                return text
+            return data[: self.p.max_bytes].decode("utf-8", errors="ignore")
+
+        class ScanLimitExceeded(Exception):
+            pass
+
+        files_scanned = 0
+        bytes_scanned = 0
+
+        def resolve_path(arg: str) -> Path:
+            if not arg:
+                return self.root
+            return (self.root / arg).resolve()
+
+        def check_limits(path: Path) -> None:
+            nonlocal files_scanned, bytes_scanned
+            files_scanned += 1
+            if files_scanned > self.p.max_files_scanned:
+                raise ScanLimitExceeded("file_limit")
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            bytes_scanned += size
+            if bytes_scanned > self.p.max_total_bytes_scanned:
+                raise ScanLimitExceeded("byte_limit")
+
+        def scan_limit_error(kind: str) -> dict[str, Any]:
+            exceeded = "files" if kind == "file_limit" else "bytes"
+            return {
+                "stdout": "",
+                "stderr": f"Denied: aborted after scanning too many {exceeded}.",
+                "outcome": {"type": "exit", "exit_code": 1},
+            }
+
+        def iter_files(base: Path) -> list[Path]:
+            if base.is_file():
+                if base.is_symlink():
+                    return []
+                try:
+                    resolved_file = base.resolve()
+                    resolved_file.relative_to(self.root)
+                except Exception:
+                    return []
+                if resolved_file.is_symlink():
+                    return []
+                if resolved_file.name in DENY_BASENAMES or ".git" in resolved_file.parts:
+                    return []
+                check_limits(resolved_file)
+                return [resolved_file]
+            if base.is_dir():
+                out: list[Path] = []
+                try:
+                    base_parts = len(base.resolve().parts)
+                except OSError:
+                    return out
+                for root_path, dirs, files in os.walk(base):
+                    try:
+                        resolved_root = Path(root_path).resolve()
+                        resolved_root.relative_to(self.root)
+                    except Exception:
+                        continue
+                    depth = len(resolved_root.parts) - base_parts
+                    if depth >= self.p.max_depth:
+                        dirs[:] = []
+                    dirs[:] = [
+                        d
+                        for d in dirs
+                        if d not in DENY_BASENAMES and d != ".git"
+                    ]
+                    for file_name in sorted(files):
+                        if file_name in DENY_BASENAMES:
+                            continue
+                        file_path = resolved_root / file_name
+                        if file_path.is_symlink():
+                            continue
+                        if ".git" in file_path.parts:
+                            continue
+                        if not file_path.is_file():
+                            continue
+                        try:
+                            resolved_file = file_path.resolve()
+                            resolved_file.relative_to(self.root)
+                        except Exception:
+                            continue
+                        if resolved_file.is_symlink():
+                            continue
+                        check_limits(resolved_file)
+                        out.append(resolved_file)
+                return out
+            return []
+
+        if name == "ls":
+            flags, _, positionals = self._parse_args(name, args)
+            show_all = any(flag in flags for flag in ("-a", "-al", "-la"))
+            long = any(flag in flags for flag in ("-l", "-al", "-la", "-lh"))
+            human = "-lh" in flags
+            shown = positionals[-1] if positionals else "."
+            base = resolve_path(shown)
+            if not base.exists():
+                return {
+                    "stdout": "",
+                    "stderr": f"ls: cannot access '{shown}': No such file or directory",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            if base.is_file():
+                entries = [base]
+            else:
+                entries = sorted(base.iterdir(), key=lambda p: p.name.lower())
+            lines: list[str] = []
+            for entry in entries:
+                if entry.name in DENY_BASENAMES:
+                    continue
+                if not show_all and entry.name.startswith("."):
+                    continue
+                if long:
+                    stat_result = entry.stat()
+                    kind = "d" if entry.is_dir() else "-"
+                    size = stat_result.st_size
+                    size_str = f"{size/1024:.1f}K" if human else str(size)
+                    mtime = datetime.fromtimestamp(stat_result.st_mtime).strftime("%Y-%m-%d %H:%M")
+                    lines.append(f"{kind} {size_str:>8} {mtime} {entry.name}")
+                else:
+                    lines.append(entry.name)
+
+            return {
+                "stdout": trunc("\n".join(lines) + ("\n" if lines else "")),
+                "stderr": "",
+                "outcome": {"type": "exit", "exit_code": 0},
+            }
+
+        if name == "stat":
+            _, _, targets = self._parse_args(name, args)
+            if not targets:
+                return {
+                    "stdout": "",
+                    "stderr": "stat: missing file operand",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+            target = resolve_path(targets[0])
+            if not target.exists():
+                return {
+                    "stdout": "",
+                    "stderr": f"stat: cannot stat '{targets[0]}'",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+            stat_result = target.stat()
+            output = (
+                f"  File: {targets[0]}\n"
+                f"  Size: {stat_result.st_size}\n"
+                f"  MTime: {datetime.fromtimestamp(stat_result.st_mtime)}\n"
+            )
+            return {"stdout": trunc(output), "stderr": "", "outcome": {"type": "exit", "exit_code": 0}}
+
+        if name in {"cat", "head", "tail", "wc", "lines"}:
+            flags, values, targets = self._parse_args(name, args)
+            if not targets:
+                return {
+                    "stdout": "",
+                    "stderr": f"{name}: missing file operand",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            target_path = resolve_path(targets[0])
+            if not target_path.exists() or not target_path.is_file():
+                return {
+                    "stdout": "",
+                    "stderr": f"{name}: cannot open '{targets[0]}'",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            if name == "cat":
+                content = target_path.read_text(encoding="utf-8", errors="replace")
+                if "-n" in flags:
+                    lines = content.splitlines(True)
+                    content = "".join(f"{i+1}\t{line}" for i, line in enumerate(lines))
+                return {"stdout": trunc(content), "stderr": "", "outcome": {"type": "exit", "exit_code": 0}}
+
+            if name == "lines":
+                try:
+                    start_idx = int(values.get("-s", "1"))
+                    end_idx = int(values.get("-e", "1"))
+                except Exception:
+                    return {
+                        "stdout": "",
+                        "stderr": "lines: invalid range",
+                        "outcome": {"type": "exit", "exit_code": 2},
+                    }
+                if start_idx < 1 or end_idx < 1:
+                    return {
+                        "stdout": "",
+                        "stderr": "lines: range must be 1-based",
+                        "outcome": {"type": "exit", "exit_code": 2},
+                    }
+                try:
+                    resolved_target = target_path.resolve()
+                    resolved_target.relative_to(self.root)
+                except Exception:
+                    return {
+                        "stdout": "",
+                        "stderr": f"{name}: path out of root",
+                        "outcome": {"type": "exit", "exit_code": 2},
+                    }
+                try:
+                    check_limits(resolved_target)
+                except ScanLimitExceeded as exc:
+                    return scan_limit_error(str(exc))
+
+                selected: list[str] = []
+                try:
+                    with resolved_target.open("r", encoding="utf-8", errors="replace") as fh:
+                        for line_no, line in enumerate(fh, start=1):
+                            if line_no < start_idx:
+                                continue
+                            if line_no > end_idx:
+                                break
+                            selected.append(line)
+                except OSError:
+                    return {
+                        "stdout": "",
+                        "stderr": f"{name}: cannot open '{targets[0]}'",
+                        "outcome": {"type": "exit", "exit_code": 2},
+                    }
+
+                return {"stdout": trunc("".join(selected)), "stderr": "", "outcome": {"type": "exit", "exit_code": 0}}
+
+            if name in {"head", "tail"}:
+                line_count = 10
+                if "-n" in flags:
+                    try:
+                        line_count = int(values.get("-n", "10"))
+                    except Exception:
+                        line_count = 10
+                try:
+                    resolved_target = target_path.resolve()
+                    resolved_target.relative_to(self.root)
+                except Exception:
+                    return {
+                        "stdout": "",
+                        "stderr": f"{name}: path out of root",
+                        "outcome": {"type": "exit", "exit_code": 2},
+                    }
+                try:
+                    check_limits(resolved_target)
+                except ScanLimitExceeded as exc:
+                    return scan_limit_error(str(exc))
+                if name == "head":
+                    selected: list[str] = []
+                    try:
+                        with resolved_target.open("r", encoding="utf-8", errors="replace") as fh:
+                            for _, line in zip(range(line_count), fh):
+                                selected.append(line)
+                    except OSError:
+                        return {
+                            "stdout": "",
+                            "stderr": f"{name}: cannot open '{targets[0]}'",
+                            "outcome": {"type": "exit", "exit_code": 2},
+                        }
+                else:
+                    tail_buf: deque[str] = deque(maxlen=line_count)
+                    try:
+                        with resolved_target.open("r", encoding="utf-8", errors="replace") as fh:
+                            for line in fh:
+                                tail_buf.append(line)
+                    except OSError:
+                        return {
+                            "stdout": "",
+                            "stderr": f"{name}: cannot open '{targets[0]}'",
+                            "outcome": {"type": "exit", "exit_code": 2},
+                        }
+                    selected = list(tail_buf)
+
+                return {"stdout": trunc("".join(selected)), "stderr": "", "outcome": {"type": "exit", "exit_code": 0}}
+
+            if name == "wc":
+                try:
+                    resolved_target = target_path.resolve()
+                    resolved_target.relative_to(self.root)
+                except Exception:
+                    return {
+                        "stdout": "",
+                        "stderr": f"{name}: path out of root",
+                        "outcome": {"type": "exit", "exit_code": 2},
+                    }
+                try:
+                    check_limits(resolved_target)
+                except ScanLimitExceeded as exc:
+                    return scan_limit_error(str(exc))
+
+                data = resolved_target.read_bytes()
+                text = data.decode("utf-8", errors="replace")
+                line_total = len(text.splitlines())
+                word_total = len(re.findall(r"\S+", text))
+                byte_total = len(data)
+                output_parts = []
+                if "-l" in flags:
+                    output_parts.append(str(line_total))
+                if "-w" in flags:
+                    output_parts.append(str(word_total))
+                if "-c" in flags or not flags:
+                    output_parts.append(str(byte_total))
+                output_parts.append(targets[0])
+                return {
+                    "stdout": " ".join(output_parts) + "\n",
+                    "stderr": "",
+                    "outcome": {"type": "exit", "exit_code": 0},
+                }
+
+        if name == "diff":
+            _, _, targets = self._parse_args(name, args)
+            if len(targets) != 2:
+                return {
+                    "stdout": "",
+                    "stderr": "diff: missing file operand",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            lhs = resolve_path(targets[0])
+            rhs = resolve_path(targets[1])
+            for label, path in ((targets[0], lhs), (targets[1], rhs)):
+                if not path.exists() or not path.is_file():
+                    return {
+                        "stdout": "",
+                        "stderr": f"diff: {label}: No such file",
+                        "outcome": {"type": "exit", "exit_code": 2},
+                    }
+                try:
+                    if path.stat().st_size > self.p.max_bytes:
+                        return {
+                            "stdout": "",
+                            "stderr": (
+                                f"Denied: file '{label}' is too large to diff (>"
+                                f"{self.p.max_bytes} bytes)."
+                            ),
+                            "outcome": {"type": "exit", "exit_code": 1},
+                        }
+                except OSError:
+                    return {
+                        "stdout": "",
+                        "stderr": f"diff: unable to read '{label}'",
+                        "outcome": {"type": "exit", "exit_code": 2},
+                    }
+
+            try:
+                lhs_text = lhs.read_text(encoding="utf-8", errors="replace").splitlines(True)
+                rhs_text = rhs.read_text(encoding="utf-8", errors="replace").splitlines(True)
+            except OSError:
+                return {
+                    "stdout": "",
+                    "stderr": "diff: error reading files",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            diff_lines = list(
+                difflib.unified_diff(
+                    lhs_text,
+                    rhs_text,
+                    fromfile=targets[0],
+                    tofile=targets[1],
+                    lineterm="",
+                )
+            )
+            exit_code = 1 if diff_lines else 0
+            output = "\n".join(diff_lines) + ("\n" if diff_lines else "")
+            return {"stdout": trunc(output), "stderr": "", "outcome": {"type": "exit", "exit_code": exit_code}}
+
+        if name == "find":
+            flags, values, positionals = self._parse_args(name, args)
+            max_matches = 200
+            if "-m" in flags:
+                try:
+                    max_matches = int(values.get("-m", "200"))
+                except Exception:
+                    max_matches = 200
+
+            if len(positionals) < 2:
+                return {
+                    "stdout": "",
+                    "stderr": "find: missing PATTERN or PATH",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            pattern = positionals[0]
+            target_path = resolve_path(positionals[1])
+            try:
+                regex = re.compile(pattern)
+            except re.error as exc:
+                return {
+                    "stdout": "",
+                    "stderr": f"find: invalid regex: {exc}",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            hits: list[str] = []
+            try:
+                for file_path in iter_files(target_path):
+                    rel_path = str(file_path.relative_to(self.root)).replace("\\", "/")
+                    if regex.search(rel_path):
+                        hits.append(rel_path)
+                        if len(hits) >= max_matches:
+                            break
+            except ScanLimitExceeded as exc:
+                return scan_limit_error(str(exc))
+
+            return {
+                "stdout": trunc("\n".join(hits) + ("\n" if hits else "")),
+                "stderr": "",
+                "outcome": {"type": "exit", "exit_code": 0 if hits else 1},
+            }
+
+        if name == "tree":
+            flags, values, targets = self._parse_args(name, args)
+            show_all = "-a" in flags
+            depth_value = self.p.max_depth
+            if "-L" in flags:
+                try:
+                    depth_value = min(int(values.get("-L", str(self.p.max_depth))), self.p.max_depth)
+                except Exception:
+                    depth_value = self.p.max_depth
+            root_target = resolve_path(targets[0] if targets else ".")
+            if not root_target.exists():
+                return {
+                    "stdout": "",
+                    "stderr": f"tree: cannot access '{targets[0] if targets else '.'}': No such file or directory",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            if root_target.is_symlink():
+                return {
+                    "stdout": "",
+                    "stderr": "tree: symlinks are not supported",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            root_label = str(root_target.relative_to(self.root)).replace("\\", "/") or "."
+            lines = [root_label]
+
+            def walk(path: Path, prefix: str, current_depth: int) -> None:
+                if current_depth >= depth_value:
+                    return
+                try:
+                    entries = sorted(path.iterdir(), key=lambda p: p.name.lower())
+                except OSError:
+                    return
+                visible = [
+                    entry
+                    for entry in entries
+                    if entry.name not in DENY_BASENAMES
+                    and entry.name != ".git"
+                    and (show_all or not entry.name.startswith("."))
+                    and not entry.is_symlink()
+                ]
+                for idx, entry in enumerate(visible):
+                    connector = "└── " if idx == len(visible) - 1 else "├── "
+                    lines.append(f"{prefix}{connector}{entry.name}")
+                    if entry.is_file():
+                        check_limits(entry)
+                    elif entry.is_dir():
+                        child_prefix = prefix + ("    " if idx == len(visible) - 1 else "│   ")
+                        walk(entry, child_prefix, current_depth + 1)
+
+            try:
+                walk(root_target, "", 0)
+            except ScanLimitExceeded as exc:
+                return scan_limit_error(str(exc))
+
+            return {
+                "stdout": trunc("\n".join(lines) + "\n"),
+                "stderr": "",
+                "outcome": {"type": "exit", "exit_code": 0},
+            }
+
+        if name in {"grep", "rg"}:
+            flags, values, positionals = self._parse_args(name, args)
+            ignore_case = "-i" in flags
+            show_line_numbers = "-n" in flags
+            max_matches = 200
+            if "-m" in flags:
+                try:
+                    max_matches = int(values.get("-m", "200"))
+                except Exception:
+                    max_matches = 200
+            before = after = 0
+            if "-C" in flags:
+                try:
+                    before = after = int(values.get("-C", "0"))
+                except Exception:
+                    before = after = 0
+            if "-A" in flags:
+                try:
+                    after = int(values.get("-A", "0"))
+                except Exception:
+                    after = 0
+            if "-B" in flags:
+                try:
+                    before = int(values.get("-B", "0"))
+                except Exception:
+                    before = 0
+
+            if len(positionals) < 2:
+                return {
+                    "stdout": "",
+                    "stderr": f"{name}: missing PATTERN or PATH",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+            pattern = positionals[0]
+            target_path = resolve_path(positionals[1])
+            try:
+                regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+            except re.error as exc:
+                return {
+                    "stdout": "",
+                    "stderr": f"{name}: invalid regex: {exc}",
+                    "outcome": {"type": "exit", "exit_code": 2},
+                }
+
+            matches = 0
+            lines_out: list[str] = []
+
+            try:
+                for file_path in iter_files(target_path):
+                    try:
+                        with file_path.open("r", encoding="utf-8", errors="replace") as fh:
+                            context_before: deque[tuple[int, str]] = deque(maxlen=before)
+                            remaining_after = 0
+                            for line_no, line in enumerate(fh, start=1):
+                                stripped = line.rstrip("\r\n")
+                                hit = regex.search(stripped) is not None
+                                if hit:
+                                    if before:
+                                        for prev_no, prev_line in context_before:
+                                            rel_prev = str(file_path.relative_to(self.root)).replace("\\", "/")
+                                            prefix_prev = (
+                                                f"{rel_prev}:{prev_no}:" if show_line_numbers else f"{rel_prev}:"
+                                            )
+                                            lines_out.append(prefix_prev + prev_line)
+                                    rel_path = str(file_path.relative_to(self.root)).replace("\\", "/")
+                                    prefix = f"{rel_path}:{line_no}:" if show_line_numbers else f"{rel_path}:"
+                                    lines_out.append(prefix + stripped)
+                                    matches += 1
+                                    remaining_after = after
+                                    if matches >= max_matches:
+                                        return {
+                                            "stdout": trunc("\n".join(lines_out) + "\n"),
+                                            "stderr": "",
+                                            "outcome": {"type": "exit", "exit_code": 0},
+                                        }
+                                elif remaining_after > 0:
+                                    rel_after = str(file_path.relative_to(self.root)).replace("\\", "/")
+                                    prefix_after = (
+                                        f"{rel_after}:{line_no}:" if show_line_numbers else f"{rel_after}:"
+                                    )
+                                    lines_out.append(prefix_after + stripped)
+                                    remaining_after -= 1
+                                else:
+                                    if before:
+                                        context_before.append((line_no, stripped))
+                    except OSError:
+                        continue
+            except ScanLimitExceeded as exc:
+                return scan_limit_error(str(exc))
+
+            exit_code = 0 if matches else 1
+            return {
+                "stdout": trunc("\n".join(lines_out) + ("\n" if lines_out else "")),
+                "stderr": "",
+                "outcome": {"type": "exit", "exit_code": exit_code},
+            }
+
+        return {
+            "stdout": "",
+            "stderr": f"Denied: builtin for '{name}' is not implemented.",
+            "outcome": {"type": "exit", "exit_code": 127},
+        }
+
+    async def _run_one(self, cmd: str, *, timeout_sec: float) -> dict[str, Any]:
+        validation_error = self._validate(cmd)
+        if validation_error:
+            return {
+                "stdout": "",
+                "stderr": validation_error,
+                "outcome": {"type": "exit", "exit_code": 1},
+            }
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._run_builtin_sync, cmd), timeout=timeout_sec
+            )
+        except asyncio.TimeoutError:
+            return {
+                "stdout": "",
+                "stderr": f"Timeout after {timeout_sec:.1f}s",
+                "outcome": {"type": "timeout"},
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            return {
+                "stdout": "",
+                "stderr": f"Shell builtin failed: {exc}",
+                "outcome": {"type": "exit", "exit_code": 1},
+            }
+
+    async def run_many(
+        self, commands: list[str], *, timeout_ms: int | None = None
+    ) -> list[dict[str, Any]]:
+        if len(commands) > self.p.max_commands:
+            return [
+                {
+                    "stdout": "",
+                    "stderr": (
+                        f"Denied: only {self.p.max_commands} command"
+                        f"{'s' if self.p.max_commands != 1 else ''} allowed per call."
+                    ),
+                    "outcome": {"type": "exit", "exit_code": 1},
+                }
+            ]
+
+        timeout_sec = self.p.hard_timeout_sec
+        if timeout_ms is not None:
+            timeout_sec = min(timeout_sec, max(0.5, timeout_ms / 1000.0))
+
+        results: list[dict[str, Any]] = []
+        for command in commands:
+            results.append(await self._run_one(command, timeout_sec=timeout_sec))
+        return results
+
+
+def _truncate_discord(text: str, limit: int = 2000) -> str:
+    """Clamp text to Discord's message length limit."""
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3] + "..."
+
+
+def _env_choice(name: str, default: str, choices: set[str]) -> str:
+    value = (os.getenv(name) or default).strip().lower()
+    return value if value in choices else default
+
+
+def _ask_reasoning_cfg() -> dict[str, Any]:
+    effort = _env_choice(
+        "ASK_REASONING_EFFORT",
+        "low",
+        {"none", "low", "medium", "high", "xhigh"},
+    )
+    return {"effort": effort}
+
+
+def _ask_text_cfg() -> dict[str, Any]:
+    verbosity = _env_choice(
+        "ASK_VERBOSITY",
+        "low",
+        {"low", "medium", "high"},
+    )
+    return {"verbosity": verbosity}
+
+
+def _question_preview(text: str, limit: int = 15) -> str:
+    """Return the first ``limit`` characters of ``text``, appending an ellipsis if truncated."""
+    trimmed = (text or "").strip()
+    if len(trimmed) <= limit:
+        return trimmed
+    return trimmed[:limit] + "..."
+
+
+MAX_TOOL_TURNS = 10
+
+
+async def run_responses_agent(
+    responses_create,
+    *,
+    model: str,
+    input_items: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    instructions: str | None = None,
+    include: list[str] | None = None,
+    previous_response_id: str | None = None,
+    shell_executor: ReadOnlyShellExecutor | None = None,
+    function_router=None,
+    event_cb=None,
+    reasoning: dict[str, Any] | None = None,
+    text: dict[str, Any] | None = None,
+):
+    inputs = list(input_items)
+    all_outputs: list[Any] = []
+    prev_id = previous_response_id
+
+    async def _emit(evt: dict[str, Any]) -> None:
+        if event_cb is None:
+            return
+        try:
+            maybe = event_cb(evt)
+            if inspect.isawaitable(maybe):
+                await maybe
+        except Exception:
+            return
+
+    for turn in range(MAX_TOOL_TURNS):
+        await _emit({"type": "turn_start", "turn": turn + 1, "max_turns": MAX_TOOL_TURNS})
+        request: dict[str, Any] = {
+            "model": model,
+            "tools": tools,
+        }
+        request["input"] = inputs
+        if instructions:
+            request["instructions"] = instructions
+        if include:
+            request["include"] = include
+        if prev_id:
+            request["previous_response_id"] = prev_id
+        if reasoning is not None:
+            request["reasoning"] = reasoning
+        if text is not None:
+            request["text"] = text
+
+        resp = await responses_create(**request)
+        outputs = getattr(resp, "output", []) or []
+        all_outputs.extend(outputs)
+        await _emit({"type": "model_response", "turn": turn + 1, "output_items": len(outputs)})
+
+        tool_outputs: list[dict[str, Any]] = []
+
+        for item in outputs:
+            item_type = getattr(item, "type", None) if not isinstance(item, dict) else item.get("type")
+
+            if item_type == "function_call":
+                name = item.name if not isinstance(item, dict) else item.get("name")
+                call_id = item.call_id if not isinstance(item, dict) else item.get("call_id")
+                args_raw = item.arguments if not isinstance(item, dict) else item.get("arguments", "{}")
+                args = args_raw
+                if isinstance(args_raw, str):
+                    try:
+                        args = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        args = {}
+                await _emit(
+                    {
+                        "type": "tool_call",
+                        "tool": "function",
+                        "name": name,
+                        "call_id": call_id,
+                        "args": args if isinstance(args, dict) else {},
+                    }
+                )
+
+                result = "Function router is not configured."
+                ok = True
+                if function_router is not None:
+                    try:
+                        result_value = await function_router(name, args if isinstance(args, dict) else {})
+                        result = (
+                            result_value
+                            if isinstance(result_value, str)
+                            else json.dumps(result_value, ensure_ascii=False)
+                        )
+                    except Exception as e:
+                        ok = False
+                        result = f"Function '{name}' failed: {e!r}"
+
+                await _emit(
+                    {
+                        "type": "tool_result",
+                        "tool": "function",
+                        "name": name,
+                        "call_id": call_id,
+                        "ok": ok,
+                    }
+                )
+
+                tool_outputs.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": result,
+                    }
+                )
+
+            elif item_type == "shell_call":
+                call_id = item.call_id if not isinstance(item, dict) else item.get("call_id")
+                action = getattr(item, "action", None) if not isinstance(item, dict) else item.get("action", {})
+                commands = getattr(action, "commands", None) if not isinstance(action, dict) else action.get("commands", [])
+                timeout_ms = getattr(action, "timeout_ms", None) if not isinstance(action, dict) else action.get("timeout_ms")
+                max_output_length = (
+                    getattr(action, "max_output_length", None)
+                    if not isinstance(action, dict)
+                    else action.get("max_output_length")
+                )
+                await _emit(
+                    {
+                        "type": "tool_call",
+                        "tool": "shell",
+                        "call_id": call_id,
+                        "commands": commands,
+                    }
+                )
+                if shell_executor is None:
+                    tool_outputs.append(
+                        {
+                            "type": "shell_call_output",
+                            "call_id": call_id,
+                            "output": [
+                                {
+                                    "stdout": "",
+                                    "stderr": "Shell executor is not configured.",
+                                    "outcome": {"type": "exit", "exit_code": 1},
+                                }
+                            ],
+                        }
+                    )
+                    continue
+
+                results = await shell_executor.run_many(commands or [], timeout_ms=timeout_ms)
+                payload: dict[str, Any] = {
+                    "type": "shell_call_output",
+                    "call_id": call_id,
+                    "output": results,
+                }
+                if max_output_length is not None:
+                    payload["max_output_length"] = max_output_length
+
+                exit_code = None
+                try:
+                    out0 = payload.get("output", [{}])[0]
+                    outcome = out0.get("outcome") or {}
+                    if outcome.get("type") == "exit":
+                        exit_code = outcome.get("exit_code")
+                except Exception:
+                    exit_code = None
+
+                await _emit(
+                    {
+                        "type": "tool_result",
+                        "tool": "shell",
+                        "call_id": call_id,
+                        "ok": exit_code == 0 if exit_code is not None else True,
+                        "exit_code": exit_code,
+                    }
+                )
+
+                tool_outputs.append(payload)
+
+            elif item_type in {"web_search_call", "code_interpreter_call"}:
+                call_id2 = (
+                    getattr(item, "call_id", None)
+                    if not isinstance(item, dict)
+                    else item.get("call_id")
+                ) or (
+                    getattr(item, "id", None)
+                    if not isinstance(item, dict)
+                    else item.get("id")
+                ) or f"{item_type}:{turn}:{len(all_outputs)}"
+                await _emit(
+                    {
+                        "type": "tool_call",
+                        "tool": "web_search" if item_type == "web_search_call" else "code_interpreter",
+                        "call_id": call_id2,
+                    }
+                )
+                await _emit(
+                    {
+                        "type": "tool_result",
+                        "tool": "web_search" if item_type == "web_search_call" else "code_interpreter",
+                        "call_id": call_id2,
+                        "ok": True,
+                    }
+                )
+
+        if not tool_outputs:
+            await _emit({"type": "final", "turn": turn + 1})
+            return resp, all_outputs, None
+
+        inputs = tool_outputs
+        prev_id = getattr(resp, "id", None) or prev_id
+
+    await _emit({"type": "error", "error": "tool_loop_exceeded"})
+    return None, all_outputs, "Tool loop exceeded. Try narrowing the request."
+
+
+def _pretty_source(title: str | None, url: str | None, index: int) -> str:
+    if not url:
+        return f"[{index}] (no url)"
+    host = urlparse(url).netloc or url
+    label = (title or "").strip() or host
+    label = label if len(label) <= 100 else label[:99] + "…"
+    return f"[{index}] [{label}]({url})"
+
+
+
+
+class _AskStatusUI:
+    """Temporary progress UI for /ask showing thinking + tool usage."""
+
+    def __init__(
+        self,
+        ctx: commands.Context,
+        *,
+        title: str = "⚙️ Status",
+        ephemeral: bool = False,
+        max_lines: int = 3,
+        edit_interval: float = 0.25,
+    ) -> None:
+        self.ctx = ctx
+        self.title = title
+        self.ephemeral = ephemeral
+        self.max_lines = max_lines
+        self.edit_interval = edit_interval
+
+        self.loading = os.getenv("STATUS_LOADING_EMOJI") or "⏳"
+        self.ok = os.getenv("STATUS_OK_EMOJI") or "✅"
+        self.fail = os.getenv("STATUS_FAIL_EMOJI") or "❌"
+
+        self._msg = None
+        self._items: deque[dict[str, Any]] = deque(maxlen=max_lines)
+        self._by_id: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+        self._dirty = False
+        self._last_edit = 0.0
+        self._flush_task = None
+
+        self._thinking_id = "__thinking__"
+        self._summ_id = "__summarizing__"
+
+    async def _send(self, **kwargs: Any):
+        try:
+            # Pull ephemerality once so we never forward duplicate keyword values
+            # to Discord send/edit helpers, and ensure prefix sends ignore it.
+            eph = kwargs.pop("ephemeral", self.ephemeral)
+            if self.ctx.interaction:
+                if self.ctx.interaction.response.is_done():
+                    return await self.ctx.interaction.followup.send(wait=True, **kwargs, ephemeral=eph)
+                await self.ctx.interaction.response.send_message(**kwargs, ephemeral=eph)
+                return await self.ctx.interaction.original_response()
+
+            return await self.ctx.send(**kwargs)
+        except Exception:
+            return None
+
+    def _tool_label(
+        self, tool: str, name: str | None = None, commands: list[Any] | None = None
+    ) -> str:
+        if tool == "web_search":
+            return "search"
+        if tool == "code_interpreter":
+            return "code"
+        if tool == "function":
+            return f"fn:{name or 'call'}"
+        if tool == "shell":
+            if commands:
+                first_raw = commands[0]
+                if isinstance(first_raw, dict):
+                    first_cmd = (
+                        str(first_raw.get("cmd") or first_raw.get("command") or "").strip()
+                    )
+                else:
+                    first_cmd = str(first_raw).strip()
+
+                if first_cmd:
+                    first_cmd = first_cmd.split()[0]
+                    return f"shell:{first_cmd}"
+            return "shell"
+        return tool
+
+    def _line(self, state: str, label: str) -> str:
+        emoji = self.loading if state == "loading" else self.ok if state == "ok" else self.fail
+        return f"{emoji} {label}"
+
+    def _append_item(self, *, call_id: str, label: str, state: str = "loading") -> None:
+        if len(self._items) == self._items.maxlen:
+            old = self._items[0]
+            old_id = old.get("call_id")
+            if isinstance(old_id, str):
+                self._by_id.pop(old_id, None)
+
+        item = {"call_id": call_id, "label": label, "state": state}
+        self._items.append(item)
+        self._by_id[call_id] = item
+
+    def _remove_item(self, call_id: str) -> None:
+        self._by_id.pop(call_id, None)
+        self._items = deque([it for it in self._items if it.get("call_id") != call_id], maxlen=self.max_lines)
+
+    def _set_state(self, call_id: str, state: str, label: str | None = None) -> None:
+        it = self._by_id.get(call_id)
+        if it:
+            it["state"] = state
+            if label is not None:
+                it["label"] = label
+
+    def _render(self) -> discord.Embed:
+        lines = [self._line(it["state"], it["label"]) for it in self._items]
+        desc = "\n".join(lines).strip() or f"{self.loading} thinking…"
+        return discord.Embed(title=self.title, description=desc)
+
+    async def start(self) -> None:
+        if self._msg is not None:
+            return
+        async with self._lock:
+            self._append_item(call_id=self._thinking_id, label="thinking", state="loading")
+            self._dirty = True
+        self._msg = await self._send(embed=self._render())
+
+    async def _schedule_flush(self) -> None:
+        try:
+            if self._flush_task and not self._flush_task.done():
+                return
+            self._flush_task = asyncio.create_task(self._flush())
+        except Exception:
+            return
+
+    async def _flush(self) -> None:
+        while True:
+            async with self._lock:
+                if not self._dirty:
+                    return
+                now = asyncio.get_running_loop().time()
+                wait_s = max(0.0, self.edit_interval - (now - self._last_edit))
+
+            if wait_s:
+                await asyncio.sleep(wait_s)
+
+            async with self._lock:
+                self._dirty = False
+                self._last_edit = asyncio.get_running_loop().time()
+                msg = self._msg
+                embed = self._render()
+
+            if msg is None:
+                return
+            try:
+                await msg.edit(embed=embed)
+            except Exception:
+                return
+
+            async with self._lock:
+                if not self._dirty:
+                    return
+
+    async def emit(self, evt: dict[str, Any]) -> None:
+        try:
+            typ = evt.get("type")
+
+            if typ == "turn_start":
+                turn = evt.get("turn")
+                max_turns = evt.get("max_turns")
+                async with self._lock:
+                    if self._thinking_id not in self._by_id:
+                        self._append_item(call_id=self._thinking_id, label="thinking", state="loading")
+                    self._set_state(self._thinking_id, "loading", f"thinking (turn {turn}/{max_turns})")
+                    self._dirty = True
+                await self._schedule_flush()
+                return
+
+            if typ == "tool_call":
+                tool = str(evt.get("tool") or "tool")
+                name = evt.get("name") if tool == "function" else None
+                commands = evt.get("commands") if isinstance(evt.get("commands"), list) else None
+                call_id = str(evt.get("call_id") or f"{tool}:{len(self._items)}")
+                label = self._tool_label(tool, name, commands)
+
+                async with self._lock:
+                    self._set_state(self._thinking_id, "ok")
+                    self._append_item(call_id=call_id, label=label, state="loading")
+                    self._dirty = True
+                await self._schedule_flush()
+                return
+
+            if typ == "tool_result":
+                call_id = str(evt.get("call_id") or "")
+                ok = bool(evt.get("ok", True))
+                async with self._lock:
+                    self._set_state(call_id, "ok" if ok else "fail")
+                    self._remove_item(self._thinking_id)
+                    self._append_item(call_id=self._thinking_id, label="thinking", state="loading")
+                    self._dirty = True
+                await self._schedule_flush()
+                return
+
+            if typ == "final":
+                async with self._lock:
+                    self._remove_item(self._thinking_id)
+                    self._append_item(call_id=self._summ_id, label="summarizing", state="loading")
+                    self._dirty = True
+                await self._schedule_flush()
+                return
+
+            if typ == "error":
+                async with self._lock:
+                    self._append_item(call_id="__error__", label="failed", state="fail")
+                    self._dirty = True
+                await self._schedule_flush()
+                return
+        except Exception:
+            return
+
+    async def finish(self, ok: bool = True) -> None:
+        async with self._lock:
+            if self._summ_id in self._by_id:
+                self._set_state(self._summ_id, "ok" if ok else "fail")
+            self._dirty = True
+        await self._schedule_flush()
+
+        async def _delete_later(msg):
+            try:
+                await asyncio.sleep(3)
+                await msg.delete()
+            except Exception:
+                return
+
+        if self._msg is not None:
+            asyncio.create_task(_delete_later(self._msg))
+
+class _ResetConfirmView(discord.ui.View):
+    def __init__(self, author_id: int) -> None:
+        super().__init__(timeout=30)
+        self.author_id = author_id
+        self.result: bool | None = None
+
+    def disable_all_items(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the admin who invoked this can confirm.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Reset", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.result = True
+        self.disable_all_items()
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.result = False
+        self.disable_all_items()
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+
+class Ask(commands.Cog):
+    """Ask the AI (with optional web search)."""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        token = os.getenv("OPENAI_TOKEN")
+        if not token:
+            log.warning("OPENAI_TOKEN is not set. Add it to your .env")
+        if AsyncOpenAI is not None:
+            self.client = AsyncOpenAI(api_key=token)
+            self._async_client = True
+        else:
+            self.client = OpenAI(api_key=token)
+            self._async_client = False
+
+        repo_root = Path(__file__).resolve().parent.parent
+        self.shell_executor = ReadOnlyShellExecutor(ShellPolicy(root_dir=repo_root))
+
+        if not hasattr(self.bot, "ai_last_response_id"):
+            self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
+
+    async def cog_load(self) -> None:
+        existing = self.bot.tree.get_command("ask", type=AppCommandType.chat_input)
+        if existing is self.ask_slash:
+            return
+
+        try:
+            self.bot.tree.add_command(self.ask_slash)
+        except CommandAlreadyRegistered:
+            log.debug("/ask slash command already registered; skipping duplicate add")
+        except Exception:
+            log.exception("Failed to register /ask slash command")
+
+    async def cog_unload(self) -> None:
+        cmd = self.bot.tree.get_command("ask", type=AppCommandType.chat_input)
+        if cmd is not self.ask_slash:
+            return
+
+        try:
+            self.bot.tree.remove_command("ask", type=AppCommandType.chat_input)
+        except Exception:
+            log.exception("Failed to unregister /ask slash command")
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot:
+            return
+        if not self.bot.user:
+            return
+
+        content = (message.content or "").strip()
+        if not content:
+            return
+
+        bot_id = self.bot.user.id
+        mention_prefix = re.compile(rf"^\s*<@!?{bot_id}>\s*")
+
+        prompt: str | None = None
+        match = mention_prefix.match(content)
+        if match:
+            prompt = content[match.end() :].strip()
+
+        if prompt is None:
+            ref = message.reference
+            resolved = getattr(ref, "resolved", None)
+
+            if ref and ref.message_id and not isinstance(resolved, discord.Message):
+                with contextlib.suppress(Exception):
+                    resolved = await message.channel.fetch_message(ref.message_id)
+
+            if isinstance(resolved, discord.Message) and resolved.author:
+                if resolved.author.id == bot_id:
+                    prompt = content
+
+        if prompt is None:
+            return
+
+        ctx = await self.bot.get_context(message)
+        if getattr(ctx, "command", None) is not None:
+            return
+
+        if not prompt:
+            return
+
+        await self.ask(ctx, action="ask", text=prompt)
+
+    def _is_noarg_command(self, command: commands.Command) -> bool:
+        try:
+            sig = inspect.signature(command.callback)
+        except (TypeError, ValueError):
+            return False
+
+        params = [
+            p
+            for p in sig.parameters.values()
+            if p.name not in {"self", "ctx", "interaction", "context"}
+        ]
+
+        for param in params:
+            if param.kind in {param.VAR_POSITIONAL, param.VAR_KEYWORD}:
+                return False
+            if param.default is param.empty and param.kind in {
+                param.POSITIONAL_ONLY,
+                param.POSITIONAL_OR_KEYWORD,
+                param.KEYWORD_ONLY,
+            }:
+                return False
+
+        return True
+
+    def _get_single_optional_param(self, command: commands.Command) -> inspect.Parameter | None:
+        try:
+            sig = inspect.signature(command.callback)
+        except (TypeError, ValueError):
+            return None
+
+        params = [
+            p
+            for p in sig.parameters.values()
+            if p.name not in {"self", "ctx", "interaction", "context"}
+        ]
+
+        if len(params) != 1:
+            return None
+
+        param = params[0]
+        if param.kind in {param.VAR_POSITIONAL, param.VAR_KEYWORD}:
+            return None
+        if param.default is param.empty:
+            return None
+
+        return param
+
+    async def _convert_single_optional(
+        self, ctx: commands.Context, param: inspect.Parameter, raw: str
+    ) -> Any:
+        anno = param.annotation
+        origin = get_origin(anno)
+        if origin in {Union, types.UnionType}:
+            args = [a for a in get_args(anno) if a is not type(None)]
+            if len(args) == 1:
+                anno = args[0]
+            elif set(args) <= {discord.Member, discord.User}:
+                anno = discord.Member
+
+        if anno in {inspect._empty, str}:
+            return raw
+
+        if anno in {discord.Member, discord.User}:
+            try:
+                return await commands.MemberConverter().convert(ctx, raw)
+            except Exception:
+                return await commands.UserConverter().convert(ctx, raw)
+
+        raise TypeError(f"Unsupported arg type for bot_invoke: {anno!r}")
+
+    def _get_command_names(self) -> list[str]:
+        return sorted({command.qualified_name for command in self.bot.commands if not command.hidden})
+
+    def _format_command_list(self, max_items: int = 30) -> str:
+        command_names = self._get_command_names()
+        if not command_names:
+            return "(none)"
+
+        displayed = command_names[:max_items]
+        remaining = len(command_names) - len(displayed)
+        commands_text = ", ".join(f"/{name}" for name in displayed)
+        if remaining > 0:
+            commands_text += f" (+{remaining} more)"
+        return commands_text
+
+    def _build_bot_tools(self) -> list[dict[str, Any]]:
+        command_names = self._get_command_names()
+        if not command_names:
+            return []
+
+        return [
+            {
+                "type": "function",
+                "name": "bot_commands",
+                "description": (
+                    "Look up details about a Discord bot command such as /help or /ping, "
+                    "including whether the current user can run it."
+                ),
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The exact command name to inspect (e.g., ping).",
+                            "enum": command_names,
+                        }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "bot_invoke",
+                "description": (
+                    "Safely run a bot command in the current channel. "
+                    "Supports a single optional argument for commands that accept one, "
+                    "like /help or /userinfo. "
+                    "Destructive or moderation commands (e.g., purge) are blocked for the LLM."
+                ),
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The exact command name to run (e.g., ping).",
+                            "enum": command_names,
+                        },
+                        "arg": {
+                            "type": "string",
+                            "description": (
+                                "Single argument field. Use empty string '' when no argument is needed. "
+                                "Commands that accept one optional argument (e.g., /help topic or /userinfo @name) "
+                                "can take that value here."
+                            ),
+                            "default": "",
+                            "maxLength": 150,
+                        },
+                    },
+                    "required": ["name", "arg"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+
+    async def _can_run_command(
+        self, ctx: commands.Context, command: commands.Command
+    ) -> tuple[bool, str]:
+        try:
+            can_run = await command.can_run(ctx)
+            return bool(can_run), ""
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc) or exc.__class__.__name__
+            return False, reason
+
+    async def _function_router(
+        self, ctx: commands.Context, name: str, args: dict[str, Any]
+    ) -> dict[str, Any] | str:
+        if name not in {"bot_commands", "bot_invoke"}:
+            return f"Unknown function: {name}"
+
+        command_name = (args.get("name") or "").strip()
+        if not command_name:
+            return "Command name is required."
+
+        command = self.bot.get_command(command_name)
+        if not command or command.hidden:
+            suggestions, extras = build_suggestions(
+                command_name.lower(), self.bot.commands, getattr(self.bot, "events", [])
+            )
+            return {
+                "ok": False,
+                "error": "command_not_available",
+                "reason": f"Command '{command_name}' is not available.",
+                "suggestions": suggestions,
+                "extras": extras,
+            }
+
+        extras = getattr(command, "extras", {}) or {}
+        category = extras.get("category", "")
+        usage = command.usage or ""
+        usage_text = f"/{command.qualified_name}" + (f" {usage}" if usage else "")
+        can_run, can_run_reason = await self._can_run_command(ctx, command)
+        single_optional_param = self._get_single_optional_param(command)
+
+        if name == "bot_commands":
+            root_name = command.qualified_name.split()[0]
+            llm_allowed = (
+                can_run
+                and root_name not in LLM_BLOCKED_COMMANDS
+                and category not in LLM_BLOCKED_CATEGORIES
+                and (self._is_noarg_command(command) or single_optional_param is not None)
+            )
+
+            return {
+                "name": command.qualified_name,
+                "description": command.description or "",
+                "help": command.help or "",
+                "category": category,
+                "pro": extras.get("pro", ""),
+                "usage": usage_text,
+                "aliases": list(command.aliases),
+                "can_run": can_run,
+                "can_run_reason": can_run_reason,
+                "llm_can_invoke": llm_allowed,
+                "llm_blocked_reason": (
+                    "no_permission"
+                    if not can_run
+                    else "blocked_command"
+                    if root_name in LLM_BLOCKED_COMMANDS
+                    else "blocked_category"
+                    if category in LLM_BLOCKED_CATEGORIES
+                    else "arguments_not_supported"
+                    if not (self._is_noarg_command(command) or single_optional_param is not None)
+                    else ""
+                ),
+            }
+
+        if not can_run:
+            return {"ok": False, "error": "no_permission", "reason": can_run_reason}
+
+        root_name = command.qualified_name.split()[0]
+
+        raw_arg = args.get("arg") or ""
+        arg = raw_arg.strip()
+
+        if root_name in LLM_BLOCKED_COMMANDS or category in LLM_BLOCKED_CATEGORIES:
+            return {
+                "ok": False,
+                "error": "restricted_for_llm",
+                "reason": "destructive_or_moderation",
+            }
+
+        if arg and single_optional_param is None:
+            return {
+                "ok": False,
+                "error": "arguments_not_supported",
+                "reason": "Command does not accept arguments. Use arg:'' for this command.",
+            }
+
+        history_after = self._history_after(ctx)
+
+        if arg:
+            try:
+                converted = await self._convert_single_optional(ctx, single_optional_param, arg)
+            except TypeError:
+                return {
+                    "ok": False,
+                    "error": "arguments_not_supported",
+                    "reason": "Command argument type not supported for bot_invoke.",
+                }
+            except Exception:
+                return {
+                    "ok": False,
+                    "error": "bad_argument",
+                    "reason": f"Couldn't parse argument '{arg}'.",
+                }
+
+            try:
+                await ctx.invoke(command, **{single_optional_param.name: converted})
+                ran = f"{command.qualified_name} {arg}".strip()
+                response: dict[str, Any] = {"ok": True, "ran": ran}
+                messages = await self._collect_bot_messages(ctx, after=history_after)
+                if messages:
+                    response["messages"] = messages
+                return response
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "ok": False,
+                    "error": "invoke_failed",
+                    "reason": str(exc) or exc.__class__.__name__,
+                }
+
+        if not (self._is_noarg_command(command) or single_optional_param is not None):
+            return {"ok": False, "error": "arguments_not_supported"}
+
+        try:
+            await ctx.invoke(command)
+            response: dict[str, Any] = {"ok": True, "ran": command.qualified_name}
+            messages = await self._collect_bot_messages(ctx, after=history_after)
+            if messages:
+                response["messages"] = messages
+            return response
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": "invoke_failed",
+                "reason": str(exc) or exc.__class__.__name__,
+            }
+
+    def _history_after(self, ctx: commands.Context) -> datetime:
+        if getattr(ctx, "message", None) is not None and ctx.message:
+            return ctx.message.created_at
+        if getattr(ctx, "interaction", None) is not None and ctx.interaction:
+            return discord.utils.snowflake_time(ctx.interaction.id)
+        return datetime.now(timezone.utc)
+
+    async def _responses_create(self, **kwargs: Any):
+        if self._async_client:
+            return await self.client.responses.create(**kwargs)
+        return await asyncio.to_thread(self.client.responses.create, **kwargs)
+
+    async def _collect_bot_messages(
+        self, ctx: commands.Context, *, after: datetime, limit: int = 5
+    ) -> list[str]:
+        channel = getattr(ctx, "channel", None)
+        if channel is None:
+            return []
+
+        bot_user = getattr(self.bot, "user", None)
+        if bot_user is None:
+            return []
+
+        try:
+            messages = [
+                message
+                async for message in channel.history(limit=limit, after=after)
+                if message.author.id == bot_user.id
+            ]
+        except Exception:
+            return []
+
+        messages.sort(key=lambda m: m.created_at)
+
+        collected: list[str] = []
+        for message in messages:
+            content = (message.content or "").strip()
+            if content:
+                collected.append(content)
+
+            for embed in message.embeds:
+                embed_parts = []
+                if embed.title:
+                    embed_parts.append(embed.title)
+                if embed.description:
+                    embed_parts.append(embed.description)
+                for field in getattr(embed, "fields", []):
+                    name = (field.name or "").strip()
+                    value = (field.value or "").strip()
+                    if name and value:
+                        embed_parts.append(f"{name}\n{value}")
+                    elif value:
+                        embed_parts.append(value)
+                if embed_parts:
+                    collected.append("\n".join(embed_parts))
+
+        return collected
+
+    async def _reply(self, ctx: commands.Context, **kwargs: Any) -> None:
+        if ctx.interaction:
+            if ctx.interaction.response.is_done():
+                await ctx.interaction.followup.send(**kwargs)
+            else:
+                await ctx.interaction.response.send_message(**kwargs)
+        else:
+            await ctx.send(**kwargs)
+
+    @commands.command(
+        name="ask",
+        description="Ask the AI anything with optional images and a reset action.",
+        usage="[ask|reset] <question (optional when attaching images)>",
+        rest_is_raw=True,
+        help=(
+            "Ask a question and get a concise AI answer. You can attach up to three images and"
+            " I'll describe or analyze them alongside your text. Large images are automatically"
+            " resized or recompressed toward ~3MB to keep requests light. Web search may be"
+            " used when needed. Admins can clear the channel conversation history by choosing"
+            " the reset action.\n\n"
+            f"**Prefix**: `{BOT_PREFIX}ask <question>` (attach files to your message; replies pick up the referenced images).\n"
+            "**Slash**: `/ask action: ask text:<question> image1:<attachment> image2:<attachment> image3:<attachment>`\n"
+            "**Examples**: `/ask action: ask text:What's a positive news story today?`\n"
+            "`/ask action: ask image1:<attach cat.png>`\n"
+            f"`{BOT_PREFIX}ask What's a positive news story today?`"
+        ),
+        extras={
+            "category": "AI",
+            "pro": (
+                "Uses the Responses API with web_search, accepts attached images for vision "
+                "analysis, keeps per-channel conversation state via previous_response_id, and "
+                "truncates output to 2000 characters to fit Discord limits."
+            ),
+            "destination": "Send a prompt (and optional images) to the AI or reset the channel memory.",
+            "plus": "Use action reset to clear the channel conversation; admins only for resets.",
+        },
+    )
+    async def ask(self, ctx: commands.Context, action: str = "ask", *, text: str | None = None) -> None:
+        await self._ask_impl(ctx, action, text, extra_images=None)
+
+    @app_commands.command(
+        name="ask",
+        description="Ask the AI anything. Send text and optionally attach images for analysis.",
+    )
+    @app_commands.describe(
+        action="Choose whether to ask a question or reset the channel's ask memory (admins only).",
+        text="Your prompt for the AI. Leave blank if you're only attaching images.",
+        image1="Optional first image for the AI to analyze.",
+        image2="Optional second image for the AI to analyze.",
+        image3="Optional third image for the AI to analyze.",
+    )
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="ask", value="ask"),
+            app_commands.Choice(name="reset", value="reset"),
+        ]
+    )
+    async def ask_slash(
+        self,
+        interaction: discord.Interaction,
+        action: str = "ask",
+        text: str | None = None,
+        image1: discord.Attachment | None = None,
+        image2: discord.Attachment | None = None,
+        image3: discord.Attachment | None = None,
+    ) -> None:
+        ctx_factory = getattr(commands.Context, "from_interaction", None)
+        if ctx_factory is None:
+            await interaction.response.send_message(
+                "This command isn't available right now. Please try again later.", ephemeral=True
+            )
+            return
+
+        ctx_candidate = ctx_factory(interaction)
+        ctx = await ctx_candidate if inspect.isawaitable(ctx_candidate) else ctx_candidate
+        await self._ask_impl(ctx, action, text, extra_images=[image1, image2, image3])
+
+    async def _ask_impl(
+        self,
+        ctx: commands.Context,
+        action: str,
+        text: str | None,
+        extra_images: list[discord.Attachment | None] | None = None,
+    ) -> None:
+        action = (action or "ask").lower()
+        text = (text or "").strip()
+
+        attachments: list[discord.Attachment] = []
+        seen_attachment_ids: set[int] = set()
+        if getattr(ctx, "message", None) is not None and ctx.message:
+            for att in ctx.message.attachments:
+                att_id = getattr(att, "id", None)
+                if att_id is not None and att_id in seen_attachment_ids:
+                    continue
+                if att_id is not None:
+                    seen_attachment_ids.add(att_id)
+                attachments.append(att)
+
+        for img in extra_images or []:
+            if img is not None:
+                att_id = getattr(img, "id", None)
+                if att_id is not None and att_id in seen_attachment_ids:
+                    continue
+                if att_id is not None:
+                    seen_attachment_ids.add(att_id)
+                attachments.append(img)
+
+        if getattr(ctx, "message", None) is not None and ctx.message and ctx.message.reference:
+            ref_msg = ctx.message.reference.resolved
+            if not isinstance(ref_msg, discord.Message):
+                with contextlib.suppress(Exception):
+                    ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)  # type: ignore[arg-type]
+            if isinstance(ref_msg, discord.Message):
+                for att in ref_msg.attachments:
+                    att_id = getattr(att, "id", None)
+                    if att_id is not None and att_id in seen_attachment_ids:
+                        continue
+                    if att_id is not None:
+                        seen_attachment_ids.add(att_id)
+                    attachments.append(att)
+
+        if action not in {"ask", "reset"}:
+            text = f"{action} {text}".strip()
+            action = "ask"
+
+        if action == "reset" and text:
+            text = f"reset {text}".strip()
+            action = "ask"
+
+        perms = getattr(ctx.author, "guild_permissions", None) if ctx.guild else None
+        is_admin = bool(getattr(perms, "administrator", False))
+
+        if action == "reset" and not text and not is_admin:
+            text = "reset"
+            action = "ask"
+
+        if action == "ask":
+            await defer_interaction(ctx)
+
+        guild_id = ctx.guild.id if ctx.guild else 0
+        channel_id = ctx.channel.id if ctx.channel else 0
+        state_key = f"{guild_id}:{channel_id}"
+
+        if action == "reset":
+            if ctx.guild is None:
+                await self._reply(ctx, content="Use this in a server channel to reset the conversation state.")
+                return
+
+            if not is_admin:
+                await self._reply(
+                    ctx, content="Only server administrators can reset the ask conversation for this channel."
+                )
+                return
+
+            prompt_embed = discord.Embed(
+                title="\U0001F9E0 Reset ask memory?",
+                description=(
+                    "I'll forget the ongoing conversation for this channel so the next ask starts fresh."
+                    " Proceed?"
+                ),
+                color=0x5865F2,
+            )
+
+            view = _ResetConfirmView(ctx.author.id)
+
+            prompt_message: discord.Message | None = None
+            try:
+                if ctx.interaction:
+                    await ctx.interaction.response.send_message(
+                        embed=prompt_embed, view=view, ephemeral=True
+                    )
+                    prompt_message = await ctx.interaction.original_response()
+                else:
+                    prompt_message = await ctx.send(embed=prompt_embed, view=view)
+            except Exception:
+                log.exception("Failed to send ask reset confirmation")
+                return
+
+            await view.wait()
+
+            def _clone_prompt_embed() -> discord.Embed:
+                return discord.Embed.from_dict(prompt_embed.to_dict())
+
+            if view.result is None:
+                if prompt_message:
+                    with contextlib.suppress(Exception):
+                        await prompt_message.edit(
+                            embed=_clone_prompt_embed().set_footer(text="Reset timed out."), view=None
+                        )
+                return
+
+            if view.result is False:
+                if prompt_message:
+                    with contextlib.suppress(Exception):
+                        await prompt_message.edit(
+                            embed=_clone_prompt_embed().set_footer(text="Reset canceled."), view=None
+                        )
+                return
+
+            with contextlib.suppress(Exception):
+                await prompt_message.edit(view=None)
+
+            try:
+                removed = self.bot.ai_last_response_id.pop(state_key, None)  # type: ignore[attr-defined]
+            except Exception:
+                removed = None
+
+            if removed:
+                desc = "Channel memory wiped. Want me to clear another channel too?"
+                color = 0x57F287
+                title = "\u2705 Ask conversation reset"
+            else:
+                desc = "There wasn't any saved ask memory here. Need me to reset somewhere else?"
+                color = 0xFEE75C
+                title = "\u2139\ufe0f No ask memory found"
+
+            result_embed = discord.Embed(title=title, description=desc, color=color)
+            result_embed.set_footer(text="Run /ask with action: reset in another channel if needed.")
+
+            reply_kwargs = {"embed": result_embed}
+            if ctx.interaction:
+                reply_kwargs["ephemeral"] = True
+
+            await self._reply(ctx, **reply_kwargs)
+            return
+
+        skipped_notes: list[str] = []
+
+        def _guess_content_type(att: discord.Attachment) -> str:
+            content_type = (att.content_type or "").lower()
+            if content_type and ";" in content_type:
+                content_type = content_type.split(";", 1)[0]
+            if not content_type:
+                ext = Path(getattr(att, "filename", "")).suffix.lower()
+                ext_map = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                }
+                content_type = ext_map.get(ext, "")
+            return content_type
+
+        allowed_types = {"image/png", "image/jpeg", "image/webp"}
+        image_atts: list[tuple[discord.Attachment, str]] = []
+
+        for att in attachments:
+            content_type = _guess_content_type(att)
+            if content_type not in allowed_types:
+                skipped_notes.append(
+                    "Skipped an unsupported attachment (only PNG/JPEG/WEBP images are processed)."
+                )
+                continue
+
+            image_atts.append((att, content_type))
+
+        async def _prepare_image_url(
+            att: discord.Attachment, content_type: str
+        ) -> tuple[str | None, str | None]:
+            filename = getattr(att, "filename", "image") or "image"
+            url = getattr(att, "url", "") or ""
+            size = getattr(att, "size", 0) or 0
+
+            if url and size and size <= MAX_IMAGE_BYTES:
+                return url, None
+
+            try:
+                data = await att.read()
+            except Exception:
+                return None, f"Failed to read {filename}."
+
+            if not data:
+                return None, f"{filename} was empty."
+
+            data_len = len(data)
+
+            if url and (size == 0 or size <= MAX_IMAGE_BYTES) and data_len <= MAX_IMAGE_BYTES:
+                return url, None
+
+            if not url and data_len <= MAX_IMAGE_BYTES:
+                b64 = base64.b64encode(data).decode("ascii")
+                return f"data:{content_type};base64,{b64}", None
+
+            try:
+                img = Image.open(BytesIO(data))
+                img = ImageOps.exif_transpose(img)
+            except (UnidentifiedImageError, OSError):
+                if url:
+                    return url, f"Used original URL for {filename} (couldn't decode the file)."
+                return None, f"Couldn't decode {filename}."
+
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                img = img.convert("RGBA")
+                bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                bg.alpha_composite(img)
+                img = bg.convert("RGB")
+            else:
+                img = img.convert("RGB")
+
+            if max(img.size) > MAX_IMAGE_DIM:
+                scale = MAX_IMAGE_DIM / max(img.size)
+                img = img.resize(
+                    (max(1, int(img.size[0] * scale)), max(1, int(img.size[1] * scale))),
+                    Image.LANCZOS,
+                )
+
+            def _encode_jpeg(image: Image.Image, quality: int) -> bytes:
+                out = BytesIO()
+                image.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
+                return out.getvalue()
+
+            attempt = img
+            for shrink_round in range(3):
+                width, height = attempt.size
+                for quality in (85, 75, 65, 55, 45, 35, 30):
+                    jpeg_bytes = _encode_jpeg(attempt, quality)
+                    if len(jpeg_bytes) <= MAX_IMAGE_BYTES:
+                        b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+                        note = (
+                            f"Compressed {filename} to {len(jpeg_bytes):,} bytes at "
+                            f"{width}x{height} (q={quality})."
+                        )
+                        return f"data:image/jpeg;base64,{b64}", note
+
+                attempt = attempt.resize(
+                    (max(1, width // 2), max(1, height // 2)),
+                    Image.LANCZOS,
+                )
+
+            if url:
+                return (
+                    url,
+                    f"Used original URL for {filename} after compression exceeded {MAX_IMAGE_BYTES:,} bytes.",
+                )
+
+            return None, f"Couldn't compress {filename} under {MAX_IMAGE_BYTES:,} bytes."
+
+        if len(image_atts) > 3:
+            skipped_notes.append("Only the first 3 images were processed.")
+            image_atts = image_atts[:3]
+
+        if not text and image_atts:
+            text = "What's in this image?"
+
+        if not text:
+            await self._reply(ctx, content="Your question was empty. Try `c!ask hello`.")
+            return
+
+        prev_id = None
+        try:
+            prev_id = self.bot.ai_last_response_id.get(state_key)  # type: ignore[attr-defined]
+        except Exception:
+            prev_id = None
+
+        username = getattr(ctx.author, "display_name", None) or getattr(ctx.author, "name", "user")
+        if ctx.guild:
+            try:
+                ofs = get_guild_offset(self.bot, ctx.guild.id)
+                tz = timezone(timedelta(hours=ofs))
+                tz_label = fmt_ofs(ofs)
+            except Exception:
+                tz = timezone.utc
+                tz_label = "UTC"
+        else:
+            tz = timezone.utc
+            tz_label = "UTC"
+
+        current_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M") + f" {tz_label}"
+        commands_text = self._format_command_list()
+        instructions = (
+            "You are a buddy AI in a Discord bot. "
+            f"Speak casually (no polite speech) and address the user as \"{username}\". "
+            f"Current time: {current_time}. "
+            "Your built-in knowledge might be wrong or outdated; question it and seek fresh verification. "
+            "Be brief and start with the conclusion; add details only when necessary. "
+            "Avoid shaky overconfident claims; verify with web_search when needed. "
+            "Use the shell tool only for read-only repo inspection with safe commands (ls, cat, head, tail, lines, diff, find, tree, grep, rg, wc, stat) inside the repo. "
+            "Shell rules: one command at a time; never use pipes, redirects, subshells, or &&. Builtins are always used; OS binaries are never invoked. "
+            "For rg/grep/find always include -m <limit> and an explicit path; tree requires -L <depth> and an explicit path. Only the listed flags work (rg -n/-i/-m/-C/-A/-B, grep -n/-i/-m/-C/-A/-B, find -m, tree -L/-a, ls -l/-la/-al/-a/-lh, lines -s/-e, diff -u). "
+            "If a shell call is denied, simplify to a single safe command like `rg -n -m 200 PATTERN path`, `find -m 200 PATTERN path`, `tree -L 2 path`, or `cat path`. "
+            "Never modify files, never attempt network access, and prefer the code interpreter tool for calculations without writing files. "
+            f"Use the bot_commands function tool to look up available bot commands before suggesting bot actions. Available commands: {commands_text}. "
+            "Use bot_invoke only for safe commands. bot_invoke always requires an arg field: use arg:'' for commands with no argument. "
+            "Only use a non-empty arg for commands that accept a single optional parameter (e.g., /help topic or /userinfo @name); otherwise pass ''. "
+            "If the user only wants the help text, prefer bot_commands instead of invoking /help."
+        )
+
+        tools = [
+            {"type": "web_search"},
+            {"type": "code_interpreter", "container": {"type": "auto", "memory_limit": "4g"}},
+            {"type": "shell"},
+            *self._build_bot_tools(),
+        ]
+
+        try:
+            content_parts: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
+
+            for att, content_type in image_atts:
+                image_url, note = await _prepare_image_url(att, content_type)
+                if note:
+                    skipped_notes.append(note)
+                if not image_url:
+                    continue
+
+                content_parts.append({"type": "input_image", "image_url": image_url})
+
+            input_items = [{"role": "user", "content": content_parts}]
+
+            status_ui = _AskStatusUI(ctx, title="⚙️ Status", ephemeral=bool(ctx.interaction))
+            await status_ui.start()
+
+            async def _router(fname: str, fargs: dict[str, Any]):
+                return await self._function_router(ctx, fname, fargs)
+
+            resp, all_outputs, error = await run_responses_agent(
+                self._responses_create,
+                model="gpt-5.2-2025-12-11",
+                input_items=input_items,
+                tools=tools,
+                include=["web_search_call.action.sources"],
+                instructions=instructions,
+                previous_response_id=prev_id,
+                shell_executor=self.shell_executor,
+                function_router=_router,
+                event_cb=status_ui.emit,
+                reasoning=_ask_reasoning_cfg(),
+                text=_ask_text_cfg(),
+            )
+
+            if error or resp is None:
+                raise RuntimeError(error or "Unknown tool loop failure")
+
+            try:
+                self.bot.ai_last_response_id[state_key] = getattr(resp, "id", None)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+            answer = getattr(resp, "output_text", "") or "(no output)"
+            answer = _truncate_discord(answer.strip(), 2000)
+
+            seen = set()
+            sources_lines: list[str] = []
+            for item in all_outputs:
+                item_type = getattr(item, "type", None) if not isinstance(item, dict) else item.get("type")
+                if item_type != "web_search_call":
+                    continue
+                action = getattr(item, "action", None) if not isinstance(item, dict) else item.get("action")
+                sources = getattr(action, "sources", None) if not isinstance(action, dict) else action.get("sources")
+                sources = sources or []
+                for source in sources:
+                    url = getattr(source, "url", None) if not isinstance(source, dict) else source.get("url")
+                    if not url or url in seen:
+                        continue
+                    seen.add(url)
+                    title = getattr(source, "title", None) if not isinstance(source, dict) else source.get("title")
+                    sources_lines.append(_pretty_source(title, url, len(sources_lines) + 1))
+
+            title_text = _question_preview(text) or "Ask"
+            title_text = f"\U0001F4AC {title_text}"
+            embed = discord.Embed(
+                title=title_text,
+                description=answer,
+                color=0x5865F2,
+            )
+            if sources_lines:
+                current_block: list[str] = []
+                current_length = 0
+                truncated = 0
+
+                for line in sources_lines:
+                    line_length = len(line) + (1 if current_block else 0)
+                    if current_length + line_length > 1024:
+                        truncated += 1
+                        continue
+                    current_block.append(line)
+                    current_length += line_length
+
+                if truncated:
+                    more_note = f"...and {truncated} more source{'s' if truncated != 1 else ''}."
+                    note_length = len(more_note) + (1 if current_block else 0)
+                    if current_length + note_length > 1024 and current_block:
+                        removed = current_block.pop()
+                        current_length -= len(removed) + (1 if current_block else 0)
+                        truncated += 1
+                        note_length = len(more_note) + (1 if current_block else 0)
+                    if current_length + note_length <= 1024:
+                        current_block.append(more_note)
+
+                if current_block:
+                    embed.add_field(name="\U0001F517 Sources", value="\n".join(current_block), inline=False)
+
+            footer_parts = ["Crafted with care ✨"]
+            if skipped_notes:
+                unique_notes = []
+                seen_notes = set()
+                for note in skipped_notes:
+                    if note not in seen_notes:
+                        unique_notes.append(note)
+                        seen_notes.add(note)
+                footer_parts.append("; ".join(unique_notes))
+
+            embed.set_footer(text=" | ".join(footer_parts))
+
+            await self._reply(ctx, embed=embed)
+            with contextlib.suppress(Exception):
+                await status_ui.finish(ok=True)
+
+        except Exception:
+            with contextlib.suppress(Exception):
+                if "status_ui" in locals():
+                    await status_ui.finish(ok=False)
+            log.exception("Failed to execute ask command")
+            error_embed = discord.Embed(
+                title="\u26A0\ufe0f Ask Failed",
+                description="An error occurred while calling the OpenAI API. Check the logs for details.",
+                color=0xFF0000,
+            )
+            try:
+                await self._reply(ctx, embed=error_embed)
+            except Exception:
+                pass
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(Ask(bot), override=True)

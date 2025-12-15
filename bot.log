@@ -1,0 +1,64 @@
+2025-12-14 21:22:40,990 [INFO] discord.client: logging in using static token
+2025-12-14 21:22:42,258 [INFO] __main__: Loaded extension commands.ask
+2025-12-14 21:22:42,266 [INFO] __main__: Loaded extension commands.help
+2025-12-14 21:22:42,272 [INFO] __main__: Loaded extension commands.info
+2025-12-14 21:22:42,277 [INFO] __main__: Loaded extension commands.messages
+2025-12-14 21:22:42,281 [INFO] __main__: Loaded extension commands.ping
+2025-12-14 21:22:42,289 [INFO] __main__: Loaded extension commands.purge
+2025-12-14 21:22:42,293 [INFO] __main__: Loaded extension commands.uptime
+2025-12-14 21:22:42,296 [INFO] __main__: Loaded extension cogs.settime
+2025-12-14 21:22:42,298 [INFO] __main__: Discovered 8 extensions
+2025-12-14 21:22:42,299 [INFO] __main__: Extensions loaded: 8 success, 0 failed
+2025-12-14 21:22:42,602 [INFO] __main__: Synced 9 application command(s): ask, help, serverinfo, userinfo, messages, ping, purge, uptime, settime
+2025-12-14 21:22:43,129 [INFO] discord.gateway: Shard ID None has connected to Gateway (Session ID: 63d0c93b9968aaa3e08907f9170ab0f9).
+2025-12-14 21:22:45,141 [INFO] __main__: Logged in as OЯA#2607 (ID 1448656653896519850)
+2025-12-14 21:23:01,997 [INFO] httpx: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+2025-12-14 23:41:02,534 [INFO] discord.gateway: Shard ID None has successfully RESUMED session 63d0c93b9968aaa3e08907f9170ab0f9.
+2025-12-15 00:25:32,236 [INFO] httpx: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+2025-12-15 00:37:19,147 [INFO] httpx: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+2025-12-15 00:52:59,689 [INFO] httpx: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+2025-12-15 02:31:25,869 [INFO] discord.gateway: Shard ID None has successfully RESUMED session 63d0c93b9968aaa3e08907f9170ab0f9.
+2025-12-15 03:45:46,401 [INFO] discord.gateway: Shard ID None has successfully RESUMED session 63d0c93b9968aaa3e08907f9170ab0f9.
+2025-12-15 07:40:30,578 [INFO] discord.gateway: Shard ID None has successfully RESUMED session 63d0c93b9968aaa3e08907f9170ab0f9.
+2025-12-15 08:40:54,059 [INFO] discord.gateway: Shard ID None has successfully RESUMED session 63d0c93b9968aaa3e08907f9170ab0f9.
+2025-12-15 09:53:47,608 [INFO] discord.gateway: Shard ID None has successfully RESUMED session 63d0c93b9968aaa3e08907f9170ab0f9.
+2025-12-15 10:10:48,898 [INFO] httpx: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+2025-12-15 10:11:17,330 [INFO] httpx: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+2025-12-15 10:11:25,239 [INFO] httpx: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+2025-12-15 10:11:34,022 [INFO] httpx: HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"
+2025-12-15 11:24:14,806 [INFO] discord.gateway: Shard ID None has successfully RESUMED session 63d0c93b9968aaa3e08907f9170ab0f9.
+2025-12-15 13:55:45,241 [ERROR] discord.app_commands.tree: Ignoring exception in command tree
+Traceback (most recent call last):
+  File "/home/ubuntu/capBOT-main/venv/lib/python3.12/site-packages/discord/app_commands/tree.py", line 1138, in wrapper
+    await self._call(interaction)
+  File "/home/ubuntu/capBOT-main/venv/lib/python3.12/site-packages/discord/app_commands/tree.py", line 1270, in _call
+    command, options = self._get_app_command_options(data)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/capBOT-main/venv/lib/python3.12/site-packages/discord/app_commands/tree.py", line 1174, in _get_app_command_options
+    raise CommandNotFound(name, parents)
+discord.app_commands.errors.CommandNotFound: Application command 'image' not found
+2025-12-15 13:57:32,946 [ERROR] discord.app_commands.tree: Ignoring exception in command tree
+Traceback (most recent call last):
+  File "/home/ubuntu/capBOT-main/venv/lib/python3.12/site-packages/discord/app_commands/tree.py", line 1138, in wrapper
+    await self._call(interaction)
+  File "/home/ubuntu/capBOT-main/venv/lib/python3.12/site-packages/discord/app_commands/tree.py", line 1270, in _call
+    command, options = self._get_app_command_options(data)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/capBOT-main/venv/lib/python3.12/site-packages/discord/app_commands/tree.py", line 1174, in _get_app_command_options
+    raise CommandNotFound(name, parents)
+discord.app_commands.errors.CommandNotFound: Application command 'image' not found
+2025-12-15 13:58:21,351 [INFO] discord.gateway: Shard ID None has successfully RESUMED session 63d0c93b9968aaa3e08907f9170ab0f9.
+2025-12-15 14:49:26,533 [INFO] discord.client: logging in using static token
+2025-12-15 14:49:27,643 [INFO] __main__: Loaded extension commands.ask
+2025-12-15 14:49:27,647 [INFO] __main__: Loaded extension commands.help
+2025-12-15 14:49:27,651 [INFO] __main__: Loaded extension commands.info
+2025-12-15 14:49:27,654 [INFO] __main__: Loaded extension commands.messages
+2025-12-15 14:49:27,657 [INFO] __main__: Loaded extension commands.ping
+2025-12-15 14:49:27,661 [INFO] __main__: Loaded extension commands.purge
+2025-12-15 14:49:27,663 [INFO] __main__: Loaded extension commands.uptime
+2025-12-15 14:49:27,666 [INFO] __main__: Loaded extension cogs.settime
+2025-12-15 14:49:27,668 [INFO] __main__: Discovered 8 extensions
+2025-12-15 14:49:27,670 [INFO] __main__: Extensions loaded: 8 success, 0 failed
+2025-12-15 14:49:28,023 [INFO] __main__: Synced 9 application command(s): ask, help, serverinfo, userinfo, messages, ping, purge, uptime, settime
+2025-12-15 14:49:28,525 [INFO] discord.gateway: Shard ID None has connected to Gateway (Session ID: a3cd79e73481ae9cc52f21d5c23ea94d).
+2025-12-15 14:49:30,538 [INFO] __main__: Logged in as OЯA#2607 (ID 1448656653896519850)
