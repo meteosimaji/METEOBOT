@@ -15,6 +15,8 @@ log = logging.getLogger(__name__)
 _openai_module = importlib.import_module("openai")
 OpenAI = getattr(_openai_module, "OpenAI")
 AsyncOpenAI = getattr(_openai_module, "AsyncOpenAI", None)
+BadRequestError = getattr(_openai_module, "BadRequestError", ())
+OPENAI_OMIT = getattr(_openai_module, "omit", None)
 
 
 class Image(commands.Cog):
@@ -71,10 +73,17 @@ class Image(commands.Cog):
             )
 
         try:
+            request_kwargs = {
+                "model": "gpt-image-1.5",
+                "prompt": prompt,
+                "size": "1024x1024",
+                "output_format": "png",
+            }
+            if OPENAI_OMIT is not None:
+                request_kwargs["response_format"] = OPENAI_OMIT
+
             result = await self._images_generate(
-                model="gpt-image-1.5",
-                prompt=prompt,
-                size="1024x1024",
+                **request_kwargs,
             )
 
             def _get_from(obj, key: str):
@@ -89,7 +98,7 @@ class Image(commands.Cog):
             if not data_items:
                 raise RuntimeError("No image returned")
             data = data_items[0]
-            b64 = _get_from(data, "b64_json")
+            b64 = _get_from(data, "b64_json") or _get_from(data, "image_base64")
             url = _get_from(data, "url")
             if b64:
                 image_bytes = base64.b64decode(b64)
@@ -115,11 +124,14 @@ class Image(commands.Cog):
                 await ctx.interaction.followup.send(embed=embed, file=file, ephemeral=False)
             else:
                 await ctx.reply(embed=embed, file=file, mention_author=False)
-        except Exception:
+        except Exception as exc:
             log.exception("Failed to generate image")
+            description = "An error occurred while generating the image. Try again later."
+            if isinstance(exc, BadRequestError):
+                description = f"OpenAI rejected the request: {getattr(exc, 'message', str(exc))}"
             error_embed = discord.Embed(
                 title="\u26A0\ufe0f Image Failed",
-                description="An error occurred while generating the image. Try again later.",
+                description=description,
                 color=0xFF0000,
             )
             try:
