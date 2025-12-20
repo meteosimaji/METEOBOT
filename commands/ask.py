@@ -1646,10 +1646,20 @@ class Ask(commands.Cog):
 
         return first
 
-    async def _convert_single_optional(
-        self, ctx: commands.Context, param: inspect.Parameter, raw: str
-    ) -> Any:
+    def _resolve_annotation(self, command: commands.Command, param: inspect.Parameter) -> Any:
         anno = param.annotation
+        if isinstance(anno, str):
+            try:
+                hints = get_type_hints(command.callback, include_extras=True)
+                anno = hints.get(param.name, anno)
+            except Exception:
+                return anno
+        return anno
+
+    async def _convert_single_optional(
+        self, ctx: commands.Context, command: commands.Command, param: inspect.Parameter, raw: str
+    ) -> Any:
+        anno = self._resolve_annotation(command, param)
         origin = get_origin(anno)
         if origin in {Union, types.UnionType}:
             args = [a for a in get_args(anno) if a is not type(None)]
@@ -1661,13 +1671,17 @@ class Ask(commands.Cog):
         if anno in {inspect._empty, str}:
             return raw
 
+        if anno in {int}:
+            return int(raw)
+
         if anno in {discord.Member, discord.User}:
             try:
                 return await commands.MemberConverter().convert(ctx, raw)
             except Exception:
                 return await commands.UserConverter().convert(ctx, raw)
 
-        raise TypeError(f"Unsupported arg type for bot_invoke: {anno!r}")
+        log.debug("bot_invoke: falling back to string for unsupported annotation %r", anno)
+        return raw
 
     def _get_command_names(self) -> list[str]:
         return sorted({command.qualified_name for command in self.bot.commands if not command.hidden})
@@ -1873,12 +1887,18 @@ class Ask(commands.Cog):
 
         if arg:
             try:
-                converted = await self._convert_single_optional(ctx, single_param, arg)
+                converted = await self._convert_single_optional(ctx, command, single_param, arg)
             except TypeError:
                 return {
                     "ok": False,
                     "error": "arguments_not_supported",
                     "reason": "Command argument type not supported for bot_invoke.",
+                }
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": "bad_argument",
+                    "reason": f"Couldn't parse argument '{arg}'.",
                 }
             except Exception:
                 return {
