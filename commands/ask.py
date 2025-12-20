@@ -80,6 +80,7 @@ LLM_BLOCKED_CATEGORIES = {"Moderation"}
 BOT_INVOKE_ALLOWLIST = {
     # General helpers
     "help",
+    "image",
     "userinfo",
     # Music controls
     "join",
@@ -87,7 +88,6 @@ BOT_INVOKE_ALLOWLIST = {
     "now",
     "pause",
     "play",
-    "playq",
     "queue",
     "resume",
     "seek",
@@ -95,7 +95,7 @@ BOT_INVOKE_ALLOWLIST = {
     "stop",
     "tune",
 }
-LLM_ALLOW_REQUIRED_ARG = {"play", "playq", "seek", "tune"}
+LLM_ALLOW_REQUIRED_ARG = {"image", "play", "seek", "tune"}
 DENY_BASENAMES = {
     ".env",
     ".env.local",
@@ -1656,6 +1656,8 @@ class Ask(commands.Cog):
         if not command_names:
             return []
 
+        required_arg_list = ", ".join(sorted(LLM_ALLOW_REQUIRED_ARG))
+
         return [
             {
                 "type": "function",
@@ -1683,8 +1685,8 @@ class Ask(commands.Cog):
                 "name": "bot_invoke",
                 "description": (
                     "Safely run a bot command in the current channel. "
-                    "Supports a single argument for commands that accept one, "
-                    "like /help or /userinfo. "
+                    "Supports one argument, including commands with a required single value "
+                    f"({required_arg_list}) and commands with one optional argument like /help or /userinfo. "
                     "Destructive or moderation commands (e.g., purge) are blocked for the LLM."
                 ),
                 "strict": True,
@@ -1699,12 +1701,13 @@ class Ask(commands.Cog):
                         "arg": {
                             "type": "string",
                             "description": (
-                                "Single argument field. Use empty string '' when no argument is needed. "
-                                "Commands that accept one optional argument (e.g., /help topic or /userinfo @name) "
-                                "can take that value here."
+                                "Single argument field. Use empty string '' when no argument is needed or you want "
+                                "to omit an optional argument. "
+                                "Provide a value here for commands that take one required or optional argument "
+                                "(e.g., /image prompt, /help topic, /userinfo @name, /play <query>)."
                             ),
                             "default": "",
-                            "maxLength": 400,
+                            "maxLength": 2000,
                         },
                     },
                     "required": ["name", "arg"],
@@ -1804,6 +1807,13 @@ class Ask(commands.Cog):
 
         raw_arg = args.get("arg") or ""
         arg = raw_arg.strip()
+
+        if root_name in LLM_ALLOW_REQUIRED_ARG and not arg:
+            return {
+                "ok": False,
+                "error": "missing_argument",
+                "reason": f"/{root_name} requires a non-empty arg for bot_invoke.",
+            }
 
         if root_name in LLM_BLOCKED_COMMANDS or category in LLM_BLOCKED_CATEGORIES:
             return {
@@ -2303,6 +2313,7 @@ class Ask(commands.Cog):
 
         current_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M") + f" {tz_label}"
         commands_text = self._format_command_list()
+        required_arg_cmds = ", ".join(f"/{name}" for name in sorted(LLM_ALLOW_REQUIRED_ARG))
         instructions = (
             "You are a buddy AI in a Discord bot. "
             f"Speak casually (no polite speech) and address the user as \"{username}\". "
@@ -2316,8 +2327,12 @@ class Ask(commands.Cog):
             "If a shell call is denied, simplify to a single safe command like `rg -n -m 200 PATTERN path`, `find -m 200 PATTERN path`, `tree -L 2 path`, or `cat path`. "
             "Never modify files, never attempt network access, and prefer the code interpreter tool for calculations without writing files. "
             f"Use the bot_commands function tool to look up available bot commands before suggesting bot actions. Available commands: {commands_text}. "
-            "Use bot_invoke only for safe commands. bot_invoke always requires an arg field: use arg:'' for commands with no argument. "
-            "Only use a non-empty arg for commands that accept a single optional parameter (e.g., /help topic or /userinfo @name); otherwise pass ''. "
+            "For music playback, use /play (single arg). "
+            "Use bot_invoke only for safe commands. bot_invoke always requires an arg field: "
+            "use arg:'' only when the command truly takes no argument or you want to omit an optional one. "
+            f"For required single-argument commands ({required_arg_cmds}), always provide the arg value. "
+            "For optional single-argument commands (e.g., /help topic or /userinfo @name), include arg when needed; "
+            "otherwise pass ''. "
             "If the user only wants the help text, prefer bot_commands instead of invoking /help."
         )
 

@@ -4,18 +4,18 @@
 1. Copy `.env.example` to `.env` and set:
    - `DISCORD_BOT_TOKEN` — your Discord bot token.
    - `BOT_PREFIX` — prefix for text commands.
-   - `OPENAI_TOKEN` — API key for the `/ask` command.
+   - `OPENAI_TOKEN` — API key for the `/ask` and `/image` commands.
 
 ## Commands
 - `ask` — Ask the AI anything; attach up to three images (about 3MB max each, i.e., ~3,000,000 bytes, including images on the message you replied to) for analysis, and it will note the current time, tap web search plus a read-only shell for repo context, and use a code interpreter for calculations. Oversized images are automatically resized/compressed toward the limit. Admins can pick action `reset` to clear channel history while non-admin reset requests are treated as normal questions. Reply-based image pickup works best with prefix commands/mentions; slash commands rely on explicitly attached files.
 - `help` — Browse commands and events or get detailed help.
+- `image` — Generate a 1024x1024 PNG from a prompt using gpt-image-1.5.
 - `join` / `leave` — Join or leave your voice channel (no queue changes).
 - `messages` — Show recent messages in the current channel.
 - `now` — Show the current track with a progress bar.
 - `pause` / `resume` — Pause or resume playback.
 - `ping` — Check the bot's responsiveness with style and speed!
 - `play` — Queue music by URL or search phrase (YouTube/Spotify/Niconico). Prefix usage also supports file attachments.
-- `playq` — LLM-safe variant of `play` (single optional arg).
 - `purge` — Bulk delete messages using flexible filters.
 - `queue` — Show interactive queue panel (pause/resume, loop, skip, stop, remove, speed/pitch).
 - `seek` — Seek within the current track (e.g. `1:23`, `+30`, `-10`).

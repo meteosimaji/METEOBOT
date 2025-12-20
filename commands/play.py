@@ -136,7 +136,8 @@ class Play(commands.Cog):
             "pro": (
                 "Supports URLs from YouTube, Spotify and Niconico as well as "
                 "plain search terms. Prefix usage can also attach media files; "
-                "video is decoded as audio-only. Playlist URLs are expanded with yt-dlp."
+                "video is decoded as audio-only. Playlist URLs are expanded with yt-dlp. "
+                "LLM/tooling can invoke /play with a single text argument (query or URL)."
             ),
         },
     )
@@ -147,7 +148,7 @@ class Play(commands.Cog):
         source: str | None = None,
         file: discord.Attachment | None = None,
     ) -> None:
-        """Human-friendly /play (supports prefix attachments, but isn't LLM-invokable)."""
+        """Play music from a search term or URL (LLM/tooling must supply one text arg)."""
         if ctx.guild is None:
             return await safe_reply(ctx, "This command can only be used in a server.", mention_author=False)
         await defer_interaction(ctx)
@@ -284,33 +285,6 @@ class Play(commands.Cog):
 
         # Search / page URL mode => yt-dlp resolve
         await self._queue_from_resolve(ctx, source)
-
-    @commands.hybrid_command(
-        name="playq",
-        description="LLM-safe play: queue from URL or search text",
-        help=(
-            "LLM-safe variant of /play (single optional argument). "
-            "Queue a track/playlist from a URL, or a search phrase.\n\n"
-            "**Usage**: `/playq <query or url>`\n"
-            "**Examples**: `/playq lofi hip hop`\n"
-            "`/playq https://youtu.be/dQw4w9WgXcQ`"
-        ),
-        extras={
-            "category": "Music",
-            "pro": (
-                "Same resolver as /play, but designed so the LLM can invoke it via bot_invoke "
-                "(0 or 1 arg only)."
-            ),
-        },
-    )
-    async def playq(self, ctx: commands.Context, *, source: str | None = None) -> None:
-        """LLM-invokable: single optional arg only."""
-        if ctx.guild is None:
-            return await safe_reply(ctx, "This command can only be used in a server.", mention_author=False)
-        await defer_interaction(ctx)
-        if not source or not source.strip():
-            return await safe_reply(ctx, "Give me a URL or a search phrase.", ephemeral=True, mention_author=False)
-        await self._queue_from_resolve(ctx, source.strip())
 
     async def _queue_from_resolve(self, ctx: commands.Context, source: str | None) -> None:
         if not source:
