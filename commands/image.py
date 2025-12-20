@@ -98,9 +98,34 @@ class Image(commands.Cog):
             if OPENAI_OMIT is not None:
                 request_kwargs["response_format"] = OPENAI_OMIT
 
+            def _file_from_bytes(data: bytes, name: str) -> tuple[discord.File, str]:
+                buf = BytesIO(data)
+                buf.seek(0)
+                file_obj = discord.File(buf, filename=name)
+                return file_obj, f"attachment://{name}"
+
+            partials: list[bytes] = []
+
+            async def _send_partial(image_bytes: bytes, idx: int | None) -> None:
+                partials.append(image_bytes)
+                if not status_msg:
+                    return
+                partial_file, partial_url = _file_from_bytes(
+                    image_bytes, f"partial{idx if idx is not None else len(partials)}.png"
+                )
+                partial_embed = discord.Embed(
+                    title="🎨 Generating image… (partial)",
+                    description=prompt,
+                    color=0x5865F2,
+                )
+                partial_embed.set_image(url=partial_url)
+                try:
+                    await status_msg.edit(embed=partial_embed, attachments=[partial_file])
+                except Exception:
+                    return
+
             async def _extract_final_and_partials():
                 final_bytes: bytes | None = None
-                partials: list[bytes] = []
                 if self._async_client:
                     stream = await self.client.images.generate(**request_kwargs)
                     async for event in stream:
@@ -117,7 +142,8 @@ class Image(commands.Cog):
                         except Exception:
                             continue
                         if "partial" in evt_type:
-                            partials.append(image_bytes)
+                            partial_idx = getattr(event, "partial_image_index", None)
+                            await _send_partial(image_bytes, partial_idx)
                         final_bytes = image_bytes
                 else:
                     # Fallback: non-streaming path
@@ -143,27 +169,6 @@ class Image(commands.Cog):
             final_bytes, partials = await _extract_final_and_partials()
             if not final_bytes:
                 raise RuntimeError("No image returned")
-
-            def _file_from_bytes(data: bytes, name: str) -> tuple[discord.File, str]:
-                buf = BytesIO(data)
-                buf.seek(0)
-                file_obj = discord.File(buf, filename=name)
-                return file_obj, f"attachment://{name}"
-
-            # Show the latest partial if available
-            if status_msg and partials:
-                last_partial = partials[-1]
-                partial_file, partial_url = _file_from_bytes(last_partial, "partial.png")
-                partial_embed = discord.Embed(
-                    title="🎨 Generating image… (partial)",
-                    description=prompt,
-                    color=0x5865F2,
-                )
-                partial_embed.set_image(url=partial_url)
-                try:
-                    await status_msg.edit(embed=partial_embed, attachments=[partial_file])
-                except Exception:
-                    pass
 
             final_file, final_url = _file_from_bytes(final_bytes, "image.png")
 
