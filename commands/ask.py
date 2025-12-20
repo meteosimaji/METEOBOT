@@ -939,7 +939,7 @@ def _env_choice(name: str, default: str, choices: set[str]) -> str:
 def _ask_reasoning_cfg() -> dict[str, Any]:
     effort = _env_choice(
         "ASK_REASONING_EFFORT",
-        "low",
+        "high",
         {"none", "low", "medium", "high", "xhigh"},
     )
     return {"effort": effort}
@@ -962,7 +962,19 @@ def _question_preview(text: str, limit: int = 15) -> str:
     return trimmed[:limit] + "..."
 
 
-MAX_TOOL_TURNS = 10
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+MAX_TOOL_TURNS = _env_int("ASK_MAX_TOOL_TURNS", 50, minimum=1)
+TOOL_WARNING_TURN = min(MAX_TOOL_TURNS, _env_int("ASK_TOOL_WARNING_TURN", 40, minimum=1))
 
 
 async def run_responses_agent(
@@ -994,8 +1006,8 @@ async def run_responses_agent(
         except Exception:
             return
 
-    for turn in range(MAX_TOOL_TURNS):
-        await _emit({"type": "turn_start", "turn": turn + 1, "max_turns": MAX_TOOL_TURNS})
+    for turn in range(1, MAX_TOOL_TURNS + 1):
+        await _emit({"type": "turn_start", "turn": turn, "max_turns": MAX_TOOL_TURNS})
         request: dict[str, Any] = {
             "model": model,
             "tools": tools,
@@ -1015,7 +1027,7 @@ async def run_responses_agent(
         resp = await responses_create(**request)
         outputs = getattr(resp, "output", []) or []
         all_outputs.extend(outputs)
-        await _emit({"type": "model_response", "turn": turn + 1, "output_items": len(outputs)})
+        await _emit({"type": "model_response", "turn": turn, "output_items": len(outputs)})
 
         tool_outputs: list[dict[str, Any]] = []
 
@@ -1165,14 +1177,34 @@ async def run_responses_agent(
                 )
 
         if not tool_outputs:
-            await _emit({"type": "final", "turn": turn + 1})
+            await _emit({"type": "final", "turn": turn})
             return resp, all_outputs, None
+
+        remaining_turns = MAX_TOOL_TURNS - turn
+        if turn >= TOOL_WARNING_TURN and remaining_turns > 0 and tool_outputs:
+            warning_text = (
+                f"⏳ Running low on tool turns ({remaining_turns} remaining). "
+                "Please start wrapping up your response."
+            )
+            tool_outputs.append(
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "text", "text": warning_text}],
+                }
+            )
 
         inputs = tool_outputs
         prev_id = getattr(resp, "id", None) or prev_id
 
-    await _emit({"type": "error", "error": "tool_loop_exceeded"})
-    return None, all_outputs, "Tool loop exceeded. Try narrowing the request."
+    await _emit({"type": "final", "turn": MAX_TOOL_TURNS, "reason": "turn_limit_reached"})
+    friendly_stop = types.SimpleNamespace(
+        output_text=(
+            "⏹️ Tool execution hit the 50-turn limit and was stopped."
+            " If you need to continue, please narrow the request and try again."
+        )
+    )
+    return friendly_stop, all_outputs, None
 
 
 def _pretty_source(title: str | None, url: str | None, index: int) -> str:
@@ -1340,11 +1372,10 @@ class _AskStatusUI:
 
             if typ == "turn_start":
                 turn = evt.get("turn")
-                max_turns = evt.get("max_turns")
                 async with self._lock:
                     if self._thinking_id not in self._by_id:
                         self._append_item(call_id=self._thinking_id, label="thinking", state="loading")
-                    self._set_state(self._thinking_id, "loading", f"thinking (turn {turn}/{max_turns})")
+                    self._set_state(self._thinking_id, "loading", f"thinking (turn {turn})")
                     self._dirty = True
                 await self._schedule_flush()
                 return
