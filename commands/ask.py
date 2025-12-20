@@ -996,6 +996,44 @@ async def run_responses_agent(
     all_outputs: list[Any] = []
     prev_id = previous_response_id
 
+    def _normalize_function_args(args_raw: Any) -> dict[str, Any]:
+        if isinstance(args_raw, dict):
+            return args_raw
+
+        if isinstance(args_raw, str):
+            try:
+                loaded = json.loads(args_raw)
+                return loaded if isinstance(loaded, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+
+        for attr in ("model_dump", "dict"):
+            if hasattr(args_raw, attr):
+                try:
+                    candidate = getattr(args_raw, attr)()
+                except Exception:
+                    candidate = None
+                if isinstance(candidate, dict):
+                    return candidate
+
+        if isinstance(args_raw, (list, tuple)):
+            collected: dict[str, Any] = {}
+            for entry in args_raw:
+                if not isinstance(entry, dict):
+                    continue
+                key = entry.get("name")
+                value = entry.get("value")
+                if key:
+                    collected[str(key)] = value
+                    continue
+                if len(entry) == 1:
+                    k, v = next(iter(entry.items()))
+                    collected[str(k)] = v
+            if collected:
+                return collected
+
+        return {}
+
     async def _emit(evt: dict[str, Any]) -> None:
         if event_cb is None:
             return
@@ -1038,12 +1076,7 @@ async def run_responses_agent(
                 name = item.name if not isinstance(item, dict) else item.get("name")
                 call_id = item.call_id if not isinstance(item, dict) else item.get("call_id")
                 args_raw = item.arguments if not isinstance(item, dict) else item.get("arguments", "{}")
-                args = args_raw
-                if isinstance(args_raw, str):
-                    try:
-                        args = json.loads(args_raw)
-                    except json.JSONDecodeError:
-                        args = {}
+                args = _normalize_function_args(args_raw)
                 await _emit(
                     {
                         "type": "tool_call",
