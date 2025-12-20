@@ -64,6 +64,20 @@ class Image(commands.Cog):
         prompt = prompt.strip()
         await defer_interaction(ctx)
 
+        status_embed = discord.Embed(
+            title="🎨 Generating image…",
+            description=prompt,
+            color=0x5865F2,
+        )
+        status_msg: discord.Message | None = None
+        try:
+            if ctx.interaction:
+                status_msg = await ctx.interaction.followup.send(embed=status_embed, wait=True)
+            else:
+                status_msg = await ctx.reply(embed=status_embed, mention_author=False)
+        except Exception:
+            status_msg = None
+
         if not getattr(self.client, "api_key", None):
             return await safe_reply(
                 ctx,
@@ -78,52 +92,101 @@ class Image(commands.Cog):
                 "prompt": prompt,
                 "size": "1024x1024",
                 "output_format": "png",
+                "stream": True,
+                "partial_images": 3,
             }
             if OPENAI_OMIT is not None:
                 request_kwargs["response_format"] = OPENAI_OMIT
 
-            result = await self._images_generate(
-                **request_kwargs,
-            )
+            async def _extract_final_and_partials():
+                final_bytes: bytes | None = None
+                partials: list[bytes] = []
+                if self._async_client:
+                    stream = await self.client.images.generate(**request_kwargs)
+                    async for event in stream:
+                        evt_type = getattr(event, "type", "") or ""
+                        b64_val = (
+                            getattr(event, "b64_json", None)
+                            or getattr(event, "image_base64", None)
+                            or getattr(event, "data", None)
+                        )
+                        if not b64_val:
+                            continue
+                        try:
+                            image_bytes = base64.b64decode(b64_val)
+                        except Exception:
+                            continue
+                        if "partial" in evt_type:
+                            partials.append(image_bytes)
+                        final_bytes = image_bytes
+                else:
+                    # Fallback: non-streaming path
+                    request_copy = dict(request_kwargs)
+                    request_copy.pop("stream", None)
+                    request_copy.pop("partial_images", None)
+                    result = await self._images_generate(**request_copy)
+                    data_items = getattr(result, "data", None)
+                    if data_items is None and isinstance(result, dict):
+                        data_items = result.get("data")
+                    data_items = data_items or []
+                    if not data_items:
+                        raise RuntimeError("No image returned")
+                    data = data_items[0]
+                    b64_val = getattr(data, "b64_json", None) or getattr(data, "image_base64", None) or (
+                        data.get("b64_json") if isinstance(data, dict) else None
+                    )
+                    if not b64_val:
+                        raise RuntimeError("No image returned")
+                    final_bytes = base64.b64decode(b64_val)
+                return final_bytes, partials
 
-            def _get_from(obj, key: str):
-                if isinstance(obj, dict):
-                    return obj.get(key)
-                return getattr(obj, key, None)
-
-            data_items = getattr(result, "data", None)
-            if data_items is None and isinstance(result, dict):
-                data_items = result.get("data")
-            data_items = data_items or []
-            if not data_items:
+            final_bytes, partials = await _extract_final_and_partials()
+            if not final_bytes:
                 raise RuntimeError("No image returned")
-            data = data_items[0]
-            b64 = _get_from(data, "b64_json") or _get_from(data, "image_base64")
-            url = _get_from(data, "url")
-            if b64:
-                image_bytes = base64.b64decode(b64)
-                buf = BytesIO(image_bytes)
+
+            def _file_from_bytes(data: bytes, name: str) -> tuple[discord.File, str]:
+                buf = BytesIO(data)
                 buf.seek(0)
-                file = discord.File(buf, filename="image.png")
-                image_url = "attachment://image.png"
-            elif url:
-                file = None
-                image_url = url
-            else:
-                raise RuntimeError("No image returned")
+                file_obj = discord.File(buf, filename=name)
+                return file_obj, f"attachment://{name}"
+
+            # Show the latest partial if available
+            if status_msg and partials:
+                last_partial = partials[-1]
+                partial_file, partial_url = _file_from_bytes(last_partial, "partial.png")
+                partial_embed = discord.Embed(
+                    title="🎨 Generating image… (partial)",
+                    description=prompt,
+                    color=0x5865F2,
+                )
+                partial_embed.set_image(url=partial_url)
+                try:
+                    await status_msg.edit(embed=partial_embed, attachments=[partial_file])
+                except Exception:
+                    pass
+
+            final_file, final_url = _file_from_bytes(final_bytes, "image.png")
 
             embed = discord.Embed(
                 title="🖼️ Image Generated",
                 description=prompt,
                 color=0x5865F2,
             )
-            embed.set_image(url=image_url)
-            embed.set_footer(text="Model: gpt-image-1.5 • Crafted with care ✨")
+            embed.set_image(url=final_url)
+            embed.set_footer(text="Crafted with care ✨")
 
+            if status_msg:
+                try:
+                    await status_msg.edit(embed=embed, attachments=[final_file])
+                    return
+                except Exception:
+                    pass
+
+            # Fallback if we couldn't edit the status message
             if ctx.interaction:
-                await ctx.interaction.followup.send(embed=embed, file=file, ephemeral=False)
+                await ctx.interaction.followup.send(embed=embed, file=final_file, ephemeral=False)
             else:
-                await ctx.reply(embed=embed, file=file, mention_author=False)
+                await ctx.reply(embed=embed, file=final_file, mention_author=False)
         except Exception as exc:
             log.exception("Failed to generate image")
             description = "An error occurred while generating the image. Try again later."
@@ -135,7 +198,10 @@ class Image(commands.Cog):
                 color=0xFF0000,
             )
             try:
-                await safe_reply(ctx, embed=error_embed, ephemeral=True, mention_author=False)
+                if status_msg:
+                    await status_msg.edit(embed=error_embed, attachments=[])
+                else:
+                    await safe_reply(ctx, embed=error_embed, ephemeral=True, mention_author=False)
             except Exception:
                 return
 
