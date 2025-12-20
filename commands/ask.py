@@ -1953,7 +1953,7 @@ class Ask(commands.Cog):
 
     async def _collect_bot_messages(
         self, ctx: commands.Context, *, after: datetime, limit: int = 5
-    ) -> list[str]:
+    ) -> list[dict[str, Any]]:
         channel = getattr(ctx, "channel", None)
         if channel is None:
             return []
@@ -1961,6 +1961,42 @@ class Ask(commands.Cog):
         bot_user = getattr(self.bot, "user", None)
         if bot_user is None:
             return []
+
+        async def _attachment_payload(att: discord.Attachment) -> dict[str, Any] | None:
+            url = getattr(att, "url", "") or ""
+            if not url:
+                return None
+
+            filename = getattr(att, "filename", "") or ""
+            size = getattr(att, "size", 0) or 0
+            content_type = (att.content_type or "").split(";", 1)[0].lower()
+            payload: dict[str, Any] = {
+                "url": url,
+                "filename": filename,
+                "size": size,
+                "content_type": content_type,
+            }
+
+            if content_type.startswith("image/"):
+                if size and size > MAX_IMAGE_BYTES:
+                    return payload
+
+                data = None
+                with contextlib.suppress(Exception):
+                    data = await att.read()
+
+                if data and len(data) <= MAX_IMAGE_BYTES:
+                    b64 = base64.b64encode(data).decode("ascii")
+                    payload["data_url"] = f"data:{content_type};base64,{b64}"
+
+            return payload
+
+        def _resolve_embed_image_url(raw_url: str, attachments_by_name: dict[str, dict[str, Any]]) -> dict[str, Any]:
+            if raw_url.startswith("attachment://"):
+                name = raw_url.split("attachment://", 1)[1].lower()
+                if name in attachments_by_name:
+                    return attachments_by_name[name]
+            return {"url": raw_url}
 
         try:
             messages = [
@@ -1973,11 +2009,15 @@ class Ask(commands.Cog):
 
         messages.sort(key=lambda m: m.created_at)
 
-        collected: list[str] = []
+        collected: list[dict[str, Any]] = []
         for message in messages:
+            entry: dict[str, Any] = {"text": "", "attachments": [], "embed_images": []}
+
+            text_parts: list[str] = []
+
             content = (message.content or "").strip()
             if content:
-                collected.append(content)
+                text_parts.append(content)
 
             for embed in message.embeds:
                 embed_parts = []
@@ -1993,7 +2033,37 @@ class Ask(commands.Cog):
                     elif value:
                         embed_parts.append(value)
                 if embed_parts:
-                    collected.append("\n".join(embed_parts))
+                    text_parts.append("\n".join(embed_parts))
+
+            attachments: list[dict[str, Any]] = []
+            attachments_by_name: dict[str, dict[str, Any]] = {}
+            for att in message.attachments:
+                payload = await _attachment_payload(att)
+                if payload is None:
+                    continue
+                attachments.append(payload)
+                name_key = (getattr(att, "filename", "") or "").lower()
+                if name_key:
+                    attachments_by_name[name_key] = payload
+
+            embed_images: list[dict[str, Any]] = []
+            for embed in message.embeds:
+                img = getattr(embed, "image", None)
+                img_url = getattr(img, "url", None) if img else None
+                if not img_url:
+                    continue
+                resolved = _resolve_embed_image_url(img_url, attachments_by_name)
+                if resolved["url"] not in {img.get("url") for img in embed_images}:
+                    embed_images.append(resolved)
+
+            entry["text"] = "\n".join(text_parts).strip()
+            if attachments:
+                entry["attachments"] = attachments
+            if embed_images:
+                entry["embed_images"] = embed_images
+
+            if entry["text"] or attachments or embed_images:
+                collected.append(entry)
 
         return collected
 
