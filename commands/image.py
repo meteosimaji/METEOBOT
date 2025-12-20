@@ -75,27 +75,40 @@ class Image(commands.Cog):
                 model="gpt-image-1.5",
                 prompt=prompt,
                 size="1024x1024",
-                response_format="b64_json",
             )
-            data_items = getattr(result, "data", None) or []
+
+            def _get_from(obj, key: str):
+                if isinstance(obj, dict):
+                    return obj.get(key)
+                return getattr(obj, key, None)
+
+            data_items = getattr(result, "data", None)
+            if data_items is None and isinstance(result, dict):
+                data_items = result.get("data")
+            data_items = data_items or []
             if not data_items:
                 raise RuntimeError("No image returned")
             data = data_items[0]
-            b64 = getattr(data, "b64_json", None)
-            if not b64:
+            b64 = _get_from(data, "b64_json")
+            url = _get_from(data, "url")
+            if b64:
+                image_bytes = base64.b64decode(b64)
+                buf = BytesIO(image_bytes)
+                buf.seek(0)
+                file = discord.File(buf, filename="image.png")
+                image_url = "attachment://image.png"
+            elif url:
+                file = None
+                image_url = url
+            else:
                 raise RuntimeError("No image returned")
-
-            image_bytes = base64.b64decode(b64)
-            buf = BytesIO(image_bytes)
-            buf.seek(0)
-            file = discord.File(buf, filename="image.png")
 
             embed = discord.Embed(
                 title="🖼️ Image Generated",
                 description=prompt,
                 color=0x5865F2,
             )
-            embed.set_image(url="attachment://image.png")
+            embed.set_image(url=image_url)
             embed.set_footer(text="Model: gpt-image-1.5 • Crafted with care ✨")
 
             if ctx.interaction:
