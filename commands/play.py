@@ -146,15 +146,20 @@ class Play(commands.Cog):
         ctx: commands.Context,
         *,
         source: str | None = None,
-        file: discord.Attachment | None = None,
     ) -> None:
         """Play music from a search term or URL (LLM/tooling must supply one text arg)."""
         if ctx.guild is None:
             return await safe_reply(ctx, "This command can only be used in a server.", mention_author=False)
         await defer_interaction(ctx)
 
-        # Attachments (prefix) count as file candidates.
-        has_attachments = bool(file or (ctx.message and ctx.message.attachments))
+        # Attachments (prefix or slash) count as file candidates.
+        attachments: list[discord.Attachment] = []
+        if ctx.message and ctx.message.attachments:
+            attachments.extend(ctx.message.attachments)
+        if getattr(ctx, "interaction", None) and getattr(ctx.interaction, "attachments", None):
+            attachments.extend(list(ctx.interaction.attachments))
+
+        has_attachments = bool(attachments)
 
         # Treat URLs as direct files only when they include an extension
         is_direct_file = False
@@ -190,14 +195,9 @@ class Play(commands.Cog):
                 else:
                     candidates.append((name, source, ext))
 
-            if file:
-                url, ext = _attachment_to_src(file)
-                candidates.append((file.filename or 'attachment', url, ext))
-
-            if ctx.message and ctx.message.attachments:
-                for att in ctx.message.attachments:
-                    url, ext = _attachment_to_src(att)
-                    candidates.append((att.filename or "attachment", url, ext))
+            for att in attachments:
+                url, ext = _attachment_to_src(att)
+                candidates.append((att.filename or "attachment", url, ext))
 
             # Deduplicate by src URL/path.
             if candidates:
