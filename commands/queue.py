@@ -170,8 +170,8 @@ class ControlView(discord.ui.View):
         except discord.NotFound:
             pass
 
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
-    async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Bye", style=discord.ButtonStyle.danger)
+    async def btn_bye(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.player.sync_voice_client()
         if not interaction.response.is_done():
             await interaction.response.defer()
@@ -292,16 +292,21 @@ class RemoveView(discord.ui.View):
         return True
 
     async def select_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         index = int(self.select.values[0])
         async with self.player._add_lock:
             track = self.player.remove_at(index)
         if not track:
-            await interaction.response.send_message("Invalid selection.", ephemeral=True)
+            await interaction.followup.send("Invalid selection.", ephemeral=True)
             return
-        await interaction.response.send_message(f"Removed **{track.title}**", ephemeral=True)
         self.control.update_labels()
         if self.control.message:
             await self.control.message.edit(embed=make_queue_embed(self.player), view=self.control)
+        await interaction.followup.send(
+            f"Removed **{track.title}** from the queue.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         self.stop()
 
 
@@ -343,9 +348,10 @@ class Queue(commands.Cog):
 
     @commands.hybrid_command(
         name="queue",
-        description="Display and control the music queue",
+        description="Display and control the music queue with interactive buttons",
         help=(
             "Show the upcoming songs in an embed with buttons to control playback. "
+            "Toggle Auto Leave to disconnect when nobody is listening. "
             "The panel auto-updates while the queue changes.\n\n"
             "**Usage**: `/queue`\n"
             f"`{BOT_PREFIX}queue`"
@@ -353,8 +359,9 @@ class Queue(commands.Cog):
         extras={
             "category": "Music",
             "pro": (
-                "List songs waiting to play with interactive controls (pause/resume, loop, skip, stop, remove). "
-                "Also provides modals to adjust speed and pitch."
+                "List songs waiting to play with interactive controls (pause/resume, loop, skip, bye, remove). "
+                "Also provides modals to adjust speed and pitch, plus an Auto Leave toggle that "
+                "disconnects the bot when no listeners remain."
             ),
         },
     )

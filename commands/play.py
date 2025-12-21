@@ -255,6 +255,10 @@ class Play(commands.Cog):
             finally:
                 await player.end_playlist()
 
+            remove_tip = (
+                f"Undo a mistaken add with /remove or `{BOT_PREFIX}remove`; "
+                "leave steps empty or use 1 to drop the latest track."
+            )
             if count == 1 and first:
                 embed = discord.Embed(
                     title="🎵 Added to Queue",
@@ -263,6 +267,7 @@ class Play(commands.Cog):
                     ),
                     color=0x1DB954,
                 )
+                embed.set_footer(text=remove_tip)
                 await ctx.reply(embed=embed, mention_author=False)
             else:
                 head = first.title if first else "file"
@@ -271,6 +276,7 @@ class Play(commands.Cog):
                     description=f"Queued **{count}** file(s) starting with **{head}**",
                     color=0x1DB954,
                 )
+                embed.set_footer(text=remove_tip)
                 await ctx.reply(embed=embed, mention_author=False)
 
             if rejected:
@@ -328,6 +334,12 @@ class Play(commands.Cog):
                         )
                         if track.duration:
                             embed.add_field(name="Duration", value=humanize_delta(track.duration))
+                        embed.set_footer(
+                            text=(
+                                f"To cancel this add, run /remove or `{BOT_PREFIX}remove`; "
+                                "blank steps or 1 deletes the latest track."
+                            )
+                        )
                         message = await ctx.reply(embed=embed, mention_author=False)
             finally:
                 await player.end_playlist()
@@ -338,6 +350,12 @@ class Play(commands.Cog):
                     title="🎵 Playlist Added",
                     description=f"{count} tracks starting with [{first.title}]({first.page_url})",
                     color=0x1DB954,
+                )
+                embed.set_footer(
+                    text=(
+                        f"Undo mistaken additions with /remove or `{BOT_PREFIX}remove`; "
+                        "leave steps empty or use 1 to drop the most recent track."
+                    )
                 )
                 await message.edit(embed=embed)
             return
@@ -352,6 +370,12 @@ class Play(commands.Cog):
         )
         if track.duration:
             embed.add_field(name="Duration", value=humanize_delta(track.duration))
+        embed.set_footer(
+            text=(
+                f"Need to cancel? Run /remove or `{BOT_PREFIX}remove`; "
+                "blank steps or 1 removes this track."
+            )
+        )
         await ctx.reply(embed=embed, mention_author=False)
 
 
