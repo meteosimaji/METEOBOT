@@ -350,7 +350,10 @@ class MusicPlayer:
                     self._request_auto_leave_check()
                 return
 
-            self._discard_by_identity(self.added_tracks, track)
+            # Note: we intentionally keep currently playing tracks in
+            # ``added_tracks`` so /remove can still "undo" an immediately
+            # started track (when the queue was empty and playback began
+            # right away). We discard finished/skipped tracks elsewhere.
 
             log.info("Now playing: %s (%s)", track.title, track.page_url)
             try:
@@ -376,6 +379,12 @@ class MusicPlayer:
             return
         if error:
             log.exception("Music playback error: %s", error)
+
+        # Once a track ends naturally, it is no longer a "recent addition" that
+        # /remove should target. Exception: loop=track keeps replaying the same
+        # current track, so keep it removable until the user changes modes.
+        if self.current and self.loop != "track":
+            self._discard_by_identity(self.added_tracks, self.current)
 
         if self.current:
             log.info("Finished playing: %s", self.current.title)
@@ -433,9 +442,15 @@ class MusicPlayer:
     async def skip(self) -> None:
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             if self.current:
+                # Skipping means we should no longer treat the current track as a
+                # "recent addition". Also, if loop=track, we must clear current
+                # or play_next() would simply replay it.
+                self._discard_by_identity(self.added_tracks, self.current)
                 self.history.append(self.current)
                 if self.loop == "queue":
                     self.queue.append(self.current)
+                if self.loop == "track":
+                    self.current = None
             self.offset = 0.0
             self.started_at = 0.0
             self.ignore_after = True
@@ -557,15 +572,38 @@ class MusicPlayer:
         """Remove the Nth most recent added (pending) track, counting from 1."""
         if n_back <= 0:
             return None
+        cancel_current = False
         async with self._add_lock:
             if n_back > len(self.added_tracks):
                 return None
             target = self.added_tracks[-n_back]
-            removed = self._remove_from_queue(target) or self._remove_from_wait_buf(target)
-            if not removed:
-                return None
-            self._discard_by_identity(self.added_tracks, target)
+            if target is self.current:
+                cancel_current = True
+                self._discard_by_identity(self.added_tracks, target)
+                # Clear current so play_next() won't replay it (especially under loop=track).
+                self.current = None
+            else:
+                removed = self._remove_from_queue(target) or self._remove_from_wait_buf(target)
+                if not removed:
+                    return None
+                self._discard_by_identity(self.added_tracks, target)
+
+        if cancel_current:
+            # Cancel the current track without treating it as "skipped":
+            # no history push, no loop queue re-add.
+            try:
+                self.sync_voice_client()
+                if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+                    self.offset = 0.0
+                    self.started_at = 0.0
+                    self.ignore_after = True
+                    self.voice.stop()
+            except Exception:
+                pass
+            await self.play_next()
             return target
+
+        return target
 
     def request_lonely_auto_leave(self, *, delay: float = 10.0) -> None:
         """Schedule an auto-leave when no non-bot listeners remain.
