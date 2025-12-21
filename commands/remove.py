@@ -48,9 +48,15 @@ class Remove(commands.Cog):
         player = get_player(self.bot, ctx.guild)
         track = await player.remove_recent_add(count)
         if not track:
+            recent = list(player.added_tracks)[-8:][::-1]  # latest first
+            hint = ""
+            if recent:
+                lines = [f"{i+1}. {sanitize(t.title)}" for i, t in enumerate(recent)]
+                hint = "\n\nRecent additions (latest first):\n" + "\n".join(lines)
             return await safe_reply(
                 ctx,
-                "Couldn't find that recent addition. It may already be playing or there are fewer pending songs.",
+                "Couldn't find that recent addition. It may have already finished, or there are fewer pending songs."
+                + hint,
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
