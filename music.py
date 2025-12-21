@@ -83,6 +83,7 @@ class MusicPlayer:
         self.guild = guild
 
         self.queue: deque[Track] = deque()
+        self.added_tracks: deque[Track] = deque()
         self.voice: discord.VoiceClient | None = None
         self.current: Track | None = None
 
@@ -285,6 +286,7 @@ class MusicPlayer:
                 log.info("Queued track (playlist): %s (%s)", track.title, track.page_url)
                 self.queue.append(track)
                 self._tail_idx = len(self.queue) - 1
+                self.added_tracks.append(track)
             if not self.voice or not self.voice.is_playing():
                 self._spawn(self.play_next())
             return
@@ -292,6 +294,7 @@ class MusicPlayer:
         async with self._add_lock:
             if self._playlist_loading:
                 self._wait_buf.append(track)
+                self.added_tracks.append(track)
                 log.info("Buffered external track: %s (%s)", track.title, track.page_url)
                 return
 
@@ -301,6 +304,7 @@ class MusicPlayer:
                 self._tail_idx += 1
             else:
                 self.queue.append(track)
+            self.added_tracks.append(track)
 
         if not self.voice or not self.voice.is_playing():
             self._spawn(self.play_next())
@@ -345,6 +349,8 @@ class MusicPlayer:
                 else:
                     self._request_auto_leave_check()
                 return
+
+            self._discard_by_identity(self.added_tracks, track)
 
             log.info("Now playing: %s (%s)", track.title, track.page_url)
             try:
@@ -408,16 +414,21 @@ class MusicPlayer:
             log.info("Playback resumed")
 
     async def stop(self) -> None:
+        self.queue.clear()
+        self.added_tracks.clear()
+        self._wait_buf.clear()
+        self._playlist_loading = False
+        self._tail_idx = None
+        self.current = None
+        self.offset = 0.0
+        self.started_at = 0.0
         if self.voice:
-            self.queue.clear()
-            self.current = None
-            self.offset = 0.0
-            self.started_at = 0.0
             self.ignore_after = True
             self.voice.stop()
-            if self.auto_leave:
-                await self.cleanup()
-            log.info("Playback stopped and queue cleared")
+        else:
+            self.ignore_after = False
+        await self.cleanup(reset_ignore_after=False)
+        log.info("Playback stopped, cleared queue, and cleaned up voice")
 
     async def skip(self) -> None:
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
@@ -447,6 +458,8 @@ class MusicPlayer:
             self._tail_idx -= 1
             if self._tail_idx < 0:
                 self._tail_idx = None
+        if track:
+            self._discard_by_identity(self.added_tracks, track)
         return track
 
     async def seek(self, position: float) -> bool:
@@ -478,7 +491,7 @@ class MusicPlayer:
             log.exception("Seek failed during playback restart")
             return False
 
-    async def cleanup(self) -> None:
+    async def cleanup(self, *, reset_ignore_after: bool = True) -> None:
         self._cancel_auto_leave_task()
         if self.voice:
             try:
@@ -488,15 +501,120 @@ class MusicPlayer:
             self.voice = None
             log.info("Disconnected from voice channel")
         self.queue.clear()
+        self.added_tracks.clear()
         self.current = None
         self.offset = 0.0
         self.started_at = 0.0
+        if reset_ignore_after:
+            self.ignore_after = False
+        self.last_channel_id = None
         # Keep the player instance so existing views continue to operate.
+        self._wait_buf.clear()
+        self._playlist_loading = False
+        self._tail_idx = None
 
     def _cancel_auto_leave_task(self) -> None:
         if self._auto_leave_task:
             self._auto_leave_task.cancel()
             self._auto_leave_task = None
+
+    @staticmethod
+    def _discard_by_identity(dq: deque[Track], target: Track) -> bool:
+        for i, t in enumerate(dq):
+            if t is target:
+                dq.rotate(-i)
+                dq.popleft()
+                dq.rotate(i)
+                return True
+        return False
+
+    def _remove_from_queue(self, track: Track) -> bool:
+        q = self.queue
+        for idx, t in enumerate(q):
+            if t is track:
+                q.rotate(-idx)
+                q.popleft()
+                q.rotate(idx)
+                if self._tail_idx is not None and idx <= self._tail_idx:
+                    self._tail_idx -= 1
+                    if self._tail_idx < 0:
+                        self._tail_idx = None
+                return True
+        return False
+
+    def _remove_from_wait_buf(self, track: Track) -> bool:
+        if not self._wait_buf:
+            return False
+        for idx, t in enumerate(self._wait_buf):
+            if t is track:
+                self._wait_buf.rotate(-idx)
+                self._wait_buf.popleft()
+                self._wait_buf.rotate(idx)
+                return True
+        return False
+
+    async def remove_recent_add(self, n_back: int = 1) -> Track | None:
+        """Remove the Nth most recent added (pending) track, counting from 1."""
+        if n_back <= 0:
+            return None
+        async with self._add_lock:
+            if n_back > len(self.added_tracks):
+                return None
+            target = self.added_tracks[-n_back]
+            removed = self._remove_from_queue(target) or self._remove_from_wait_buf(target)
+            if not removed:
+                return None
+            self._discard_by_identity(self.added_tracks, target)
+            return target
+
+    def request_lonely_auto_leave(self, *, delay: float = 10.0) -> None:
+        """Schedule an auto-leave when no non-bot listeners remain.
+
+        Intended for voice-state updates while music is playing; validates
+        channel membership again after ``delay`` before disconnecting.
+        """
+
+        if not self.auto_leave:
+            return
+
+        self.sync_voice_client()
+        if not self.voice or not self.voice.is_connected():
+            return
+
+        channel = getattr(self.voice, "channel", None)
+        members = getattr(channel, "members", []) if channel else []
+        if any(not getattr(m, "bot", False) for m in members):
+            return
+
+        self._cancel_auto_leave_task()
+
+        async def _lonely_leave() -> None:
+            me = asyncio.current_task()
+            try:
+                await asyncio.sleep(delay)
+                self.sync_voice_client()
+                if not self.auto_leave:
+                    return
+                if not self.voice or not self.voice.is_connected():
+                    return
+                channel = getattr(self.voice, "channel", None)
+                members = getattr(channel, "members", []) if channel else []
+                if any(not getattr(m, "bot", False) for m in members):
+                    return
+                log.info("Auto leave triggered: channel %s has no listeners", getattr(channel, "id", "?"))
+                # Prevent after_play from restarting playback/reconnect churn
+                self.ignore_after = True
+                try:
+                    if self.voice:
+                        self.voice.stop()
+                except Exception:
+                    pass
+                await self.cleanup(reset_ignore_after=False)
+            finally:
+                if self._auto_leave_task is me:
+                    self._auto_leave_task = None
+
+        self._auto_leave_task = asyncio.create_task(_lonely_leave())
 
     def _request_auto_leave_check(self, *, delay: float = 90.0) -> None:
         """Schedule an auto-leave if idle and allowed.
