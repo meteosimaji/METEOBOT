@@ -1663,6 +1663,21 @@ class Ask(commands.Cog):
     def _get_command_names(self) -> list[str]:
         return sorted({command.qualified_name for command in self.bot.commands if not command.hidden})
 
+    def _get_required_single_arg_commands(self) -> list[str]:
+        required: set[str] = set()
+        for command in self.bot.commands:
+            if command.hidden:
+                continue
+
+            single_param = self._get_single_arg_param(command)
+            if single_param is None:
+                continue
+
+            if single_param.default is inspect._empty:
+                required.add(command.qualified_name.split()[0])
+
+        return sorted(required)
+
     def _format_command_list(self, max_items: int = 30) -> str:
         command_names = self._get_command_names()
         if not command_names:
@@ -1680,7 +1695,22 @@ class Ask(commands.Cog):
         if not command_names:
             return []
 
-        required_arg_list = ", ".join(sorted(LLM_ALLOW_REQUIRED_ARG))
+        required_arg_commands = self._get_required_single_arg_commands()
+        if required_arg_commands:
+            required_arg_list = ", ".join(f"/{name}" for name in required_arg_commands)
+            bot_invoke_description = (
+                "Safely run a bot command in the current channel. "
+                "Supports one argument, including commands with a required single value "
+                f"({required_arg_list}) and commands with one optional argument like /help or /userinfo. "
+                "Destructive or moderation commands (e.g., purge) are blocked for the LLM."
+            )
+        else:
+            bot_invoke_description = (
+                "Safely run a bot command in the current channel. "
+                "Supports one argument for commands with a single required or optional parameter "
+                "(e.g., /help topic or /userinfo). "
+                "Destructive or moderation commands (e.g., purge) are blocked for the LLM."
+            )
 
         return [
             {
@@ -1707,12 +1737,7 @@ class Ask(commands.Cog):
             {
                 "type": "function",
                 "name": "bot_invoke",
-                "description": (
-                    "Safely run a bot command in the current channel. "
-                    "Supports one argument, including commands with a required single value "
-                    f"({required_arg_list}) and commands with one optional argument like /help or /userinfo. "
-                    "Destructive or moderation commands (e.g., purge) are blocked for the LLM."
-                ),
+                "description": bot_invoke_description,
                 "strict": True,
                 "parameters": {
                     "type": "object",
@@ -2395,7 +2420,14 @@ class Ask(commands.Cog):
 
         current_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M") + f" {tz_label}"
         commands_text = self._format_command_list()
-        required_arg_cmds = ", ".join(f"/{name}" for name in sorted(LLM_ALLOW_REQUIRED_ARG))
+        required_arg_commands = self._get_required_single_arg_commands()
+        if required_arg_commands:
+            required_arg_cmds = ", ".join(f"/{name}" for name in required_arg_commands)
+            required_arg_note = (
+                f"For required single-argument commands ({required_arg_cmds}), always provide the arg value. "
+            )
+        else:
+            required_arg_note = "For commands that require a single argument, always provide the arg value. "
         instructions = (
             "You are a buddy AI in a Discord bot. "
             f"Speak casually (no polite speech) and address the user as \"{username}\". "
@@ -2412,7 +2444,7 @@ class Ask(commands.Cog):
             "For music playback, use /play (single arg). "
             "Use bot_invoke only for safe commands. bot_invoke always requires an arg field: "
             "use arg:'' only when the command truly takes no argument or you want to omit an optional one. "
-            f"For required single-argument commands ({required_arg_cmds}), always provide the arg value. "
+            f"{required_arg_note}"
             "For optional single-argument commands (e.g., /help topic or /userinfo @name), include arg when needed; "
             "otherwise pass ''. "
             "If the user only wants the help text, prefer bot_commands instead of invoking /help."
