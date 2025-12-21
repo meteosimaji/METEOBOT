@@ -77,25 +77,6 @@ FLAG_REQUIRES_VALUE: dict[str, set[str]] = {
 PATTERN_ARG_COUNT: dict[str, int] = {"find": 1, "grep": 1, "rg": 1}
 LLM_BLOCKED_COMMANDS = {"purge", "ask"}
 LLM_BLOCKED_CATEGORIES = {"Moderation"}
-BOT_INVOKE_ALLOWLIST = {
-    # General helpers
-    "help",
-    "image",
-    "userinfo",
-    # Music controls
-    "join",
-    "leave",
-    "now",
-    "pause",
-    "play",
-    "queue",
-    "resume",
-    "seek",
-    "skip",
-    "stop",
-    "tune",
-}
-LLM_ALLOW_REQUIRED_ARG = {"image", "play", "seek", "tune"}
 DENY_BASENAMES = {
     ".env",
     ".env.local",
@@ -1615,9 +1596,7 @@ class Ask(commands.Cog):
 
         return True
 
-    def _get_single_arg_param(
-        self, command: commands.Command, *, allow_required: bool
-    ) -> inspect.Parameter | None:
+    def _get_single_arg_param(self, command: commands.Command) -> inspect.Parameter | None:
         try:
             sig = inspect.signature(command.callback)
         except (TypeError, ValueError):
@@ -1634,8 +1613,6 @@ class Ask(commands.Cog):
 
         first = params[0]
         if first.kind in {first.VAR_POSITIONAL, first.VAR_KEYWORD}:
-            return None
-        if first.default is first.empty and not allow_required:
             return None
 
         for extra in params[1:]:
@@ -1802,13 +1779,11 @@ class Ask(commands.Cog):
         usage_text = f"/{command.qualified_name}" + (f" {usage}" if usage else "")
         can_run, can_run_reason = await self._can_run_command(ctx, command)
         root_name = command.qualified_name.split()[0]
-        allow_required = root_name in LLM_ALLOW_REQUIRED_ARG
-        single_param = self._get_single_arg_param(command, allow_required=allow_required)
+        single_param = self._get_single_arg_param(command)
 
         if name == "bot_commands":
             llm_allowed = (
                 can_run
-                and root_name in BOT_INVOKE_ALLOWLIST
                 and root_name not in LLM_BLOCKED_COMMANDS
                 and category not in LLM_BLOCKED_CATEGORIES
                 and (self._is_noarg_command(command) or single_param is not None)
@@ -1832,8 +1807,6 @@ class Ask(commands.Cog):
                     if root_name in LLM_BLOCKED_COMMANDS
                     else "blocked_category"
                     if category in LLM_BLOCKED_CATEGORIES
-                    else "not_allowlisted"
-                    if root_name not in BOT_INVOKE_ALLOWLIST
                     else "arguments_not_supported"
                     if not (self._is_noarg_command(command) or single_param is not None)
                     else ""
@@ -1843,24 +1816,10 @@ class Ask(commands.Cog):
         if not can_run:
             return {"ok": False, "error": "no_permission", "reason": can_run_reason}
 
-        if root_name not in BOT_INVOKE_ALLOWLIST:
-            return {
-                "ok": False,
-                "error": "restricted_for_llm",
-                "reason": "not_allowlisted",
-            }
-
         allow_args = single_param is not None
 
         raw_arg = args.get("arg") or ""
         arg = raw_arg.strip()
-
-        if root_name in LLM_ALLOW_REQUIRED_ARG and not arg:
-            return {
-                "ok": False,
-                "error": "missing_argument",
-                "reason": f"/{root_name} requires a non-empty arg for bot_invoke.",
-            }
 
         if root_name in LLM_BLOCKED_COMMANDS or category in LLM_BLOCKED_CATEGORIES:
             return {
