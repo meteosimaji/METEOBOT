@@ -1799,7 +1799,7 @@ class Ask(commands.Cog):
                             "default": True,
                         },
                     },
-                    "required": ["url"],
+                    "required": ["url", "max_chars", "include_embeds"],
                     "additionalProperties": False,
                 },
             },
@@ -1952,7 +1952,8 @@ class Ask(commands.Cog):
                     perms = channel.permissions_for(member)
                     permitted = perms.view_channel and perms.read_message_history
         elif isinstance(channel, discord.DMChannel):
-            permitted = True
+            recipient = getattr(channel, "recipient", None)
+            permitted = bool(recipient and ctx.author and recipient.id == ctx.author.id)
 
         if not permitted:
             return {
