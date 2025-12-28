@@ -4,7 +4,7 @@
 1. Copy `.env.example` to `.env` and set:
    - `DISCORD_BOT_TOKEN` — your Discord bot token.
    - `BOT_PREFIX` — prefix for text commands.
-   - `OPENAI_TOKEN` — API key for the `/ask` and `/image` commands.
+   - `OPENAI_TOKEN` — API key for `/ask`, `/image`, and flag reaction translation.
 
 ## Commands
 - `ask` — Ask the AI anything; attach up to three images (about 3MB max each, i.e., ~3,000,000 bytes, including images on the message you replied to) for analysis, and it will note the current time, tap web search plus a read-only shell for repo context, and use a code interpreter for calculations. Oversized images are automatically resized/compressed toward the limit. Admins can pick action `reset` to clear channel history while non-admin reset requests are treated as normal questions. Reply-based image pickup works best with prefix commands/mentions; slash commands rely on explicitly attached files.
@@ -27,7 +27,7 @@
 - `skip` — Skip the current track.
 - `tune` — Set speed and pitch (`/tune 1.2 0.9`).
 - `uptime` — Show how long the bot has been running.
-- `userinfo` — Show a member's profile with timestamps and roles.
+- `userinfo` — Show a member's profile with timestamps, roles, and bot status.
 
 ### Music prerequisites
 - Install **FFmpeg** and ensure `ffmpeg` is on PATH (required for audio decoding).
@@ -38,4 +38,5 @@
 Prefix commands work with either the configured `BOT_PREFIX` or by mentioning the bot (for example, `@Bot ping`). Messages that start with a bot mention or reply to the bot will fall back to `ask` when they are not recognized as commands.
 
 ## Events
+- `flag_translate` — Translate a message when a user reacts with a country flag emoji (includes embeds and images).
 - `voice_auto_leave` — Leave voice automatically when only bots remain in the voice channel (Auto Leave must be on).
