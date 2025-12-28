@@ -1,0 +1,249 @@
+🇦🇼	AW	Aruba	Dutch
+🇦🇫	AF	Afghanistan	Dari Persian
+🇦🇴	AO	Angola	Portuguese
+🇦🇮	AI	Anguilla	English
+🇦🇽	AX	Åland Islands	Swedish
+🇦🇱	AL	Albania	Albanian
+🇦🇩	AD	Andorra	Catalan
+🇦🇪	AE	United Arab Emirates	Arabic
+🇦🇷	AR	Argentina	Spanish
+🇦🇲	AM	Armenia	Armenian
+🇦🇸	AS	American Samoa	Samoan
+🇦🇶	AQ	Antarctica	English
+🇹🇫	TF	French Southern Territories	French
+🇦🇬	AG	Antigua and Barbuda	English
+🇦🇺	AU	Australia	English
+🇦🇹	AT	Austria	German
+🇦🇿	AZ	Azerbaijan	Azerbaijani
+🇧🇮	BI	Burundi	Kirundi
+🇧🇪	BE	Belgium	French
+🇧🇯	BJ	Benin	French
+🇧🇶	BQ	Bonaire, Sint Eustatius and Saba	Dutch
+🇧🇫	BF	Burkina Faso	French
+🇧🇩	BD	Bangladesh	Bengali
+🇧🇬	BG	Bulgaria	Bulgarian
+🇧🇭	BH	Bahrain	Arabic
+🇧🇸	BS	Bahamas	English
+🇧🇦	BA	Bosnia and Herzegovina	Bosnian
+🇧🇱	BL	Saint Barthélemy	French
+🇧🇾	BY	Belarus	Belarusian
+🇧🇿	BZ	Belize	English
+🇧🇲	BM	Bermuda	English
+🇧🇴	BO	Bolivia, Plurinational State of	Spanish
+🇧🇷	BR	Brazil	Portuguese
+🇧🇧	BB	Barbados	English
+🇧🇳	BN	Brunei Darussalam	Malay
+🇧🇹	BT	Bhutan	Dzongkha
+🇧🇻	BV	Bouvet Island	Norwegian
+🇧🇼	BW	Botswana	English
+🇨🇫	CF	Central African Republic	French
+🇨🇦	CA	Canada	English
+🇨🇨	CC	Cocos (Keeling) Islands	English
+🇨🇭	CH	Switzerland	German
+🇨🇱	CL	Chile	Spanish
+🇨🇳	CN	China	Chinese (Simplified)
+🇨🇮	CI	Côte d'Ivoire	French
+🇨🇲	CM	Cameroon	French
+🇨🇩	CD	Congo, The Democratic Republic of the	French
+🇨🇬	CG	Congo	French
+🇨🇰	CK	Cook Islands	English
+🇨🇴	CO	Colombia	Spanish
+🇰🇲	KM	Comoros	Comorian
+🇨🇻	CV	Cabo Verde	Portuguese
+🇨🇷	CR	Costa Rica	Spanish
+🇨🇺	CU	Cuba	Spanish
+🇨🇼	CW	Curaçao	Dutch
+🇨🇽	CX	Christmas Island	English
+🇰🇾	KY	Cayman Islands	English
+🇨🇾	CY	Cyprus	Greek
+🇨🇿	CZ	Czechia	Czech
+🇩🇪	DE	Germany	German
+🇩🇯	DJ	Djibouti	French
+🇩🇲	DM	Dominica	English
+🇩🇰	DK	Denmark	Danish
+🇩🇴	DO	Dominican Republic	Spanish
+🇩🇿	DZ	Algeria	Arabic
+🇪🇨	EC	Ecuador	Spanish
+🇪🇬	EG	Egypt	Arabic
+🇪🇷	ER	Eritrea	Tigrinya
+🇪🇭	EH	Western Sahara	Arabic
+🇪🇸	ES	Spain	Spanish
+🇪🇪	EE	Estonia	Estonian
+🇪🇹	ET	Ethiopia	Amharic
+🇫🇮	FI	Finland	Finnish
+🇫🇯	FJ	Fiji	English
+🇫🇰	FK	Falkland Islands (Malvinas)	English
+🇫🇷	FR	France	French
+🇫🇴	FO	Faroe Islands	Faroese
+🇫🇲	FM	Micronesia, Federated States of	English
+🇬🇦	GA	Gabon	French
+🇬🇧	GB	United Kingdom	English
+🇬🇪	GE	Georgia	Georgian
+🇬🇬	GG	Guernsey	English
+🇬🇭	GH	Ghana	English
+🇬🇮	GI	Gibraltar	English
+🇬🇳	GN	Guinea	French
+🇬🇵	GP	Guadeloupe	French
+🇬🇲	GM	Gambia	English
+🇬🇼	GW	Guinea-Bissau	Portuguese
+🇬🇶	GQ	Equatorial Guinea	Spanish
+🇬🇷	GR	Greece	Greek
+🇬🇩	GD	Grenada	English
+🇬🇱	GL	Greenland	Greenlandic
+🇬🇹	GT	Guatemala	Spanish
+🇬🇫	GF	French Guiana	French
+🇬🇺	GU	Guam	English
+🇬🇾	GY	Guyana	English
+🇭🇰	HK	Hong Kong	Chinese (Traditional)
+🇭🇲	HM	Heard Island and McDonald Islands	English
+🇭🇳	HN	Honduras	Spanish
+🇭🇷	HR	Croatia	Croatian
+🇭🇹	HT	Haiti	Haitian Creole
+🇭🇺	HU	Hungary	Hungarian
+🇮🇩	ID	Indonesia	Indonesian
+🇮🇲	IM	Isle of Man	English
+🇮🇳	IN	India	Hindi
+🇮🇴	IO	British Indian Ocean Territory	English
+🇮🇪	IE	Ireland	English
+🇮🇷	IR	Iran, Islamic Republic of	Persian
+🇮🇶	IQ	Iraq	Arabic
+🇮🇸	IS	Iceland	Icelandic
+🇮🇱	IL	Israel	Hebrew
+🇮🇹	IT	Italy	Italian
+🇯🇲	JM	Jamaica	English
+🇯🇪	JE	Jersey	English
+🇯🇴	JO	Jordan	Arabic
+🇯🇵	JP	Japan	Japanese
+🇰🇿	KZ	Kazakhstan	Kazakh
+🇰🇪	KE	Kenya	Swahili
+🇰🇬	KG	Kyrgyzstan	Kyrgyz
+🇰🇭	KH	Cambodia	Khmer
+🇰🇮	KI	Kiribati	English
+🇰🇳	KN	Saint Kitts and Nevis	English
+🇰🇷	KR	Korea, Republic of	Korean
+🇰🇼	KW	Kuwait	Arabic
+🇱🇦	LA	Lao People's Democratic Republic	Lao
+🇱🇧	LB	Lebanon	Arabic
+🇱🇷	LR	Liberia	English
+🇱🇾	LY	Libya	Arabic
+🇱🇨	LC	Saint Lucia	English
+🇱🇮	LI	Liechtenstein	German
+🇱🇰	LK	Sri Lanka	Sinhala
+🇱🇸	LS	Lesotho	Sesotho
+🇱🇹	LT	Lithuania	Lithuanian
+🇱🇺	LU	Luxembourg	Luxembourgish
+🇱🇻	LV	Latvia	Latvian
+🇲🇴	MO	Macao	Chinese (Traditional)
+🇲🇫	MF	Saint Martin (French part)	French
+🇲🇦	MA	Morocco	Arabic
+🇲🇨	MC	Monaco	French
+🇲🇩	MD	Moldova, Republic of	Romanian
+🇲🇬	MG	Madagascar	Malagasy
+🇲🇻	MV	Maldives	Dhivehi
+🇲🇽	MX	Mexico	Spanish
+🇲🇭	MH	Marshall Islands	Marshallese
+🇲🇰	MK	North Macedonia	Macedonian
+🇲🇱	ML	Mali	French
+🇲🇹	MT	Malta	Maltese
+🇲🇲	MM	Myanmar	Burmese
+🇲🇪	ME	Montenegro	Montenegrin
+🇲🇳	MN	Mongolia	Mongolian
+🇲🇵	MP	Northern Mariana Islands	English
+🇲🇿	MZ	Mozambique	Portuguese
+🇲🇷	MR	Mauritania	Arabic
+🇲🇸	MS	Montserrat	English
+🇲🇶	MQ	Martinique	French
+🇲🇺	MU	Mauritius	English
+🇲🇼	MW	Malawi	English
+🇲🇾	MY	Malaysia	Malay
+🇾🇹	YT	Mayotte	French
+🇳🇦	NA	Namibia	English
+🇳🇨	NC	New Caledonia	French
+🇳🇪	NE	Niger	French
+🇳🇫	NF	Norfolk Island	English
+🇳🇬	NG	Nigeria	English
+🇳🇮	NI	Nicaragua	Spanish
+🇳🇺	NU	Niue	English
+🇳🇱	NL	Netherlands	Dutch
+🇳🇴	NO	Norway	Norwegian
+🇳🇵	NP	Nepal	Nepali
+🇳🇷	NR	Nauru	Nauruan
+🇳🇿	NZ	New Zealand	English
+🇴🇲	OM	Oman	Arabic
+🇵🇰	PK	Pakistan	Urdu
+🇵🇦	PA	Panama	Spanish
+🇵🇳	PN	Pitcairn	English
+🇵🇪	PE	Peru	Spanish
+🇵🇭	PH	Philippines	Filipino
+🇵🇼	PW	Palau	Palauan
+🇵🇬	PG	Papua New Guinea	Tok Pisin
+🇵🇱	PL	Poland	Polish
+🇵🇷	PR	Puerto Rico	Spanish
+🇰🇵	KP	Korea, Democratic People's Republic of	Korean
+🇵🇹	PT	Portugal	Portuguese
+🇵🇾	PY	Paraguay	Spanish
+🇵🇸	PS	Palestine, State of	Arabic
+🇵🇫	PF	French Polynesia	French
+🇶🇦	QA	Qatar	Arabic
+🇷🇪	RE	Réunion	French
+🇷🇴	RO	Romania	Romanian
+🇷🇺	RU	Russian Federation	Russian
+🇷🇼	RW	Rwanda	Kinyarwanda
+🇸🇦	SA	Saudi Arabia	Arabic
+🇸🇩	SD	Sudan	Arabic
+🇸🇳	SN	Senegal	French
+🇸🇬	SG	Singapore	English
+🇬🇸	GS	South Georgia and the South Sandwich Islands	English
+🇸🇭	SH	Saint Helena, Ascension and Tristan da Cunha	English
+🇸🇯	SJ	Svalbard and Jan Mayen	Norwegian
+🇸🇧	SB	Solomon Islands	English
+🇸🇱	SL	Sierra Leone	English
+🇸🇻	SV	El Salvador	Spanish
+🇸🇲	SM	San Marino	Italian
+🇸🇴	SO	Somalia	Somali
+🇵🇲	PM	Saint Pierre and Miquelon	French
+🇷🇸	RS	Serbia	Serbian
+🇸🇸	SS	South Sudan	English
+🇸🇹	ST	Sao Tome and Principe	Portuguese
+🇸🇷	SR	Suriname	Dutch
+🇸🇰	SK	Slovakia	Slovak
+🇸🇮	SI	Slovenia	Slovene
+🇸🇪	SE	Sweden	Swedish
+🇸🇿	SZ	Eswatini	English
+🇸🇽	SX	Sint Maarten (Dutch part)	Dutch
+🇸🇨	SC	Seychelles	English
+🇸🇾	SY	Syrian Arab Republic	Arabic
+🇹🇨	TC	Turks and Caicos Islands	English
+🇹🇩	TD	Chad	French
+🇹🇬	TG	Togo	French
+🇹🇭	TH	Thailand	Thai
+🇹🇯	TJ	Tajikistan	Tajik
+🇹🇰	TK	Tokelau	Tokelauan
+🇹🇲	TM	Turkmenistan	Turkmen
+🇹🇱	TL	Timor-Leste	Tetum
+🇹🇴	TO	Tonga	Tongan
+🇹🇹	TT	Trinidad and Tobago	English
+🇹🇳	TN	Tunisia	Arabic
+🇹🇷	TR	Türkiye	Turkish
+🇹🇻	TV	Tuvalu	Tuvaluan
+🇹🇼	TW	Taiwan, Province of China	Chinese (Traditional)
+🇹🇿	TZ	Tanzania, United Republic of	Swahili
+🇺🇬	UG	Uganda	English
+🇺🇦	UA	Ukraine	Ukrainian
+🇺🇲	UM	United States Minor Outlying Islands	English
+🇺🇾	UY	Uruguay	Spanish
+🇺🇸	US	United States	English
+🇺🇿	UZ	Uzbekistan	Uzbek
+🇻🇦	VA	Holy See (Vatican City State)	Italian
+🇻🇨	VC	Saint Vincent and the Grenadines	English
+🇻🇪	VE	Venezuela, Bolivarian Republic of	Spanish
+🇻🇬	VG	Virgin Islands, British	English
+🇻🇮	VI	Virgin Islands, U.S.	English
+🇻🇳	VN	Viet Nam	Vietnamese
+🇻🇺	VU	Vanuatu	Bislama
+🇼🇫	WF	Wallis and Futuna	French
+🇼🇸	WS	Samoa	Samoan
+🇾🇪	YE	Yemen	Arabic
+🇿🇦	ZA	South Africa	English
+🇿🇲	ZM	Zambia	English
+🇿🇼	ZW	Zimbabwe	English
