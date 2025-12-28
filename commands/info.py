@@ -187,6 +187,7 @@ class Info(commands.Cog):
         joined_ts: int | None = None
         display_roles = "No roles"
         top_role = "-"
+        account_type = "Bot \U0001F916" if getattr(target, "bot", False) else "Human \U0001F9D1"
 
         if isinstance(target, discord.Member):
             joined_ts = int(target.joined_at.replace(tzinfo=timezone.utc).timestamp()) if target.joined_at else None
@@ -207,6 +208,7 @@ class Info(commands.Cog):
         embed.set_thumbnail(url=avatar_url)
         embed.add_field(name="User", value=target.mention if hasattr(target, "mention") else str(target), inline=True)
         embed.add_field(name="User ID", value=str(target.id), inline=True)
+        embed.add_field(name="Account Type", value=account_type, inline=True)
         embed.add_field(name="Account Created", value=f"<t:{created_ts}:F>\n<t:{created_ts}:R>", inline=False)
         embed.add_field(name="Joined Server", value=joined_value, inline=False)
         embed.add_field(name="Top Role", value=top_role, inline=True)
