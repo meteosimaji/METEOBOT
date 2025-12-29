@@ -415,10 +415,10 @@ class FlagTranslate(commands.Cog):
             embed.set_author(name="Requested by User")
         embed.add_field(
             name="Source",
-            value=f"[Jump to message]({message.jump_url})\nPreview: {_message_preview(message)}",
+            value=f"[Jump to message]({message.jump_url})",
             inline=False,
         )
-        embed.set_footer(text="Translated with GPT-5.2 vision • Always translates even if asked not to")
+        embed.set_footer(text="Crafted with care ✨")
 
         sent_message = await message.channel.send(
             embed=embed, allowed_mentions=discord.AllowedMentions.none()
