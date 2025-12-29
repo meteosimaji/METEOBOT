@@ -1558,8 +1558,15 @@ class Ask(commands.Cog):
             resolved = getattr(ref, "resolved", None)
 
             if ref and ref.message_id and not isinstance(resolved, discord.Message):
-                with contextlib.suppress(Exception):
-                    resolved = await message.channel.fetch_message(ref.message_id)
+                ref_channel_id = getattr(ref, "channel_id", None) or message.channel.id
+                ref_guild_id = getattr(ref, "guild_id", None) or getattr(message.guild, "id", None)
+                resolved = await self._fetch_message_from_channel(
+                    channel_id=ref_channel_id,
+                    message_id=ref.message_id,
+                    channel=message.channel if ref_channel_id == message.channel.id else None,
+                    guild_id=ref_guild_id,
+                    actor=message.author,
+                )
 
             if isinstance(resolved, discord.Message) and resolved.author:
                 if resolved.author.id == bot_id:
@@ -1818,6 +1825,147 @@ class Ask(commands.Cog):
         message_id = int(match.group("message"))
         return guild_id, channel_id, message_id
 
+    def _get_messageable(
+        self,
+        channel_id: int,
+        *,
+        channel: discord.abc.Snowflake | None = None,
+        guild_id: int | None = None,
+    ) -> discord.abc.Messageable | None:
+        if isinstance(channel, discord.abc.Messageable):
+            return channel
+
+        inferred_guild_id = guild_id
+        if inferred_guild_id is None and channel and hasattr(channel, "guild") and channel.guild:
+            inferred_guild_id = channel.guild.id
+
+        with contextlib.suppress(Exception):
+            return self.bot.get_partial_messageable(channel_id, guild_id=inferred_guild_id)
+
+        return None
+
+    async def _fetch_message_from_channel(
+        self,
+        *,
+        channel_id: int,
+        message_id: int,
+        channel: discord.abc.Snowflake | None = None,
+        guild_id: int | None = None,
+        actor: discord.abc.Snowflake | None = None,
+    ) -> discord.Message | None:
+        message, _ = await self._fetch_message_with_acl(
+            actor=actor,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            channel=channel,
+            enforce_user_acl=actor is not None,
+        )
+        return message
+
+    async def _fetch_message_with_acl(
+        self,
+        *,
+        actor: discord.abc.Snowflake | None,
+        guild_id: int | None,
+        channel_id: int,
+        message_id: int,
+        channel: discord.abc.Snowflake | None = None,
+        enforce_user_acl: bool = True,
+    ) -> tuple[discord.Message | None, dict[str, str] | None]:
+        channel_obj = channel or self.bot.get_channel(channel_id)
+        if channel_obj is None:
+            try:
+                channel_obj = await self.bot.fetch_channel(channel_id)
+            except Exception:
+                channel_obj = None
+
+        channel_guild_id = getattr(getattr(channel_obj, "guild", None), "id", None)
+        target_guild_id = channel_guild_id or guild_id
+
+        if channel_obj is None:
+            return None, {
+                "ok": False,
+                "error": "channel_not_found",
+                "reason": "Could not access the channel for this link.",
+            }
+
+        permitted = not enforce_user_acl
+        if isinstance(channel_obj, (discord.abc.GuildChannel, discord.Thread)):
+            guild = channel_obj.guild
+            if guild is None:
+                return None, {
+                    "ok": False,
+                    "error": "channel_not_found",
+                    "reason": "Could not access the channel for this link.",
+                }
+            if enforce_user_acl and actor:
+                member = guild.get_member(actor.id)
+                if member is None:
+                    with contextlib.suppress(discord.HTTPException):
+                        member = await guild.fetch_member(actor.id)
+                if member:
+                    perms = channel_obj.permissions_for(member)
+                    permitted = perms.view_channel and perms.read_message_history
+                else:
+                    permitted = False
+        elif isinstance(channel_obj, discord.DMChannel):
+            if enforce_user_acl and actor:
+                recipient = getattr(channel_obj, "recipient", None)
+                permitted = bool(recipient and recipient.id == actor.id)
+            else:
+                permitted = True
+        elif isinstance(channel_obj, discord.GroupChannel):
+            if enforce_user_acl and actor:
+                permitted = any(u.id == actor.id for u in channel_obj.recipients)
+            else:
+                permitted = True
+
+        if not permitted:
+            return None, {
+                "ok": False,
+                "error": "no_access",
+                "reason": "You do not have permission to view that message.",
+            }
+
+        messageable = self._get_messageable(channel_id, channel=channel_obj, guild_id=target_guild_id)
+        if messageable is None:
+            return None, {
+                "ok": False,
+                "error": "channel_not_found",
+                "reason": "That channel does not support retrieving messages.",
+            }
+
+        try:
+            message = await messageable.fetch_message(message_id)
+        except discord.Forbidden:
+            return None, {
+                "ok": False,
+                "error": "no_access",
+                "reason": "The bot cannot read messages in that channel.",
+            }
+        except (discord.HTTPException, discord.NotFound):
+            return None, {
+                "ok": False,
+                "error": "message_not_found",
+                "reason": "The message could not be fetched.",
+            }
+        except discord.DiscordException:
+            return None, {
+                "ok": False,
+                "error": "message_not_found",
+                "reason": "The message could not be fetched.",
+            }
+        except Exception:
+            log.exception("Unexpected error while fetching message")
+            return None, {
+                "ok": False,
+                "error": "message_not_found",
+                "reason": "The message could not be fetched.",
+            }
+
+        return message, None
+
     def _message_reference_url(self, message: discord.Message) -> str | None:
         ref = getattr(message, "reference", None)
         if not ref:
@@ -1917,13 +2065,6 @@ class Ask(commands.Cog):
         if not channel_id or not message_id:
             return {"ok": False, "error": "invalid_link", "reason": "Invalid Discord message link."}
 
-        if guild_id and ctx.guild and ctx.guild.id != guild_id:
-            return {
-                "ok": False,
-                "error": "cross_guild",
-                "reason": "Message link points to a different guild.",
-            }
-
         channel = self.bot.get_channel(channel_id)
         if channel is None:
             try:
@@ -1931,45 +2072,16 @@ class Ask(commands.Cog):
             except Exception:
                 channel = None
 
-        if channel is None:
-            return {
-                "ok": False,
-                "error": "channel_not_found",
-                "reason": "Could not access the channel for this link.",
-            }
-
-        # Only allow text channels, threads, or DMs where the author has access
-        permitted = False
-        member = None
-        if isinstance(channel, (discord.TextChannel, discord.Thread)):
-            guild = channel.guild
-            if guild and ctx.author:
-                member = guild.get_member(ctx.author.id)
-                if member is None:
-                    with contextlib.suppress(discord.HTTPException):
-                        member = await guild.fetch_member(ctx.author.id)
-                if member:
-                    perms = channel.permissions_for(member)
-                    permitted = perms.view_channel and perms.read_message_history
-        elif isinstance(channel, discord.DMChannel):
-            recipient = getattr(channel, "recipient", None)
-            permitted = bool(recipient and ctx.author and recipient.id == ctx.author.id)
-
-        if not permitted:
-            return {
-                "ok": False,
-                "error": "no_access",
-                "reason": "You do not have permission to view that message.",
-            }
-
-        try:
-            message = await channel.fetch_message(message_id)
-        except Exception:
-            return {
-                "ok": False,
-                "error": "message_not_found",
-                "reason": "The message could not be fetched.",
-            }
+        message, error = await self._fetch_message_with_acl(
+            actor=ctx.author,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            channel=channel,
+            enforce_user_acl=True,
+        )
+        if error:
+            return error
 
         summary = self._summarize_message(
             message, max_chars=max_chars, include_embeds=include_embeds
@@ -2389,8 +2501,15 @@ class Ask(commands.Cog):
         if getattr(ctx, "message", None) is not None and ctx.message and ctx.message.reference:
             ref_msg = ctx.message.reference.resolved
             if not isinstance(ref_msg, discord.Message):
-                with contextlib.suppress(Exception):
-                    ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)  # type: ignore[arg-type]
+                ref_channel_id = getattr(ctx.message.reference, "channel_id", None) or ctx.channel.id  # type: ignore[arg-type]
+                ref_guild_id = getattr(ctx.message.reference, "guild_id", None) or getattr(ctx.guild, "id", None)
+                ref_msg = await self._fetch_message_from_channel(
+                    channel_id=ref_channel_id,
+                    message_id=ctx.message.reference.message_id,
+                    channel=ctx.channel if ref_channel_id == ctx.channel.id else None,  # type: ignore[arg-type]
+                    guild_id=ref_guild_id,
+                    actor=ctx.author,
+                )
             if isinstance(ref_msg, discord.Message):
                 for att in ref_msg.attachments:
                     att_id = getattr(att, "id", None)

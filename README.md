@@ -7,7 +7,7 @@
    - `OPENAI_TOKEN` — API key for `/ask`, `/image`, and flag reaction translation.
 
 ## Commands
-- `ask` — Ask the AI anything; attach up to three images (about 3MB max each, i.e., ~3,000,000 bytes, including images on the message you replied to) for analysis, and it will note the current time, tap web search plus a read-only shell for repo context, and use a code interpreter for calculations. Oversized images are automatically resized/compressed toward the limit. Admins can pick action `reset` to clear channel history while non-admin reset requests are treated as normal questions. Reply-based image pickup works best with prefix commands/mentions; slash commands rely on explicitly attached files.
+- `ask` — Ask the AI anything; attach up to three images (about 3MB max each, i.e., ~3,000,000 bytes, including images on the message you replied to) for analysis, and it will note the current time, tap web search plus a read-only shell for repo context, and use a code interpreter for calculations. Oversized images are automatically resized/compressed toward the limit. Admins can pick action `reset` to clear channel history while non-admin reset requests are treated as normal questions. Reply-based image pickup works best with prefix commands/mentions; slash commands rely on explicitly attached files. Message link fetching respects both user and bot permissions, even across guilds.
 - `help` — Browse commands and events or get detailed help.
 - `image` — Generate a 1024x1024 PNG from a prompt using gpt-image-1.5.
 - `autoleave` — Toggle Auto Leave (disconnect when idle/bot-only) or view the current state.
@@ -38,5 +38,5 @@
 Prefix commands work with either the configured `BOT_PREFIX` or by mentioning the bot (for example, `@Bot ping`). Messages that start with a bot mention or reply to the bot will fall back to `ask` when they are not recognized as commands.
 
 ## Events
-- `flag_translate` — Translate a message when a user reacts with a country flag emoji (includes embeds and images).
+- `flag_translate` — Translate a message when a user reacts with a country flag emoji (any channel that supports text chat; includes embeds and images, requires permission to read message history).
 - `voice_auto_leave` — Leave voice automatically when only bots remain in the voice channel (Auto Leave must be on).
