@@ -38,5 +38,5 @@
 Prefix commands work with either the configured `BOT_PREFIX` or by mentioning the bot (for example, `@Bot ping`). Messages that start with a bot mention or reply to the bot will fall back to `ask` when they are not recognized as commands.
 
 ## Events
-- `flag_translate` — Translate a message when a user reacts with a country flag emoji (any channel that supports text chat; includes embeds and images, requires permission to read message history).
+- `flag_translate` — Translate a message when a user reacts with a country flag emoji (any channel that supports text chat; includes embeds and images, notifies about cooldowns/permissions, requires permission to read message history).
 - `voice_auto_leave` — Leave voice automatically when only bots remain in the voice channel (Auto Leave must be on).
