@@ -14,7 +14,7 @@ import discord
 from discord.ext import commands
 
 from events import EventInfo
-from utils import sanitize
+from utils import humanize_delta, sanitize
 
 log = logging.getLogger(__name__)
 
@@ -169,6 +169,13 @@ class FlagTranslate(commands.Cog):
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        log.info(
+            "Flag translation reaction received: emoji=%s user_id=%s message_id=%s channel_id=%s",
+            payload.emoji,
+            payload.user_id,
+            payload.message_id,
+            payload.channel_id,
+        )
         if not self.enabled:
             return
         if payload.member and payload.member.bot:
@@ -185,31 +192,6 @@ class FlagTranslate(commands.Cog):
             locale = self.flag_map.get(emoji_str)
         if locale is None:
             return
-
-        now = asyncio.get_running_loop().time()
-        user_last = self._cooldown_user.get(payload.user_id, 0.0)
-        if now - user_last < USER_COOLDOWN_SEC:
-            return
-        msg_last = self._cooldown_msg.get(payload.message_id, 0.0)
-        if now - msg_last < MESSAGE_COOLDOWN_SEC:
-            return
-        key = (payload.message_id, emoji_str)
-        last = self._cooldown.get(key, 0.0)
-        if now - last < 8.0:
-            return
-        self._cooldown_user[payload.user_id] = now
-        self._cooldown_msg[payload.message_id] = now
-        self._cooldown[key] = now
-        if len(self._cooldown) > 5000:
-            for old_key in list(self._cooldown.keys())[:2500]:
-                self._cooldown.pop(old_key, None)
-        if len(self._cooldown_user) > 5000:
-            for old_key in list(self._cooldown_user.keys())[:2500]:
-                self._cooldown_user.pop(old_key, None)
-        if len(self._cooldown_msg) > 5000:
-            for old_key in list(self._cooldown_msg.keys())[:2500]:
-                self._cooldown_msg.pop(old_key, None)
-        language = locale.language
 
         # Supports any channel that has text chat (text, threads, forums, voice/stage chat, etc.).
         # If the bot cannot retrieve the message, we log and skip.
@@ -238,6 +220,61 @@ class FlagTranslate(commands.Cog):
             )
             return
 
+        now = asyncio.get_running_loop().time()
+        user_last = self._cooldown_user.get(payload.user_id, 0.0)
+        user_remaining = USER_COOLDOWN_SEC - (now - user_last)
+        if user_remaining > 0:
+            await self._send_temporary_notice(
+                messageable,
+                self._cooldown_embed(
+                    scope="You're translating too quickly.",
+                    remaining=user_remaining,
+                    hint="Flag translations have a short per-user cooldown to prevent spam.",
+                ),
+            )
+            return
+
+        msg_last = self._cooldown_msg.get(payload.message_id, 0.0)
+        msg_remaining = MESSAGE_COOLDOWN_SEC - (now - msg_last)
+        if msg_remaining > 0:
+            await self._send_temporary_notice(
+                messageable,
+                self._cooldown_embed(
+                    scope="This message was just translated.",
+                    remaining=msg_remaining,
+                    hint="Try again once its cooldown expires.",
+                ),
+            )
+            return
+
+        key = (payload.message_id, emoji_str)
+        last = self._cooldown.get(key, 0.0)
+        emoji_remaining = 8.0 - (now - last)
+        if emoji_remaining > 0:
+            await self._send_temporary_notice(
+                messageable,
+                self._cooldown_embed(
+                    scope=f"The {emoji_str} flag reaction is cooling down here.",
+                    remaining=emoji_remaining,
+                    hint="Give it a moment before requesting another translation with the same flag.",
+                ),
+            )
+            return
+
+        self._cooldown_user[payload.user_id] = now
+        self._cooldown_msg[payload.message_id] = now
+        self._cooldown[key] = now
+        if len(self._cooldown) > 5000:
+            for old_key in list(self._cooldown.keys())[:2500]:
+                self._cooldown.pop(old_key, None)
+        if len(self._cooldown_user) > 5000:
+            for old_key in list(self._cooldown_user.keys())[:2500]:
+                self._cooldown_user.pop(old_key, None)
+        if len(self._cooldown_msg) > 5000:
+            for old_key in list(self._cooldown_msg.keys())[:2500]:
+                self._cooldown_msg.pop(old_key, None)
+        language = locale.language
+
         try:
             message: discord.Message = await messageable.fetch_message(payload.message_id)
         except discord.Forbidden:
@@ -245,8 +282,19 @@ class FlagTranslate(commands.Cog):
                 "Flag translation skipped: bot has no access (channel_id=%s)",
                 payload.channel_id,
             )
+            await self._send_temporary_notice(
+                messageable,
+                self._error_embed(
+                    "I can't read message history in this channel."
+                    " Grant **View Channel** and **Read Message History** so I can translate reactions."
+                ),
+            )
             return
         except discord.NotFound:
+            await self._send_temporary_notice(
+                messageable,
+                self._error_embed("I couldn't find that message—maybe it was deleted."),
+            )
             return
         except discord.HTTPException:
             log.exception("Failed to fetch message for flag translation")
@@ -322,18 +370,30 @@ class FlagTranslate(commands.Cog):
                 )
         except Exception:
             log.exception("Translation request failed")
-            await message.channel.send(
+            msg = await message.channel.send(
                 embed=self._error_embed("Translation failed. Please try again."),
                 allowed_mentions=discord.AllowedMentions.none(),
+            )
+            log.info(
+                "Flag translation error notice sent (failed request) in channel_id=%s trigger_message_id=%s",
+                payload.channel_id,
+                message.id,
+                extra={"sent_message_id": getattr(msg, "id", None)},
             )
             return
 
         translation = getattr(resp, "output_text", "") or ""
         translation = translation.strip()
         if not translation:
-            await message.channel.send(
+            msg = await message.channel.send(
                 embed=self._error_embed("No translation returned."),
                 allowed_mentions=discord.AllowedMentions.none(),
+            )
+            log.info(
+                "Flag translation error notice sent (empty response) in channel_id=%s trigger_message_id=%s",
+                payload.channel_id,
+                message.id,
+                extra={"sent_message_id": getattr(msg, "id", None)},
             )
             return
 
@@ -360,13 +420,47 @@ class FlagTranslate(commands.Cog):
         )
         embed.set_footer(text="Translated with GPT-5.2 vision • Always translates even if asked not to")
 
-        await message.channel.send(
+        sent_message = await message.channel.send(
             embed=embed, allowed_mentions=discord.AllowedMentions.none()
+        )
+        log.info(
+            "Flag translation sent: sent_message_id=%s channel_id=%s trigger_message_id=%s",
+            getattr(sent_message, "id", None),
+            payload.channel_id,
+            message.id,
         )
 
     @staticmethod
     def _error_embed(desc: str) -> discord.Embed:
         return discord.Embed(title="⚠️ Translation Error", description=desc, color=0xFF0000)
+
+    @staticmethod
+    def _cooldown_embed(*, scope: str, remaining: float, hint: str) -> discord.Embed:
+        pretty = humanize_delta(max(1, remaining))
+        embed = discord.Embed(
+            title="⏳ Translation cooldown",
+            description=f"{scope}\nPlease try again in **{pretty}**.",
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=hint)
+        return embed
+
+    async def _send_temporary_notice(
+        self, messageable: Any, embed: discord.Embed, *, delete_after: float = 5.0
+    ) -> None:
+        if not hasattr(messageable, "send"):
+            return
+        with contextlib.suppress(Exception):
+            msg = await messageable.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            log.info(
+                "Flag translation notice sent (title=%s) in channel_id=%s message_id=%s",
+                embed.title,
+                getattr(messageable, "id", "unknown"),
+                getattr(msg, "id", "unknown"),
+            )
+            if delete_after > 0:
+                await asyncio.sleep(delete_after)
+                await msg.delete()
 
 
 async def setup(bot: commands.Bot) -> None:
