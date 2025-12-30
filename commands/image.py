@@ -6,12 +6,32 @@ import os
 import re
 import socket
 from io import BytesIO
+import warnings
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import ipaddress
 
 import discord
 from discord.ext import commands
+from PIL import (
+    DecompressionBombError,
+    DecompressionBombWarning,
+    Image,
+    ImageOps,
+    UnidentifiedImageError,
+)
+
+HEIF_ENABLED = False
+try:  # Optional HEIC/HEIF support
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    HEIF_ENABLED = True
+except Exception:
+    HEIF_ENABLED = False
+
+# Safety guard against decompression bombs in untrusted images
+Image.MAX_IMAGE_PIXELS = 4096 * 4096 * 4
 
 from utils import BOT_PREFIX, defer_interaction, safe_reply
 
@@ -19,8 +39,19 @@ log = logging.getLogger(__name__)
 
 MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50MB per input image (Images API limit)
 MAX_IMAGE_COUNT = 16  # Images API accepts up to 16 input images
-ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+ALLOWED_IMAGE_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+}
 URL_PATTERN = re.compile(r"https?://[^\s<>]+")
+MESSAGE_LINK_PATTERN = re.compile(
+    r"https?://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/"
+    r"(?P<guild_id>\d+|@me)/(?P<channel_id>\d+)/(?P<message_id>\d+)(?:\?.*)?$"
+)
 BLOCKED_NETWORKS = [
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
@@ -39,6 +70,30 @@ def _summarize_prompt_for_embed(prompt: str, max_len: int = 300) -> str:
     if len(cleaned) > max_len:
         cleaned = cleaned[: max_len - 1].rstrip() + "…"
     return cleaned or "[prompt hidden]"
+
+
+def _normalize_discord_cdn_url(url: str) -> str:
+    """Prefer original CDN assets over preview variants."""
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+
+    # Only normalize Discord CDN/preview URLs; leave other hosts intact to avoid
+    # breaking signed or transformation-required links.
+    if host not in {"media.discordapp.net", "cdn.discordapp.com"}:
+        return url
+
+    if host == "media.discordapp.net":
+        parsed = parsed._replace(netloc="cdn.discordapp.com")
+
+    query_pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key not in {"format", "quality", "width", "height"}
+    ]
+
+    parsed = parsed._replace(query=urlencode(query_pairs, doseq=True))
+    return urlunparse(parsed)
 
 _openai_module = importlib.import_module("openai")
 OpenAI = getattr(_openai_module, "OpenAI")
@@ -81,6 +136,92 @@ class Image(commands.Cog):
         images: list[tuple[bytes, str]] = []
         seen_attachment_ids: set[int] = set()
         seen_urls: set[str] = set()
+        seen_message_links: set[int] = set()
+
+        MAX_DECODE_DIM = 4096  # Safety guard against overly large inputs during decode
+
+        def _normalize_image_bytes(
+            data: bytes,
+            source: str,
+            filename_hint: str,
+            content_type_hint: str = "",
+        ) -> tuple[bytes, str] | None:
+            lower_hint = filename_hint.lower()
+
+            # Quick detection for obvious HTML responses to improve user-facing notes.
+            if data[:6].lower().startswith(b"<html") or data[:1] == b"<":
+                notes.append(f"Skipped {source}: URL returned HTML, not an image.")
+                return None
+
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", DecompressionBombWarning)
+                    img = Image.open(BytesIO(data))
+                    img.load()
+            except (
+                UnidentifiedImageError,
+                OSError,
+                DecompressionBombError,
+                DecompressionBombWarning,
+            ):
+                is_heic = lower_hint.endswith((".heic", ".heif")) or content_type_hint in {
+                    "image/heic",
+                    "image/heif",
+                }
+                if is_heic and not HEIF_ENABLED:
+                    notes.append(
+                        f"Skipped {source}: HEIC/HEIF isn't supported on this host (install pillow-heif). "
+                        "Convert to JPG/PNG and re-upload."
+                    )
+                else:
+                    notes.append(
+                        f"Skipped {source}: couldn't decode as an image. "
+                        "If this came from a Discord preview/CDN, download it and re-upload the actual file."
+                    )
+                return None
+
+            try:
+                if getattr(img, "is_animated", False) and getattr(img, "n_frames", 1) > 1:
+                    notes.append(f"Skipped {source}: animated images aren't supported. Export a still frame.")
+                    return None
+            except Exception:
+                pass
+
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+
+            has_alpha = (
+                img.mode in ("RGBA", "LA")
+                or (img.mode == "P" and "transparency" in getattr(img, "info", {}))
+            )
+
+            if has_alpha:
+                img = img.convert("RGBA")
+            else:
+                img = img.convert("RGB")
+
+            if max(img.size) > MAX_DECODE_DIM:
+                img.thumbnail((MAX_DECODE_DIM, MAX_DECODE_DIM), Image.LANCZOS)
+
+            out = BytesIO()
+            stem = Path(filename_hint or "image").stem or "image"
+            if has_alpha:
+                img.save(out, format="PNG", optimize=True)
+                new_name = f"{stem}.png"
+            else:
+                img.save(out, format="JPEG", quality=95, optimize=True, progressive=True)
+                new_name = f"{stem}.jpg"
+
+            new_data = out.getvalue()
+            if len(new_data) >= MAX_IMAGE_BYTES:
+                notes.append(
+                    f"Skipped {source}: normalized image exceeded {MAX_IMAGE_BYTES // (1024 * 1024)}MB."
+                )
+                return None
+
+            return new_data, new_name
 
         async def _read_attachment(att: discord.Attachment, source: str) -> None:
             att_id = getattr(att, "id", None)
@@ -88,6 +229,13 @@ class Image(commands.Cog):
                 return
             if att_id is not None:
                 seen_attachment_ids.add(att_id)
+
+            size = getattr(att, "size", None)
+            if size is not None and size >= MAX_IMAGE_BYTES:
+                notes.append(
+                    f"Skipped {source}: attachment is larger than {MAX_IMAGE_BYTES // (1024 * 1024)}MB."
+                )
+                return
 
             if len(images) >= MAX_IMAGE_COUNT:
                 notes.append(
@@ -103,6 +251,8 @@ class Image(commands.Cog):
                     ".jpg": "image/jpeg",
                     ".jpeg": "image/jpeg",
                     ".webp": "image/webp",
+                    ".heic": "image/heic",
+                    ".heif": "image/heif",
                 }
                 content_type = ext_map.get(ext, "")
 
@@ -125,9 +275,13 @@ class Image(commands.Cog):
                     f"Skipped {source}: attachment is larger than {MAX_IMAGE_BYTES // (1024 * 1024)}MB."
                 )
                 return
+            filename_hint = getattr(att, "filename", "image") or "image"
+            normalized = _normalize_image_bytes(data, source, filename_hint, content_type)
+            if not normalized:
+                return
 
-            filename = getattr(att, "filename", "image.png") or "image.png"
-            images.append((data, filename))
+            norm_data, norm_name = normalized
+            images.append((norm_data, norm_name))
 
         def _iter_attachments() -> list[tuple[discord.Attachment, str]]:
             att_list: list[tuple[discord.Attachment, str]] = []
@@ -184,66 +338,188 @@ class Image(commands.Cog):
                             return True
                     return False
 
+                ext_content_type_map = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                    ".heic": "image/heic",
+                    ".heif": "image/heif",
+                }
+
                 for raw_url in url_matches:
                     url = raw_url.rstrip("),.;")
-                    if url in seen_urls:
+                    normalized_url = _normalize_discord_cdn_url(url)
+                    if normalized_url in seen_urls:
                         continue
-                    seen_urls.add(url)
+                    seen_urls.add(normalized_url)
+
+                    message_match = MESSAGE_LINK_PATTERN.match(url)
+                    if message_match:
+                        try:
+                            message_id = int(message_match.group("message_id"))
+                            channel_id = int(message_match.group("channel_id"))
+                        except ValueError:
+                            notes.append(f"Skipped message link (invalid ID): {url}")
+                            continue
+
+                        if message_id in seen_message_links:
+                            continue
+                        seen_message_links.add(message_id)
+
+                        channel = self.bot.get_channel(channel_id)
+                        if channel is None:
+                            try:
+                                channel = await self.bot.fetch_channel(channel_id)
+                            except Exception:
+                                notes.append(f"Skipped message link (can't access channel): {url}")
+                                continue
+
+                        if not hasattr(channel, "fetch_message"):
+                            notes.append(
+                                f"Skipped message link (channel doesn't allow reading messages): {url}"
+                            )
+                            continue
+
+                        try:
+                            linked_message = await channel.fetch_message(message_id)
+                        except (discord.Forbidden, discord.NotFound):
+                            notes.append(f"Skipped message link (can't read message): {url}")
+                            continue
+                        except Exception:
+                            notes.append(f"Skipped message link (failed to read message): {url}")
+                            continue
+
+                        if not linked_message.attachments:
+                            notes.append(f"Skipped message link (no attachments to edit): {url}")
+                            continue
+
+                        for att in linked_message.attachments:
+                            await _read_attachment(att, f"message link {url}")
+                        continue
 
                     if len(images) >= MAX_IMAGE_COUNT:
                         notes.append(
-                            f"Skipped URL {url}: reached the {MAX_IMAGE_COUNT}-image limit for edits."
+                            f"Skipped URL {normalized_url}: reached the {MAX_IMAGE_COUNT}-image limit for edits."
                         )
                         continue
 
-                    parsed = urlparse(url)
+                    parsed = urlparse(normalized_url)
                     if parsed.scheme != "https":
-                        notes.append("Skipped URL (HTTPS required): " + url)
+                        notes.append("Skipped URL (HTTPS required): " + normalized_url)
                         continue
 
                     hostname = parsed.hostname
                     if not hostname:
-                        notes.append("Skipped URL (invalid host): " + url)
+                        notes.append("Skipped URL (invalid host): " + normalized_url)
                         continue
 
                     if await _is_blocked_host(hostname):
-                        notes.append("Skipped URL (host blocked): " + url)
+                        notes.append("Skipped URL (host blocked): " + normalized_url)
                         continue
 
                     try:
-                        async with session.get(url, allow_redirects=False) as resp:
-                            if resp.status != 200:
-                                notes.append(f"Skipped URL ({resp.status}): {url}")
-                                continue
-
-                            content_type = (resp.headers.get("Content-Type", "") or "").split(
-                                ";", 1
-                            )[0].lower()
-                            if content_type not in ALLOWED_IMAGE_TYPES:
-                                notes.append(f"Skipped URL (not an image): {url}")
-                                continue
-
-                            content_length = resp.headers.get("Content-Length")
+                        redirect_statuses = {301, 302, 303, 307, 308}
+                        current_url = normalized_url
+                        redirect_hops = 0
+                        while True:
+                            resp = await session.get(current_url, allow_redirects=False)
                             try:
-                                if content_length is not None and int(content_length) >= MAX_IMAGE_BYTES:
+                                if resp.status in redirect_statuses:
+                                    location = resp.headers.get("Location")
+                                    if not location:
+                                        notes.append(
+                                            f"Skipped URL (redirect missing Location): {current_url}"
+                                        )
+                                        break
+                                    current_url = urljoin(current_url, location)
+                                    parsed_redirect = urlparse(current_url)
+                                    if parsed_redirect.scheme != "https":
+                                        notes.append("Skipped URL (HTTPS required): " + current_url)
+                                        break
+                                    redirect_host = parsed_redirect.hostname
+                                    if not redirect_host or await _is_blocked_host(redirect_host):
+                                        notes.append("Skipped URL (host blocked): " + current_url)
+                                        break
+                                    redirect_hops += 1
+                                    if redirect_hops > 3:
+                                        notes.append(f"Skipped URL (too many redirects): {normalized_url}")
+                                        break
+                                    continue
+
+                                if resp.status != 200:
+                                    notes.append(f"Skipped URL ({resp.status}): {current_url}")
+                                    break
+
+                                parsed_final = urlparse(current_url)
+
+                                content_type = (resp.headers.get("Content-Type", "") or "").split(
+                                    ";", 1
+                                )[0].lower()
+                                ext_type_hint = ext_content_type_map.get(
+                                    Path(parsed_final.path).suffix.lower(), ""
+                                )
+                                is_discord_cdn = parsed_final.hostname in {
+                                    "cdn.discordapp.com",
+                                    "media.discordapp.net",
+                                }
+                                if content_type not in ALLOWED_IMAGE_TYPES:
+                                    if not content_type and not is_discord_cdn and ext_type_hint not in ALLOWED_IMAGE_TYPES:
+                                        notes.append(f"Skipped URL (missing content type): {current_url}")
+                                        break
+                                    if content_type and not is_discord_cdn and ext_type_hint not in ALLOWED_IMAGE_TYPES:
+                                        notes.append(f"Skipped URL (not an image): {current_url}")
+                                        break
+                                    if not content_type and is_discord_cdn:
+                                        notes.append(
+                                            f"Attempting decode despite missing content type: {current_url}"
+                                        )
+                                    elif content_type and is_discord_cdn:
+                                        notes.append(
+                                            f"Attempting decode despite content type {content_type}: {current_url}"
+                                        )
+                                    elif ext_type_hint in ALLOWED_IMAGE_TYPES:
+                                        notes.append(
+                                            f"Attempting decode based on file extension despite content type {content_type or 'missing'}: {current_url}"
+                                        )
+
+                                content_length = resp.headers.get("Content-Length")
+                                try:
+                                    if content_length is not None and int(content_length) >= MAX_IMAGE_BYTES:
+                                        notes.append(
+                                            f"Skipped URL: file exceeded {MAX_IMAGE_BYTES // (1024 * 1024)}MB"
+                                        )
+                                        break
+                                except ValueError:
+                                    pass
+
+                                data = await resp.content.read(MAX_IMAGE_BYTES + 1)
+                                if len(data) >= MAX_IMAGE_BYTES:
                                     notes.append(
                                         f"Skipped URL: file exceeded {MAX_IMAGE_BYTES // (1024 * 1024)}MB"
                                     )
-                                    continue
-                            except ValueError:
-                                pass
+                                    break
 
-                            data = await resp.content.read(MAX_IMAGE_BYTES + 1)
-                            if len(data) >= MAX_IMAGE_BYTES:
-                                notes.append(
-                                    f"Skipped URL: file exceeded {MAX_IMAGE_BYTES // (1024 * 1024)}MB"
+                                name_hint = Path(parsed_final.path).name or "image"
+                                normalized = _normalize_image_bytes(
+                                    data,
+                                    f"URL {current_url}",
+                                    name_hint,
+                                    content_type or ext_type_hint,
                                 )
-                                continue
+                                if not normalized:
+                                    break
 
-                            name = Path(parsed.path).name or "image.png"
-                            images.append((data, name))
-                    except Exception:
-                        notes.append(f"Skipped URL (download failed): {url}")
+                                norm_data, norm_name = normalized
+                                images.append((norm_data, norm_name))
+                                break
+                            finally:
+                                resp.release()
+                    except Exception as exc:
+                        notes.append(
+                            f"Skipped URL (download failed): {normalized_url} "
+                            f"({type(exc).__name__}: {str(exc)[:120]})"
+                        )
 
         return images, notes
 
@@ -253,16 +529,17 @@ class Image(commands.Cog):
         cooldown_after_parsing=True,
         cooldown=commands.CooldownMapping.from_cooldown(1, 10, commands.BucketType.user),
         help=(
-            "Generate or edit a 1024x1024 image with gpt-image-1.5. Attach images or drop public HTTPS image URLs in the prompt to edit; first image is the base, the rest are references (up to 16 inputs total, each under 50MB).\n\n"
+            "Generate or edit a 1024x1024 image with gpt-image-1.5. Attach images, drop public HTTPS image URLs, or paste Discord message links with attachments in the prompt to edit; first image is the base, the rest are references (up to 16 inputs total, each under 50MB).\n\n"
             "**Usage**: `/image <prompt>`\n"
-            "**Examples**: `/image cozy cabin in the snow at night`, `/image this image https://... add a crown`\n"
+            "**Examples**: `/image cozy cabin in the snow at night`, `/image this image https://... add a crown`, `/image use the image in this message link ... and add fireworks`\n"
             f"`{BOT_PREFIX}image add a neon crown to this character` (with an attachment)"
+            "\nHEIC/HEIF uploads are accepted and converted internally when pillow-heif is available."
         ),
         extras={
             "category": "AI",
-            "destination": "Generate or edit images from prompts, attachments, or URLs.",
-            "plus": "Edits when you attach/URL an image (first is base, others references); otherwise generates. HTTPS URLs only.",
-            "pro": "Uses the Images API with gpt-image-1.5, supports attachments, reply images, ask-injected images, and HTTPS URLs.",
+            "destination": "Generate or edit images from prompts, attachments, URLs, or message links.",
+            "plus": "Edits when you attach/URL/link an image (first is base, others references); otherwise generates. HTTPS URLs only.",
+            "pro": "Uses the Images API with gpt-image-1.5, supports attachments, reply images, ask-injected images, HTTPS URLs, and message links that contain attachments.",
         },
     )
     async def image(self, ctx: commands.Context, *, prompt: str) -> None:
@@ -474,12 +751,22 @@ class Image(commands.Cog):
             log.exception("Failed to generate image")
             description = "An error occurred while generating the image. Try again later."
             if isinstance(exc, BadRequestError):
-                description = f"OpenAI rejected the request: {getattr(exc, 'message', str(exc))}"
+                detail = getattr(exc, "message", str(exc))
+                description = f"OpenAI rejected the request: {detail}"
+                if "invalid_image_file" in str(getattr(exc, "code", "")) or "Invalid image file" in detail:
+                    description += (
+                        "\nMake sure your images are PNG, JPEG/JPG, or WEBP, under 50MB, and still accessible. "
+                        "Message links must point to a message with downloadable image attachments."
+                        "\nIf you pasted a Discord CDN/preview link, download the image and re-upload it here as a PNG/JPEG/WEBP file."
+                    )
             error_embed = discord.Embed(
                 title="\u26A0\ufe0f Image Failed",
                 description=description,
                 color=0xFF0000,
             )
+            if notes:
+                note_text = "\n".join(notes)
+                error_embed.add_field(name="Notes", value=note_text[:1024], inline=False)
             try:
                 if status_msg:
                     await status_msg.edit(embed=error_embed, attachments=[])
