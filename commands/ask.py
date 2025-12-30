@@ -2002,9 +2002,13 @@ class Ask(commands.Cog):
         return {
             "title": clamp(embed.title) if embed.title else "",
             "description": clamp(embed.description) if embed.description else "",
-            "author": getattr(embed.author, "name", "") or "",
-            "footer": getattr(embed.footer, "text", "") or "",
+            "author": clamp(getattr(embed.author, "name", "") or ""),
+            "author_icon": str(getattr(embed.author, "icon_url", "") or ""),
+            "footer": clamp(getattr(embed.footer, "text", "") or ""),
+            "footer_icon": str(getattr(embed.footer, "icon_url", "") or ""),
             "url": embed.url or "",
+            "thumbnail": str(getattr(getattr(embed, "thumbnail", None), "url", "") or ""),
+            "image": str(getattr(getattr(embed, "image", None), "url", "") or ""),
             "fields": fields,
         }
 
@@ -2111,6 +2115,14 @@ class Ask(commands.Cog):
         content = getattr(ctx, "ask_request_text", "") or ""
         reply_url = getattr(ctx, "ask_request_reply_url", None)
 
+        interaction_embeds: list[discord.Embed] = []
+        interaction = getattr(ctx, "interaction", None)
+        if interaction:
+            with contextlib.suppress(Exception):
+                msg = getattr(interaction, "message", None)
+                if msg and getattr(msg, "embeds", None):
+                    interaction_embeds = list(msg.embeds)
+
         if not attachments and not content:
             return {
                 "ok": False,
@@ -2139,6 +2151,12 @@ class Ask(commands.Cog):
 
         now_iso = datetime.now(timezone.utc).isoformat()
 
+        embed_payloads: list[dict[str, Any]] = []
+        if include_embeds:
+            raw_embeds = getattr(ctx, "ask_request_embeds", None) or interaction_embeds
+            for embed in raw_embeds:
+                embed_payloads.append(self._summarize_embed(embed, max_chars=max_chars))
+
         return {
             "ok": True,
             "message": {
@@ -2152,7 +2170,7 @@ class Ask(commands.Cog):
                 "content": _truncate_discord(content, limit=max_chars),
                 "content_length": len(content),
                 "attachments": attachment_payloads,
-                "embeds": [] if not include_embeds else [],
+                "embeds": embed_payloads,
             },
         }
 
@@ -2439,14 +2457,28 @@ class Ask(commands.Cog):
                     attachments_by_name[name_key] = payload
 
             embed_images: list[dict[str, Any]] = []
+            seen_embed_urls: set[str] = set()
+
+            def _add_embed_image(raw_url: str | None) -> None:
+                if not raw_url:
+                    return
+                resolved = _resolve_embed_image_url(str(raw_url), attachments_by_name)
+                url = resolved.get("url", "")
+                if not url or url in seen_embed_urls:
+                    return
+                seen_embed_urls.add(url)
+                embed_images.append(resolved)
+
             for embed in message.embeds:
                 img = getattr(embed, "image", None)
-                img_url = getattr(img, "url", None) if img else None
-                if not img_url:
-                    continue
-                resolved = _resolve_embed_image_url(img_url, attachments_by_name)
-                if resolved["url"] not in {img.get("url") for img in embed_images}:
-                    embed_images.append(resolved)
+                thumb = getattr(embed, "thumbnail", None)
+                author = getattr(embed, "author", None)
+                footer = getattr(embed, "footer", None)
+
+                _add_embed_image(getattr(img, "url", None) if img else None)
+                _add_embed_image(getattr(thumb, "url", None) if thumb else None)
+                _add_embed_image(getattr(author, "icon_url", None) if author else None)
+                _add_embed_image(getattr(footer, "icon_url", None) if footer else None)
 
             entry["text"] = "\n".join(text_parts).strip()
             if attachments:
@@ -2549,6 +2581,13 @@ class Ask(commands.Cog):
         attachments: list[discord.Attachment] = []
         seen_attachment_ids: set[int] = set()
         reply_url = None
+        interaction_embeds: list[discord.Embed] = []
+        interaction = getattr(ctx, "interaction", None)
+        if interaction:
+            with contextlib.suppress(Exception):
+                msg = getattr(interaction, "message", None)
+                if msg and getattr(msg, "embeds", None):
+                    interaction_embeds = list(msg.embeds)
         if getattr(ctx, "message", None) is not None and ctx.message:
             reply_url = self._message_reference_url(ctx.message)
             for att in ctx.message.attachments:
@@ -2601,6 +2640,8 @@ class Ask(commands.Cog):
             ctx.ask_request_attachments = list(attachments)
             ctx.ask_request_text = text
             ctx.ask_request_reply_url = reply_url
+            if interaction_embeds:
+                ctx.ask_request_embeds = list(interaction_embeds)
         except Exception:
             pass
 
@@ -2894,6 +2935,8 @@ class Ask(commands.Cog):
             " payload, and fetch results are auto-passed as inputs (first image is the base, others are references). "
             "If at least one image/URL is present, treat it as an edit request; otherwise use generation. Keep arg text-only;"
             " add HTTPS image URLs only when you want them used as inputs, and do not invent filenames or inline binary data."
+            " For edits that rely on a URL instead of an attachment, include that image URL in arg alongside the prompt so the"
+            " edit always has a base image."
         )
 
         tools = [
