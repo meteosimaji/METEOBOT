@@ -22,7 +22,8 @@ import discord
 from discord import AppCommandType, app_commands
 from discord.app_commands.errors import CommandAlreadyRegistered
 from discord.ext import commands
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
+from PIL.Image import Image as PILImageType
 
 from utils import BOT_PREFIX, build_suggestions, defer_interaction
 from cogs.settime import fmt_ofs, get_guild_offset
@@ -2769,7 +2770,7 @@ class Ask(commands.Cog):
                 return f"data:{content_type};base64,{b64}", None
 
             try:
-                img = Image.open(BytesIO(data))
+                img = PILImage.open(BytesIO(data))
                 img = ImageOps.exif_transpose(img)
             except (UnidentifiedImageError, OSError):
                 if url:
@@ -2778,7 +2779,7 @@ class Ask(commands.Cog):
 
             if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
                 img = img.convert("RGBA")
-                bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                bg = PILImage.new("RGBA", img.size, (255, 255, 255, 255))
                 bg.alpha_composite(img)
                 img = bg.convert("RGB")
             else:
@@ -2788,10 +2789,10 @@ class Ask(commands.Cog):
                 scale = MAX_IMAGE_DIM / max(img.size)
                 img = img.resize(
                     (max(1, int(img.size[0] * scale)), max(1, int(img.size[1] * scale))),
-                    Image.LANCZOS,
+                    getattr(PILImage, "Resampling", PILImage).LANCZOS,
                 )
 
-            def _encode_jpeg(image: Image.Image, quality: int) -> bytes:
+            def _encode_jpeg(image: PILImageType, quality: int) -> bytes:
                 out = BytesIO()
                 image.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
                 return out.getvalue()
@@ -2811,7 +2812,7 @@ class Ask(commands.Cog):
 
                 attempt = attempt.resize(
                     (max(1, width // 2), max(1, height // 2)),
-                    Image.LANCZOS,
+                    getattr(PILImage, "Resampling", PILImage).LANCZOS,
                 )
 
             if url:
