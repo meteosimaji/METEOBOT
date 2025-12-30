@@ -13,13 +13,8 @@ import ipaddress
 
 import discord
 from discord.ext import commands
-from PIL import (
-    DecompressionBombError,
-    DecompressionBombWarning,
-    Image,
-    ImageOps,
-    UnidentifiedImageError,
-)
+from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL.Image import DecompressionBombError, DecompressionBombWarning
 
 HEIF_ENABLED = False
 try:  # Optional HEIC/HEIF support
