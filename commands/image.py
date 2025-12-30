@@ -13,8 +13,7 @@ import ipaddress
 
 import discord
 from discord.ext import commands
-from PIL import Image, ImageOps, UnidentifiedImageError
-from PIL.Image import DecompressionBombError, DecompressionBombWarning
+from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
 
 HEIF_ENABLED = False
 try:  # Optional HEIC/HEIF support
@@ -26,7 +25,9 @@ except Exception:
     HEIF_ENABLED = False
 
 # Safety guard against decompression bombs in untrusted images
-Image.MAX_IMAGE_PIXELS = 4096 * 4096 * 4
+PILImage.MAX_IMAGE_PIXELS = 4096 * 4096 * 4
+DecompressionBombError = getattr(PILImage, "DecompressionBombError", OSError)
+DecompressionBombWarning = getattr(PILImage, "DecompressionBombWarning", Warning)
 
 from utils import BOT_PREFIX, defer_interaction, safe_reply
 
@@ -151,7 +152,7 @@ class Image(commands.Cog):
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("error", DecompressionBombWarning)
-                    img = Image.open(BytesIO(data))
+                    img = PILImage.open(BytesIO(data))
                     img.load()
             except (
                 UnidentifiedImageError,
@@ -198,7 +199,8 @@ class Image(commands.Cog):
                 img = img.convert("RGB")
 
             if max(img.size) > MAX_DECODE_DIM:
-                img.thumbnail((MAX_DECODE_DIM, MAX_DECODE_DIM), Image.LANCZOS)
+                resample = getattr(PILImage, "Resampling", PILImage).LANCZOS
+                img.thumbnail((MAX_DECODE_DIM, MAX_DECODE_DIM), resample)
 
             out = BytesIO()
             stem = Path(filename_hint or "image").stem or "image"
