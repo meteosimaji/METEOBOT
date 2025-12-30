@@ -61,11 +61,36 @@ BLOCKED_NETWORKS = [
 
 
 def _summarize_prompt_for_embed(prompt: str, max_len: int = 300) -> str:
-    """Hide long URLs and trim prompt text for cleaner embeds."""
-    cleaned = URL_PATTERN.sub("[link]", prompt).strip()
-    if len(cleaned) > max_len:
-        cleaned = cleaned[: max_len - 1].rstrip() + "…"
-    return cleaned or "[prompt hidden]"
+    """Replace URLs with clickable labels (using filenames/hosts) and trim."""
+
+    def _format_url(url: str) -> str:
+        url = url.rstrip(") ,.;&")
+        parsed = urlparse(url)
+        filename = Path(parsed.path.rstrip("/")).name or parsed.netloc or "link"
+        label = re.sub(r"[\[\]\(\)]", "", filename.split("?")[0] or "link")
+        return f"[{label}]({url})"
+
+    replaced = URL_PATTERN.sub(lambda m: _format_url(m.group(0)), prompt).strip()
+    if not replaced:
+        return "[prompt hidden]"
+
+    if len(replaced) <= max_len:
+        return replaced
+
+    parts: list[str] = []
+    length = 0
+    for token in re.split(r"(\s+)", replaced):
+        if not token:
+            continue
+        token_len = len(token)
+        if length + token_len > max_len:
+            if not parts:
+                return replaced[: max_len - 1].rstrip() + "…"
+            break
+        parts.append(token)
+        length += token_len
+
+    return "".join(parts).rstrip() + "…"
 
 
 def _normalize_discord_cdn_url(url: str) -> str:
@@ -77,6 +102,13 @@ def _normalize_discord_cdn_url(url: str) -> str:
     # Only normalize Discord CDN/preview URLs; leave other hosts intact to avoid
     # breaking signed or transformation-required links.
     if host not in {"media.discordapp.net", "cdn.discordapp.com"}:
+        return url
+
+    query_dict = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+    # Signed/expiring URLs must be left untouched; modifying the query can
+    # invalidate the signature and yield 404s even when the asset exists.
+    if any(key in query_dict for key in ("ex", "is", "hm")):
         return url
 
     if host == "media.discordapp.net":
@@ -125,11 +157,12 @@ class Image(commands.Cog):
 
     async def _gather_images(
         self, ctx: commands.Context, prompt: str
-    ) -> tuple[list[tuple[bytes, str]], list[str]]:
+    ) -> tuple[list[tuple[bytes, str]], list[str], bool]:
         """Collect input images from ask-injected context, attachments, replies, and URLs."""
 
         notes: list[str] = []
         images: list[tuple[bytes, str]] = []
+        had_candidates = False
         seen_attachment_ids: set[int] = set()
         seen_urls: set[str] = set()
         seen_message_links: set[int] = set()
@@ -298,12 +331,17 @@ class Image(commands.Cog):
 
             return att_list
 
-        for att, source in _iter_attachments():
+        attachments = _iter_attachments()
+        if attachments:
+            had_candidates = True
+
+        for att, source in attachments:
             await _read_attachment(att, source)
 
         # URLs embedded in the prompt
         url_matches = URL_PATTERN.findall(prompt)
         if url_matches:
+            had_candidates = True
             import aiohttp
 
             timeout = aiohttp.ClientTimeout(total=10)
@@ -345,7 +383,12 @@ class Image(commands.Cog):
                 }
 
                 for raw_url in url_matches:
-                    url = raw_url.rstrip("),.;")
+                    # Discord attachments sometimes include a trailing '&' (and similar
+                    # punctuation) when copied out of embeds or message content. These
+                    # suffixes break the signed CDN query string and lead to HTML/403
+                    # bodies that Pillow cannot decode. Strip common trailing noise
+                    # before normalization/fetching.
+                    url = raw_url.rstrip("),.;&")
                     normalized_url = _normalize_discord_cdn_url(url)
                     if normalized_url in seen_urls:
                         continue
@@ -518,7 +561,7 @@ class Image(commands.Cog):
                             f"({type(exc).__name__}: {str(exc)[:120]})"
                         )
 
-        return images, notes
+        return images, notes, had_candidates
 
     @commands.hybrid_command(
         name="image",
@@ -546,8 +589,22 @@ class Image(commands.Cog):
         prompt = prompt.strip()
         await defer_interaction(ctx)
 
-        images, notes = await self._gather_images(ctx, prompt)
+        images, notes, had_candidates = await self._gather_images(ctx, prompt)
         display_prompt = _summarize_prompt_for_embed(prompt)
+
+        if had_candidates and not images and notes:
+            error_embed = discord.Embed(
+                title="\u26a0\ufe0f No usable images to edit",
+                description=(
+                    "All provided image inputs were skipped or couldn't be decoded, "
+                    "so I won't generate a new image for this request."
+                ),
+                color=0xFF0000,
+            )
+            note_text = "\n".join(notes)
+            error_embed.add_field(name="Notes", value=note_text[:1024], inline=False)
+            await safe_reply(ctx, embed=error_embed, ephemeral=True, mention_author=False)
+            return
 
         status_embed = discord.Embed(
             title="🎨 Editing image…" if images else "🎨 Generating image…",
