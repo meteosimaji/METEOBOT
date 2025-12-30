@@ -9,7 +9,7 @@
 ## Commands
 - `ask` — Ask the AI anything; attach up to three images (about 3MB max each, i.e., ~3,000,000 bytes, including images on the message you replied to) for analysis, and it will note the current time, tap web search plus a read-only shell for repo context, and use a code interpreter for calculations. Oversized images are automatically resized/compressed toward the limit. Admins can pick action `reset` to clear channel history while non-admin reset requests are treated as normal questions. Reply-based image pickup works best with prefix commands/mentions; slash commands rely on explicitly attached files. Message link fetching respects both user and bot permissions, even across guilds.
 - `help` — Browse commands and events or get detailed help.
-- `image` — Generate or edit a 1024x1024 PNG with gpt-image-1.5; attach images or include public HTTPS image URLs in the prompt to edit (first image is the base, the rest are references; up to 16 inputs, each under 50MB).
+- `image` — Generate or edit a 1024x1024 PNG with gpt-image-1.5; attach images, include public HTTPS image URLs, or paste Discord message links with attachments in the prompt to edit (first image is the base, the rest are references; up to 16 inputs, each under 50MB). HEIC/HEIF uploads are accepted and converted internally when `pillow-heif` is available.
 - `autoleave` — Toggle Auto Leave (disconnect when idle/bot-only) or view the current state.
 - `bye` — Stop playback, clear the queue, and leave voice.
 - `loopmode` — Set looping to off, track, or queue (or display the current mode).
