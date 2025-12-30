@@ -57,12 +57,37 @@ def _chain_atempo(tempo: float) -> list[str]:
     return filters
 
 
+def _format_headers_arg(headers: dict[str, str] | None) -> str | None:
+    """Format http_headers for ffmpeg -headers option, filtering sensitive values."""
+
+    if not headers:
+        return None
+
+    filtered: list[tuple[str, str]] = []
+    for key, value in headers.items():
+        if not value:
+            continue
+        lower = key.lower()
+        if lower in {"cookie", "authorization"}:
+            continue
+        safe_value = str(value).replace("\r", " ").replace("\n", " ")
+        filtered.append((key, safe_value))
+
+    if not filtered:
+        return None
+
+    payload = "\r\n".join(f"{k}: {v}" for k, v in filtered) + "\r\n"
+    safe_payload = payload.replace('"', r'\"')
+    return f'-headers "{safe_payload}"'
+
+
 @dataclass
 class Track:
     url: str          # direct media URL for ffmpeg
     title: str
     duration: float   # seconds (0 if unknown)
     page_url: str     # webpage URL for display
+    http_headers: dict[str, str] | None = None
 
 
 class VoiceConnectionError(Exception):
@@ -213,7 +238,11 @@ class MusicPlayer:
             self.offset = 0.0
         self.started_at = time.monotonic()
 
-        before_opts = FFMPEG_OPTS["before_options"]
+        before_parts = [FFMPEG_OPTS["before_options"]]
+        header_arg = _format_headers_arg(track.http_headers)
+        if header_arg:
+            before_parts.append(header_arg)
+        before_opts = " ".join(before_parts)
         if seek > 0:
             before_opts += f" -ss {seek}"
 
@@ -738,11 +767,13 @@ async def yt_search(query: str) -> Track:
                 if not entries:
                     raise yt_dlp.utils.DownloadError("No results")
                 info = entries[0]
+            headers = info.get("http_headers") or None
             return Track(
                 url=info["url"],
                 title=info.get("title", "Unknown"),
                 duration=info.get("duration", 0) or 0,
                 page_url=info.get("webpage_url", query),
+                http_headers=headers,
             )
 
     return await asyncio.to_thread(extract)
