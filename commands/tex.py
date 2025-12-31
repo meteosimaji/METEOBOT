@@ -104,6 +104,10 @@ def _looks_like_raw_body(src: str) -> bool:
     return False
 
 
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", text))
+
+
 def _wrap_expression(src: str) -> str:
     s = src.strip()
     if not s:
@@ -194,6 +198,48 @@ def _default_template_xetex(body: str) -> str:
 
             % Make output crisp
             \linespread{1.0}
+
+            \begin{document}
+            {body}
+            \end{document}
+            """
+        )
+        .strip()
+        .replace("{body}", body)
+        + "\n"
+    )
+
+
+def _default_text_template_xetex(body: str) -> str:
+    return (
+        textwrap.dedent(
+            r"""
+            \documentclass[border=6pt]{standalone}
+
+            \usepackage{xcolor}
+            \usepackage{fontspec}
+            \usepackage{xeCJK}
+            \usepackage{amsmath,amssymb}
+            \defaultfontfeatures{Ligatures=TeX}
+
+            % Latin font
+            \IfFontExistsTF{TeX Gyre Termes}{\setmainfont{TeX Gyre Termes}}{}
+
+            % CJK font fallbacks (use what's installed)
+            \IfFontExistsTF{Noto Sans CJK JP}{\setCJKmainfont{Noto Sans CJK JP}}{%
+              \IfFontExistsTF{Noto Serif CJK JP}{\setCJKmainfont{Noto Serif CJK JP}}{%
+                \IfFontExistsTF{IPAexGothic}{\setCJKmainfont{IPAexGothic}}{%
+                  \IfFontExistsTF{IPAMincho}{\setCJKmainfont{IPAMincho}}{%
+                    \setCJKmainfont{FandolSong-Regular}% final forced fallback
+                  }
+                }
+              }
+            }
+
+            \linespread{1.05}
+            \setlength{\parindent}{0pt}
+            \setlength{\parskip}{6pt}
+            \nopagecolor
 
             \begin{document}
             {body}
@@ -340,6 +386,7 @@ def _pdf_to_png_via_gs(
         f"-r{dpi}",
         "-dTextAlphaBits=4",
         "-dGraphicsAlphaBits=4",
+        "-dUseCropBox",
         f"-sOutputFile={out_pattern}",
         str(pdf_path),
     ]
@@ -425,27 +472,26 @@ def render_latex_to_png_pdf(
             if s.startswith("[") and s.endswith("]") and not s.startswith(r"\["):
                 s = r"\[" + s[1:-1].strip() + r"\]"
             explicit_env = _looks_like_raw_body(s)
+            contains_cjk = _contains_cjk(s)
             autowrap = _bool_env("LATEXBOT_AUTOWRAP", DEFAULT_AUTOWRAP)
-            if "\n" in s and not explicit_env:
-                raise LatexRenderError(
-                    "Multi-line input must use an explicit math environment. "
-                    "Wrap it like: \\[\\begin{aligned} ... \\end{aligned}\\] and align equals with `&`, "
-                    "or provide a full LaTeX document (\\documentclass ...)."
-                )
-            if re.search(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", s) and not explicit_env:
-                raise LatexRenderError(
-                    "Japanese/CJK text requires explicit math delimiters or a full document. "
-                    "Use \\[ ... \\] or provide a full LaTeX document."
-                )
+            if contains_cjk and not explicit_env:
+                tex_source = _default_text_template_xetex(body=s)
+            else:
+                if "\n" in s and not explicit_env:
+                    raise LatexRenderError(
+                        "Multi-line input must use an explicit math environment. "
+                        "Wrap it like: \\[\\begin{aligned} ... \\end{aligned}\\] and align equals with `&`, "
+                        "or provide a full LaTeX document (\\documentclass ...)."
+                    )
 
-            if not explicit_env and not autowrap:
-                raise LatexRenderError(
-                    "No explicit math delimiters found and LATEXBOT_AUTOWRAP=0. Wrap your expression with $...$ or \\[...\\], "
-                    "or provide a full LaTeX document (\\documentclass ...), or re-enable auto-wrap with LATEXBOT_AUTOWRAP=1."
-                )
+                if not explicit_env and not autowrap:
+                    raise LatexRenderError(
+                        "No explicit math delimiters found and LATEXBOT_AUTOWRAP=0. Wrap your expression with $...$ or \\[...\\], "
+                        "or provide a full LaTeX document (\\documentclass ...), or re-enable auto-wrap with LATEXBOT_AUTOWRAP=1."
+                    )
 
-            body = _wrap_expression(s) if (not explicit_env and autowrap) else s
-            tex_source = _default_template_xetex(body=body)
+                body = _wrap_expression(s) if (not explicit_env and autowrap) else s
+                tex_source = _default_template_xetex(body=body)
 
         pdf_path, engine = _compile_to_pdf(tex_source, workdir=workdir, timeout_s=compile_timeout_s)
 
