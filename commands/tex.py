@@ -14,7 +14,7 @@ import discord
 from discord.ext import commands
 from PIL import Image
 
-from utils import LONG_VIEW_TIMEOUT_S, defer_interaction
+from utils import defer_interaction
 
 
 DEFAULT_DPI = 300
@@ -33,7 +33,6 @@ DEFAULT_MAX_PAGES = 3
 MIN_MAX_PAGES = 1
 MAX_MAX_PAGES = 4
 DISCORD_ATTACHMENT_LIMIT = 10
-TOGGLE_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
 MAX_LATEX_CHARS = 20_000
 
@@ -512,116 +511,66 @@ async def _send_response(
     *,
     content: Optional[str] = None,
     embed: Optional[discord.Embed] = None,
+    embeds: Optional[list[discord.Embed]] = None,
     files: Optional[list[discord.File]] = None,
-    view: Optional[discord.ui.View] = None,
     mention_author: bool = False,
 ) -> discord.Message:
+    if embed is not None and embeds is not None:
+        raise ValueError("Pass either embed or embeds, not both.")
+
+    send_kwargs = {}
+    if content is not None:
+        send_kwargs["content"] = content
+    if embed is not None:
+        send_kwargs["embed"] = embed
+    if embeds is not None:
+        send_kwargs["embeds"] = embeds
+    if files is not None:
+        send_kwargs["files"] = files
+
     if ctx.interaction:
-        return await ctx.interaction.followup.send(
-            content=content,
-            embed=embed,
-            files=files,
-            view=view,
-        )
-    return await ctx.reply(
-        content=content,
-        embed=embed,
-        files=files,
-        view=view,
-        mention_author=mention_author,
+        return await ctx.interaction.followup.send(**send_kwargs)
+
+    return await ctx.reply(**send_kwargs, mention_author=mention_author)
+
+
+def _build_preview_embed(
+    *,
+    white_files: list[str],
+    transparent_files: list[str],
+    pdf_omitted_for_size: bool,
+    max_bytes: int,
+    color: int = 0xE67E22,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="TeX Render",
+        description=(
+            "White preview is shown as the main image; transparent preview is the thumbnail. "
+            "All white + transparent pages are attached for download."
+        ),
+        color=color,
     )
 
-
-class _RenderToggleView(discord.ui.View):
-    def __init__(
-        self,
-        *,
-        white_files: list[str],
-        transparent_files: list[str],
-        pdf_omitted_for_size: bool,
-        max_bytes: int,
-        author_id: int,
-    ):
-        super().__init__(timeout=TOGGLE_VIEW_TIMEOUT_S)
-        self.variant: str = "white"
-        self.white_files = white_files
-        self.transparent_files = transparent_files
-        self.pdf_omitted_for_size = pdf_omitted_for_size
-        self.max_bytes = max_bytes
-        self.author_id = author_id
-        self.message: Optional[discord.Message] = None
-        self._sync_button_styles()
-
-    def _active_files(self) -> list[str]:
-        return self.white_files if self.variant == "white" else self.transparent_files
-
-    def _sync_button_styles(self) -> None:
-        if hasattr(self, "btn_white") and hasattr(self, "btn_transparent"):
-            self.btn_white.style = (
-                discord.ButtonStyle.success if self.variant == "white" else discord.ButtonStyle.secondary
-            )
-            self.btn_transparent.style = (
-                discord.ButtonStyle.success if self.variant == "transparent" else discord.ButtonStyle.secondary
-            )
-
-    def build_embed(self) -> discord.Embed:
-        files = self._active_files()
-        embed = discord.Embed(
-            title="TeX Render",
-            description="Tap the buttons below to swap between transparent and white PNGs.",
-            color=0xE67E22,
-        )
-        if len(files) > 1:
-            embed.add_field(
-                name="Pages",
-                value=f"Rendered {len(files)} page PNG set (see attachments).",
-                inline=False,
-            )
+    if len(white_files) > 1:
         embed.add_field(
-            name="Background",
-            value="⬜ White canvas" if self.variant == "white" else "🪟 Transparent canvas",
+            name="Pages",
+            value=(
+                f"Showing page 1 preview. Attachments include {len(white_files)} pages "
+                "for both backgrounds."
+            ),
             inline=False,
         )
-        if self.pdf_omitted_for_size:
-            embed.add_field(
-                name="PDF",
-                value=f"PDF attachment omitted (over ~{self.max_bytes:,} bytes).",
-                inline=False,
-            )
-        embed.set_image(url=f"attachment://{files[0]}")
-        return embed
 
-    async def _swap(self, interaction: discord.Interaction, variant: str) -> None:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "Only the requester can switch backgrounds.",
-                ephemeral=True,
-            )
-            return
-        if self.variant == variant:
-            await interaction.response.defer(thinking=False)
-            return
-        self.variant = variant
-        self._sync_button_styles()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+    if pdf_omitted_for_size:
+        embed.add_field(
+            name="PDF",
+            value=f"PDF attachment omitted (over ~{max_bytes:,} bytes).",
+            inline=False,
+        )
 
-    @discord.ui.button(label="⬜ White PNG", style=discord.ButtonStyle.success)
-    async def btn_white(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._swap(interaction, "white")
-
-    @discord.ui.button(label="🪟 Transparent PNG", style=discord.ButtonStyle.secondary)
-    async def btn_transparent(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._swap(interaction, "transparent")
-
-    async def on_timeout(self) -> None:
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except Exception:
-                pass
+    embed.set_image(url=f"attachment://{white_files[0]}")
+    embed.set_thumbnail(url=f"attachment://{transparent_files[0]}")
+    return embed
 
 
 class Tex(commands.Cog):
@@ -642,7 +591,7 @@ class Tex(commands.Cog):
             "category": "Tools",
             "pro": "Requires `tectonic` (untrusted mode) and Ghostscript on the server for PNG output.",
             "destination": "Render LaTeX into PNG images with both white and transparent backgrounds plus the PDF for download.",
-            "plus": "Switch backgrounds with the buttons; full documents compile as-is and auto-wrap is on by default (set LATEXBOT_AUTOWRAP=0 to require delimiters).",
+            "plus": "Both white and transparent previews are attached; full documents compile as-is and auto-wrap is on by default (set LATEXBOT_AUTOWRAP=0 to require delimiters).",
         },
     )
     async def tex(self, ctx: commands.Context, *, arg: str):
@@ -766,7 +715,7 @@ class Tex(commands.Cog):
                 title="📎 Attachment Limit Hit",
                 description=(
                     f"This render would need {attachment_budget} files, which exceeds Discord's limit of {DISCORD_ATTACHMENT_LIMIT}.\n"
-                    "Try reducing the page count or disabling one background to stay within the cap."
+                    "Try reducing the page count to stay within the cap."
                 ),
                 color=0xE67E22,
             )
@@ -807,22 +756,33 @@ class Tex(commands.Cog):
                 pdf_io.seek(0)
                 files.append(discord.File(fp=pdf_io, filename="render.pdf"))
 
-            view = _RenderToggleView(
+            if not png_white_files or not png_transparent_files:
+                error_embed = discord.Embed(
+                    title="⚠️ TeX Render Failed",
+                    description="Internal error: render completed but no previews were produced.",
+                    color=0xE74C3C,
+                )
+                await _send_response(
+                    ctx,
+                    content=error_embed.description,
+                    embed=error_embed,
+                    mention_author=False,
+                )
+                return
+
+            embed = _build_preview_embed(
                 white_files=png_white_files,
                 transparent_files=png_transparent_files,
                 pdf_omitted_for_size=result.pdf_omitted_for_size,
                 max_bytes=max_bytes,
-                author_id=ctx.author.id,
             )
 
-            message = await _send_response(
+            await _send_response(
                 ctx,
-                embed=view.build_embed(),
+                embed=embed,
                 files=files,
-                view=view,
                 mention_author=False,
             )
-            view.message = message
         finally:
             # discord.File keeps open handles on Windows; ensure close.
             for f in files:

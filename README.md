@@ -25,7 +25,7 @@
 - `serverinfo` — Display a polished snapshot of the current server.
 - `settime` — Configure a server's timezone with interactive buttons.
 - `skip` — Skip the current track.
-- `tex` — Render LaTeX to crisp PNGs with both white and transparent backgrounds plus a PDF; swap backgrounds via the buttons. Supports up to four pages (keeps Discord attachments under the cap) and works great when invoked via `/ask` tool-calling.
+- `tex` — Render LaTeX to crisp PNGs with both white and transparent backgrounds plus a PDF; both preview variants are attached together. Supports up to four pages (keeps Discord attachments under the cap) and works great when invoked via `/ask` tool-calling.
 - `tune` — Set speed and pitch (`/tune 1.2 0.9`).
 - `uptime` — Show how long the bot has been running.
 - `userinfo` — Show a member's profile with timestamps, roles, and bot status.
