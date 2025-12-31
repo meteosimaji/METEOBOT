@@ -21,7 +21,7 @@ DEFAULT_DPI = 300
 DEFAULT_COMPILE_TIMEOUT_S = 15
 DEFAULT_RASTER_TIMEOUT_S = 10
 DEFAULT_MAX_BYTES = 7_800_000
-DEFAULT_AUTOWRAP = False
+DEFAULT_AUTOWRAP = True
 
 MIN_DPI = 72
 MAX_DPI = 600
@@ -61,7 +61,7 @@ def _is_full_document(src: str) -> bool:
 
 
 def _assert_supported_document(src: str) -> None:
-    """Reject document classes that won't compile under Tectonic/XeTeX.
+    r"""Reject document classes that won't compile under Tectonic/XeTeX.
 
     A common failure case is `\documentclass[...uplatex...]{jsarticle}`, which is a
     pLaTeX/upLaTeX workflow incompatible with Tectonic. Suggest bxjsarticle instead.
@@ -105,11 +105,11 @@ def _looks_like_raw_body(src: str) -> bool:
 def _wrap_expression(src: str) -> str:
     s = src.strip()
     if not s:
-        return "\\[\\;\\]"
+        return r"\[\;\]"
     if _looks_like_raw_body(s):
         return s
     # Single-line, no obvious LaTeX structure => interpret as a math expression.
-    return "\\[\\displaystyle " + s + "\\]"
+    return r"\[\displaystyle " + s + r"\]"
 
 
 def _reject_dangerous_tex(src: str) -> None:
@@ -149,54 +149,59 @@ def _reject_dangerous_tex(src: str) -> None:
 
 
 def _default_template_xetex(body: str) -> str:
-    return textwrap.dedent(
-        rf"""
-        \\documentclass[preview,border=2pt]{{standalone}}
+    return (
+        textwrap.dedent(
+            r"""
+            \documentclass[preview,border=2pt]{standalone}
 
-        % --- Math ---
-        \\usepackage{{amsmath,amssymb,mathtools}}
-        \\usepackage{{physics}}
-        \\usepackage{{siunitx}}
-        \\usepackage{{mhchem}}
-        \\usepackage{{bm}}
+            % --- Math ---
+            \usepackage{amsmath,amssymb,mathtools}
+            \usepackage{physics}
+            \usepackage{siunitx}
+            \usepackage{mhchem}
+            \usepackage{bm}
 
-        % --- Graphics / circuits ---
-        \\usepackage{{graphicx}}
-        \\usepackage{{tikz}}
-        \\usetikzlibrary{{arrows.meta,calc,positioning,decorations.pathmorphing}}
-        \\usepackage{{circuitikz}}
+            % --- Graphics / circuits ---
+            \usepackage{graphicx}
+            \usepackage{tikz}
+            \usetikzlibrary{arrows.meta,calc,positioning,decorations.pathmorphing}
+            \usepackage{circuitikz}
 
-        % --- Colors & background ---
-        \\usepackage{{xcolor}}
-        \\nopagecolor
+            % --- Colors & background ---
+            \usepackage{xcolor}
+            \nopagecolor
 
-        % --- Unicode / Japanese ---
-        \\usepackage{{fontspec}}
-        \\usepackage{{xeCJK}}
-        \\defaultfontfeatures{{Ligatures=TeX}}
+            % --- Unicode / Japanese ---
+            \usepackage{fontspec}
+            \usepackage{xeCJK}
+            \defaultfontfeatures{Ligatures=TeX}
 
-        % Latin font
-        \\IfFontExistsTF{{TeX Gyre Termes}}{{\\setmainfont{{TeX Gyre Termes}}}}{{}}
+            % Latin font
+            \IfFontExistsTF{TeX Gyre Termes}{\setmainfont{TeX Gyre Termes}}{}
 
-        % CJK font fallbacks (use what's installed)
-        \\IfFontExistsTF{{Noto Sans CJK JP}}{{\\setCJKmainfont{{Noto Sans CJK JP}}}}{{%
-          \\IfFontExistsTF{{Noto Serif CJK JP}}{{\\setCJKmainfont{{Noto Serif CJK JP}}}}{{%
-            \\IfFontExistsTF{{IPAexGothic}}{{\\setCJKmainfont{{IPAexGothic}}}}{{%
-              \\IfFontExistsTF{{IPAMincho}}{{\\setCJKmainfont{{IPAMincho}}}}{{%
-                \\setCJKmainfont{{FandolSong-Regular}}% final forced fallback
-              }}
-            }}
-          }}
-        }}
+            % CJK font fallbacks (use what's installed)
+            \IfFontExistsTF{Noto Sans CJK JP}{\setCJKmainfont{Noto Sans CJK JP}}{%
+              \IfFontExistsTF{Noto Serif CJK JP}{\setCJKmainfont{Noto Serif CJK JP}}{%
+                \IfFontExistsTF{IPAexGothic}{\setCJKmainfont{IPAexGothic}}{%
+                  \IfFontExistsTF{IPAMincho}{\setCJKmainfont{IPAMincho}}{%
+                    \setCJKmainfont{FandolSong-Regular}% final forced fallback
+                  }
+                }
+              }
+            }
 
-        % Make output crisp
-        \\linespread{{1.0}}
+            % Make output crisp
+            \linespread{1.0}
 
-        \\begin{{document}}
-        {body}
-        \\end{{document}}
-        """
-    ).strip() + "\n"
+            \begin{document}
+            {body}
+            \end{document}
+            """
+        )
+        .strip()
+        .replace("{body}", body)
+        + "\n"
+    )
 
 
 def _pick_engine() -> tuple[str, str]:
@@ -367,6 +372,9 @@ def render_latex_to_png_pdf(
             tex_source = src.strip() + "\n"
         else:
             s = src.strip()
+            # Accept user shorthand: [ ... ]  -> \[ ... \]
+            if s.startswith("[") and s.endswith("]") and not s.startswith(r"\["):
+                s = r"\[" + s[1:-1].strip() + r"\]"
             explicit_env = _looks_like_raw_body(s)
             autowrap = _bool_env("LATEXBOT_AUTOWRAP", DEFAULT_AUTOWRAP)
             if "\n" in s and not explicit_env:
@@ -383,9 +391,8 @@ def render_latex_to_png_pdf(
 
             if not explicit_env and not autowrap:
                 raise LatexRenderError(
-                    "No explicit math delimiters found. Wrap your expression with $...$ or \\[...\\], "
-                    "or provide a full LaTeX document (\\documentclass ...). "
-                    "Set LATEXBOT_AUTOWRAP=1 if you want single-line expressions auto-wrapped."
+                    "No explicit math delimiters found and LATEXBOT_AUTOWRAP=0. Wrap your expression with $...$ or \\[...\\], "
+                    "or provide a full LaTeX document (\\documentclass ...), or re-enable auto-wrap with LATEXBOT_AUTOWRAP=1."
                 )
 
             body = _wrap_expression(s) if (not explicit_env and autowrap) else s
@@ -481,7 +488,7 @@ class Tex(commands.Cog):
         help=(
             "Render LaTeX to a crisp transparent PNG (+ PDF).\n"
             "- If you paste a full document (contains \\documentclass), it compiles as-is.\n"
-            "- Otherwise include math delimiters ($...$, \\[...\\]) — optional auto-wrap is controlled by LATEXBOT_AUTOWRAP.\n"
+            "- Otherwise include math delimiters ($...$, \\[...\\]); single-line input auto-wraps by default (disable with LATEXBOT_AUTOWRAP=0).\n"
             "Tip: TikZ/CircuiTikZ and Japanese text are supported when Tectonic is installed."
         ),
         usage="<latex>",
@@ -489,7 +496,7 @@ class Tex(commands.Cog):
             "category": "Tools",
             "pro": "Requires `tectonic` (untrusted mode) and Ghostscript on the server for PNG output.",
             "destination": "Render LaTeX into a PNG image and attach the PDF for download.",
-            "plus": "Full documents compile as-is; single-line auto-wrap is opt-in via LATEXBOT_AUTOWRAP=1.",
+            "plus": "Full documents compile as-is; single-line auto-wrap is on by default (set LATEXBOT_AUTOWRAP=0 to require delimiters).",
         },
     )
     async def tex(self, ctx: commands.Context, *, arg: str):
@@ -501,8 +508,7 @@ class Tex(commands.Cog):
             empty_embed = discord.Embed(
                 title="🧪 No LaTeX Provided",
                 description=(
-                    "Add something to render, e.g., `/tex \\[\\frac{a}{b}\\]` "
-                    "(or enable LATEXBOT_AUTOWRAP=1)."
+                    "Add something to render, e.g., `/tex \\[\\frac{a}{b}\\]`. Single-line math auto-wraps by default."
                 ),
                 color=0xE74C3C,
             )
