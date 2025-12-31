@@ -6,10 +6,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils import BOT_PREFIX, defer_interaction, safe_reply
+from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, safe_reply
 
 DATA_PATH = Path("guild_timezones.json")  # { "<guild_id>": int_offset }
 MIN_OFS, MAX_OFS = -12, 14  # UTC-12 .. UTC+14
+TZ_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
 # Major cities (1-hour increments only)
 CITIES_BY_OFS: dict[int, list[str]] = {
@@ -103,7 +104,7 @@ def make_embed(guild: discord.Guild, ofs: int) -> discord.Embed:
 
 
 class TzView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, guild: discord.Guild, start_ofs: int, *, author_id: int, timeout: float | None = None):
+    def __init__(self, bot: commands.Bot, guild: discord.Guild, start_ofs: int, *, author_id: int, timeout: float | None = TZ_VIEW_TIMEOUT_S):
         super().__init__(timeout=timeout)
         self.bot = bot
         self.guild = guild

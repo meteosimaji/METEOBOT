@@ -15,7 +15,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils import BOT_PREFIX, defer_interaction, safe_reply, strip_markdown
+from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, safe_reply, strip_markdown
+
+CONFIRM_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
 # Accepts:
 # - https://discord.com/channels/<guild>/<channel>/<message>
@@ -54,7 +56,7 @@ class PurgeQuery:
 
 class ConfirmView(discord.ui.View):
     def __init__(self, author_id: int) -> None:
-        super().__init__(timeout=30)
+        super().__init__(timeout=CONFIRM_VIEW_TIMEOUT_S)
         self.author_id = author_id
         self.result: bool | None = None
 
