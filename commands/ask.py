@@ -25,10 +25,12 @@ from discord.ext import commands
 from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
 from PIL.Image import Image as PILImageType
 
-from utils import BOT_PREFIX, build_suggestions, defer_interaction
+from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, build_suggestions, defer_interaction
 from cogs.settime import fmt_ofs, get_guild_offset
 
 log = logging.getLogger(__name__)
+
+RESET_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
 _openai_module = importlib.import_module("openai")
 OpenAI = getattr(_openai_module, "OpenAI")
@@ -1461,7 +1463,7 @@ class _AskStatusUI:
 
 class _ResetConfirmView(discord.ui.View):
     def __init__(self, author_id: int) -> None:
-        super().__init__(timeout=30)
+        super().__init__(timeout=RESET_VIEW_TIMEOUT_S)
         self.author_id = author_id
         self.result: bool | None = None
 

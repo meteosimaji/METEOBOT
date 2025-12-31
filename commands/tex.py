@@ -14,7 +14,7 @@ import discord
 from discord.ext import commands
 from PIL import Image
 
-from utils import defer_interaction
+from utils import LONG_VIEW_TIMEOUT_S, defer_interaction
 
 
 DEFAULT_DPI = 300
@@ -31,14 +31,17 @@ MIN_MAX_BYTES = 100_000
 MAX_MAX_BYTES = 8_000_000
 DEFAULT_MAX_PAGES = 3
 MIN_MAX_PAGES = 1
-MAX_MAX_PAGES = 8
+MAX_MAX_PAGES = 4
+DISCORD_ATTACHMENT_LIMIT = 10
+TOGGLE_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
 MAX_LATEX_CHARS = 20_000
 
 
 @dataclass(frozen=True)
 class RenderResult:
-    png_bytes: list[bytes]
+    png_white_bytes: list[bytes]
+    png_transparent_bytes: list[bytes]
     pdf_bytes: Optional[bytes]
     used_engine: str
     pdf_omitted_for_size: bool = False
@@ -318,6 +321,8 @@ def _pdf_to_png_via_gs(
     dpi: int,
     timeout_s: int,
     max_pages: int,
+    *,
+    device: str = "pngalpha",
 ) -> list[Path]:
     gs = _which("gs", "gswin64c", "gswin32c")
     if not gs:
@@ -332,7 +337,7 @@ def _pdf_to_png_via_gs(
         "-dSAFER",
         "-dFirstPage=1",
         f"-dLastPage={max_pages}",
-        "-sDEVICE=pngalpha",
+        f"-sDEVICE={device}",
         f"-r{dpi}",
         "-dTextAlphaBits=4",
         "-dGraphicsAlphaBits=4",
@@ -353,6 +358,51 @@ def _pdf_to_png_via_gs(
     return outputs
 
 
+def _encode_png_with_limit(img: Image.Image, max_bytes: int) -> tuple[bytes, Image.Image]:
+    """Encode an image to PNG, downscaling if necessary to fit the size limit."""
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    while buf.tell() > max_bytes and img.width > 16 and img.height > 16:
+        scale = (max_bytes / buf.tell()) ** 0.5
+        new_w = max(16, int(img.width * scale))
+        new_h = max(16, int(img.height * scale))
+        img = img.resize((new_w, new_h), resample=Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), img
+
+
+def _encode_dual_png_with_limit(rgba_img: Image.Image, max_bytes: int) -> tuple[bytes, bytes]:
+    """Encode transparent and white PNGs with matched dimensions.
+
+    If the white variant requires extra downscaling to fit `max_bytes`, retry both
+    encodes using the same reduced size so the toggle view swaps images seamlessly.
+    """
+
+    candidate = rgba_img
+    while True:
+        transparent_bytes, scaled_rgba = _encode_png_with_limit(candidate, max_bytes)
+
+        white_img = _flatten_to_white(scaled_rgba)
+        white_bytes, scaled_white = _encode_png_with_limit(white_img, max_bytes)
+
+        if scaled_white.size != scaled_rgba.size:
+            # Keep both variants at the same resolution; retry from the smaller size.
+            candidate = scaled_white.convert("RGBA")
+            continue
+
+        return transparent_bytes, white_bytes
+
+
+def _flatten_to_white(img: Image.Image) -> Image.Image:
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    background = Image.new("RGB", img.size, "white")
+    background.paste(img, mask=img.getchannel("A"))
+    return background
+
+
 def render_latex_to_png_pdf(
     src: str,
     dpi: int,
@@ -361,7 +411,7 @@ def render_latex_to_png_pdf(
     max_bytes: int,
     max_pages: int,
 ) -> RenderResult:
-    """Render LaTeX -> (transparent PNG, PDF)."""
+    """Render LaTeX -> (transparent + white PNGs, PDF)."""
     _reject_dangerous_tex(src)
 
     with tempfile.TemporaryDirectory(prefix="latexbot_") as td:
@@ -407,19 +457,19 @@ def render_latex_to_png_pdf(
             dpi=dpi,
             timeout_s=raster_timeout_s,
             max_pages=max_pages,
+            device="pngalpha",
         )
 
-        png_bytes: list[bytes] = []
+        png_white_bytes: list[bytes] = []
+        png_transparent_bytes: list[bytes] = []
         for page_path in page_pngs:
-            current = page_path
-            if current.stat().st_size > max_bytes:
-                img = Image.open(current)
-                scale = (max_bytes / current.stat().st_size) ** 0.5
-                new_w = max(16, int(img.width * scale))
-                new_h = max(16, int(img.height * scale))
-                img = img.resize((new_w, new_h), resample=Image.LANCZOS)
-                img.save(current, format="PNG", optimize=True)
-            png_bytes.append(current.read_bytes())
+            with Image.open(page_path) as im:
+                rgba_img = im.convert("RGBA")
+
+            transparent_bytes, white_bytes = _encode_dual_png_with_limit(rgba_img, max_bytes)
+
+            png_transparent_bytes.append(transparent_bytes)
+            png_white_bytes.append(white_bytes)
 
         pdf_bytes: Optional[bytes] = None
         pdf_omitted_for_size = False
@@ -431,7 +481,8 @@ def render_latex_to_png_pdf(
                 pdf_omitted_for_size = True
 
         return RenderResult(
-            png_bytes=png_bytes,
+            png_white_bytes=png_white_bytes,
+            png_transparent_bytes=png_transparent_bytes,
             pdf_bytes=pdf_bytes,
             used_engine=engine,
             pdf_omitted_for_size=pdf_omitted_for_size,
@@ -462,6 +513,7 @@ async def _send_response(
     content: Optional[str] = None,
     embed: Optional[discord.Embed] = None,
     files: Optional[list[discord.File]] = None,
+    view: Optional[discord.ui.View] = None,
     mention_author: bool = False,
 ) -> discord.Message:
     if ctx.interaction:
@@ -469,13 +521,107 @@ async def _send_response(
             content=content,
             embed=embed,
             files=files,
+            view=view,
         )
     return await ctx.reply(
         content=content,
         embed=embed,
         files=files,
+        view=view,
         mention_author=mention_author,
     )
+
+
+class _RenderToggleView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        white_files: list[str],
+        transparent_files: list[str],
+        pdf_omitted_for_size: bool,
+        max_bytes: int,
+        author_id: int,
+    ):
+        super().__init__(timeout=TOGGLE_VIEW_TIMEOUT_S)
+        self.variant: str = "white"
+        self.white_files = white_files
+        self.transparent_files = transparent_files
+        self.pdf_omitted_for_size = pdf_omitted_for_size
+        self.max_bytes = max_bytes
+        self.author_id = author_id
+        self.message: Optional[discord.Message] = None
+        self._sync_button_styles()
+
+    def _active_files(self) -> list[str]:
+        return self.white_files if self.variant == "white" else self.transparent_files
+
+    def _sync_button_styles(self) -> None:
+        if hasattr(self, "btn_white") and hasattr(self, "btn_transparent"):
+            self.btn_white.style = (
+                discord.ButtonStyle.success if self.variant == "white" else discord.ButtonStyle.secondary
+            )
+            self.btn_transparent.style = (
+                discord.ButtonStyle.success if self.variant == "transparent" else discord.ButtonStyle.secondary
+            )
+
+    def build_embed(self) -> discord.Embed:
+        files = self._active_files()
+        embed = discord.Embed(
+            title="TeX Render",
+            description="Tap the buttons below to swap between transparent and white PNGs.",
+            color=0xE67E22,
+        )
+        if len(files) > 1:
+            embed.add_field(
+                name="Pages",
+                value=f"Rendered {len(files)} page PNG set (see attachments).",
+                inline=False,
+            )
+        embed.add_field(
+            name="Background",
+            value="⬜ White canvas" if self.variant == "white" else "🪟 Transparent canvas",
+            inline=False,
+        )
+        if self.pdf_omitted_for_size:
+            embed.add_field(
+                name="PDF",
+                value=f"PDF attachment omitted (over ~{self.max_bytes:,} bytes).",
+                inline=False,
+            )
+        embed.set_image(url=f"attachment://{files[0]}")
+        return embed
+
+    async def _swap(self, interaction: discord.Interaction, variant: str) -> None:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the requester can switch backgrounds.",
+                ephemeral=True,
+            )
+            return
+        if self.variant == variant:
+            await interaction.response.defer(thinking=False)
+            return
+        self.variant = variant
+        self._sync_button_styles()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="⬜ White PNG", style=discord.ButtonStyle.success)
+    async def btn_white(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._swap(interaction, "white")
+
+    @discord.ui.button(label="🪟 Transparent PNG", style=discord.ButtonStyle.secondary)
+    async def btn_transparent(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._swap(interaction, "transparent")
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
 
 
 class Tex(commands.Cog):
@@ -484,9 +630,9 @@ class Tex(commands.Cog):
 
     @commands.hybrid_command(
         name="tex",
-        description="Render LaTeX to a transparent PNG (and a PDF).",
+        description="Render LaTeX to PNG (transparent + white) and PDF.",
         help=(
-            "Render LaTeX to a crisp transparent PNG (+ PDF).\n"
+            "Render LaTeX to crisp PNGs with both transparent and white backgrounds (+ PDF).\n"
             "- If you paste a full document (contains \\documentclass), it compiles as-is.\n"
             "- Otherwise include math delimiters ($...$, \\[...\\]); single-line input auto-wraps by default (disable with LATEXBOT_AUTOWRAP=0).\n"
             "Tip: TikZ/CircuiTikZ and Japanese text are supported when Tectonic is installed."
@@ -495,8 +641,8 @@ class Tex(commands.Cog):
         extras={
             "category": "Tools",
             "pro": "Requires `tectonic` (untrusted mode) and Ghostscript on the server for PNG output.",
-            "destination": "Render LaTeX into a PNG image and attach the PDF for download.",
-            "plus": "Full documents compile as-is; single-line auto-wrap is on by default (set LATEXBOT_AUTOWRAP=0 to require delimiters).",
+            "destination": "Render LaTeX into PNG images with both white and transparent backgrounds plus the PDF for download.",
+            "plus": "Switch backgrounds with the buttons; full documents compile as-is and auto-wrap is on by default (set LATEXBOT_AUTOWRAP=0 to require delimiters).",
         },
     )
     async def tex(self, ctx: commands.Context, *, arg: str):
@@ -605,55 +751,78 @@ class Tex(commands.Cog):
             )
             return
 
+        if len(result.png_white_bytes) != len(result.png_transparent_bytes):
+            error_msg = "Internal error: rendered PNG variant counts differ."
+            await _send_response(
+                ctx,
+                content=error_msg,
+                embed=discord.Embed(title="⚠️ TeX Render Failed", description=error_msg, color=0xE74C3C),
+            )
+            return
+
+        attachment_budget = len(result.png_white_bytes) * 2 + (1 if result.pdf_bytes else 0)
+        if attachment_budget > DISCORD_ATTACHMENT_LIMIT:
+            over_embed = discord.Embed(
+                title="📎 Attachment Limit Hit",
+                description=(
+                    f"This render would need {attachment_budget} files, which exceeds Discord's limit of {DISCORD_ATTACHMENT_LIMIT}.\n"
+                    "Try reducing the page count or disabling one background to stay within the cap."
+                ),
+                color=0xE67E22,
+            )
+            await _send_response(
+                ctx,
+                content=over_embed.description,
+                embed=over_embed,
+                mention_author=False,
+            )
+            return
+
         files: list[discord.File] = []
         try:
-            png_files: list[str] = []
-            for idx, data in enumerate(result.png_bytes, start=1):
-                filename = "render.png" if len(result.png_bytes) == 1 else f"render-{idx}.png"
-                png_io = io.BytesIO(data)
-                png_io.seek(0)
-                files.append(discord.File(fp=png_io, filename=filename))
-                png_files.append(filename)
+            png_white_files: list[str] = []
+            png_transparent_files: list[str] = []
+            for idx, (white_data, transparent_data) in enumerate(
+                zip(result.png_white_bytes, result.png_transparent_bytes), start=1
+            ):
+                white_name = "render-white.png" if len(result.png_white_bytes) == 1 else f"render-white-{idx}.png"
+                transparent_name = (
+                    "render-transparent.png"
+                    if len(result.png_transparent_bytes) == 1
+                    else f"render-transparent-{idx}.png"
+                )
+
+                white_io = io.BytesIO(white_data)
+                white_io.seek(0)
+                files.append(discord.File(fp=white_io, filename=white_name))
+                png_white_files.append(white_name)
+
+                transparent_io = io.BytesIO(transparent_data)
+                transparent_io.seek(0)
+                files.append(discord.File(fp=transparent_io, filename=transparent_name))
+                png_transparent_files.append(transparent_name)
 
             if result.pdf_bytes:
                 pdf_io = io.BytesIO(result.pdf_bytes)
                 pdf_io.seek(0)
                 files.append(discord.File(fp=pdf_io, filename="render.pdf"))
 
-            embed = discord.Embed(
-                title="TeX Render",
-                description=f"engine: `{result.used_engine}` • dpi: `{dpi}`",
-                color=0xE67E22,
+            view = _RenderToggleView(
+                white_files=png_white_files,
+                transparent_files=png_transparent_files,
+                pdf_omitted_for_size=result.pdf_omitted_for_size,
+                max_bytes=max_bytes,
+                author_id=ctx.author.id,
             )
-            embed.add_field(
-                name="Limits",
-                value=(
-                    f"Input capped at {MAX_LATEX_CHARS:,} characters. "
-                    f"PNG auto-downscaled under ~{max_bytes:,} bytes each. "
-                    f"Compile timeout: {compile_timeout_s}s; raster timeout: {raster_timeout_s}s. "
-                    f"Pages rendered (PNG): up to {max_pages}."
-                ),
-                inline=False,
-            )
-            if len(png_files) > 1:
-                embed.add_field(
-                    name="Pages",
-                    value=f"Rendered {len(png_files)} page PNG set (see attachments).",
-                    inline=False,
-                )
-            if result.pdf_omitted_for_size:
-                embed.add_field(
-                    name="PDF",
-                    value=f"PDF attachment omitted (over ~{max_bytes:,} bytes).",
-                    inline=False,
-                )
-            embed.set_image(url=f"attachment://{png_files[0]}")
-            await _send_response(
+
+            message = await _send_response(
                 ctx,
-                embed=embed,
+                embed=view.build_embed(),
                 files=files,
+                view=view,
                 mention_author=False,
             )
+            view.message = message
         finally:
             # discord.File keeps open handles on Windows; ensure close.
             for f in files:

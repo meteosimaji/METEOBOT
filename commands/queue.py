@@ -8,9 +8,11 @@ import discord
 from discord.ext import commands
 
 from music import get_player, progress_bar
-from utils import format_timestamp, defer_interaction, BOT_PREFIX
+from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, format_timestamp
 
 log = logging.getLogger(__name__)
+
+QUEUE_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
 
 def _short(text: str, limit: int = 96) -> str:
@@ -20,7 +22,7 @@ def _short(text: str, limit: int = 96) -> str:
 
 class ControlView(discord.ui.View):
     def __init__(self, player) -> None:
-        super().__init__(timeout=600)  # auto-stop after 10 minutes
+        super().__init__(timeout=QUEUE_VIEW_TIMEOUT_S)  # keep controls available for 7 days
         self.player = player
         self.message: Optional[discord.Message] = None
         self.task: Optional[asyncio.Task] = None
@@ -266,7 +268,7 @@ class PitchModal(discord.ui.Modal):
 
 class RemoveView(discord.ui.View):
     def __init__(self, player, control: ControlView) -> None:
-        super().__init__(timeout=60)
+        super().__init__(timeout=QUEUE_VIEW_TIMEOUT_S)
         self.player = player
         self.control = control
         options = [

@@ -25,7 +25,7 @@
 - `serverinfo` — Display a polished snapshot of the current server.
 - `settime` — Configure a server's timezone with interactive buttons.
 - `skip` — Skip the current track.
-- `tex` — Render LaTeX to a crisp PNG (transparent for expression mode) and attach a PDF too. Works great when invoked via `/ask` tool-calling.
+- `tex` — Render LaTeX to crisp PNGs with both white and transparent backgrounds plus a PDF; swap backgrounds via the buttons. Supports up to four pages (keeps Discord attachments under the cap) and works great when invoked via `/ask` tool-calling.
 - `tune` — Set speed and pitch (`/tune 1.2 0.9`).
 - `uptime` — Show how long the bot has been running.
 - `userinfo` — Show a member's profile with timestamps, roles, and bot status.
@@ -40,7 +40,7 @@ Prefix commands work with either the configured `BOT_PREFIX` or by mentioning th
 
 ### TeX prerequisites
 - Install **Tectonic** (required; uses untrusted mode for safety).
-- Install **Ghostscript** (`gs`) for PDF → PNG/alpha rasterization (multi-page PNGs are supported up to the configured page cap).
+- Install **Ghostscript** (`gs`) for PDF → PNG rasterization (multi-page PNGs are supported up to the configured page cap, capped at four pages to stay within Discord's attachment limits).
 - For Japanese documents that use `jsarticle`/`uplatex`, switch to `bxjsarticle` (XeTeX-compatible) before rendering.
 - Wrap equations with math delimiters (`$...$`, `\[...\]`) or provide a full LaTeX document. Single-line auto-wrap can be enabled via `LATEXBOT_AUTOWRAP=1` if desired.
 

@@ -1,10 +1,12 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from utils import BOT_PREFIX, SuggestionView, build_suggestions, defer_interaction
+from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, SuggestionView, build_suggestions, defer_interaction
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Iterable, List, Tuple
+
+HELP_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
 CATEGORIES = [
     ("All", "\U0001F50E"),
@@ -129,7 +131,7 @@ def make_command_help_embed(bot: commands.Bot, name: str) -> discord.Embed | Non
 
 class HelpView(discord.ui.View):
     def __init__(self, bot: commands.Bot, category: str = "All") -> None:
-        super().__init__(timeout=None)
+        super().__init__(timeout=HELP_VIEW_TIMEOUT_S)
         self.bot = bot
         self.category = category
         self.pages = make_help_pages(bot, category)

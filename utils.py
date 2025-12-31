@@ -7,6 +7,8 @@ from difflib import SequenceMatcher
 from typing import Iterable, List, Sequence, Tuple
 
 BOT_PREFIX = os.getenv("BOT_PREFIX", "c!")
+LONG_VIEW_TIMEOUT_S = 60 * 60 * 24 * 7  # 7 days
+SUGGESTION_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
 
 def humanize_delta(seconds: float) -> str:
@@ -164,7 +166,7 @@ def build_suggestions(
 class SuggestionView(discord.ui.View):
     """Provides a button to reveal additional suggestions."""
 
-    def __init__(self, extras: List[str], *, timeout: float | None = 60) -> None:
+    def __init__(self, extras: List[str], *, timeout: float | None = SUGGESTION_VIEW_TIMEOUT_S) -> None:
         super().__init__(timeout=timeout)
         self.extras = extras
 
