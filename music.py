@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import AsyncIterator
@@ -87,6 +88,8 @@ class Track:
     title: str
     duration: float   # seconds (0 if unknown)
     page_url: str     # webpage URL for display
+    add_id: int | None = None
+    related: list[dict[str, str]] | None = None
     http_headers: dict[str, str] | None = None
 
 
@@ -111,6 +114,8 @@ class MusicPlayer:
         self.added_tracks: deque[Track] = deque()
         self.voice: discord.VoiceClient | None = None
         self.current: Track | None = None
+        self.last_removed: Track | None = None
+        self.next_add_id: int = 1
 
         # Loop modes: none | track | queue
         self.loop: str = "none"
@@ -312,6 +317,9 @@ class MusicPlayer:
     async def add(self, track: Track, *, from_playlist: bool = False) -> None:
         if from_playlist:
             async with self._add_lock:
+                if track.add_id is None:
+                    track.add_id = self.next_add_id
+                    self.next_add_id += 1
                 log.info("Queued track (playlist): %s (%s)", track.title, track.page_url)
                 self.queue.append(track)
                 self._tail_idx = len(self.queue) - 1
@@ -321,6 +329,9 @@ class MusicPlayer:
             return
 
         async with self._add_lock:
+            if track.add_id is None:
+                track.add_id = self.next_add_id
+                self.next_add_id += 1
             if self._playlist_loading:
                 self._wait_buf.append(track)
                 self.added_tracks.append(track)
@@ -617,9 +628,51 @@ class MusicPlayer:
                     return None
                 self._discard_by_identity(self.added_tracks, target)
 
+        self.last_removed = target
+
         if cancel_current:
             # Cancel the current track without treating it as "skipped":
             # no history push, no loop queue re-add.
+            try:
+                self.sync_voice_client()
+                if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+                    self.offset = 0.0
+                    self.started_at = 0.0
+                    self.ignore_after = True
+                    self.voice.stop()
+            except Exception:
+                pass
+            await self.play_next()
+            return target
+
+        return target
+
+    async def remove_by_add_id(self, add_id: int) -> Track | None:
+        """Remove a pending track by its stable add_id."""
+        if add_id <= 0:
+            return None
+        cancel_current = False
+        async with self._add_lock:
+            target = None
+            for track in self.added_tracks:
+                if track.add_id == add_id:
+                    target = track
+                    break
+            if target is None:
+                return None
+            if target is self.current:
+                cancel_current = True
+                self._discard_by_identity(self.added_tracks, target)
+                self.current = None
+            else:
+                removed = self._remove_from_queue(target) or self._remove_from_wait_buf(target)
+                if not removed:
+                    return None
+                self._discard_by_identity(self.added_tracks, target)
+
+        self.last_removed = target
+
+        if cancel_current:
             try:
                 self.sync_voice_client()
                 if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
@@ -760,6 +813,28 @@ async def yt_search(query: str) -> Track:
     """Fetch track information using yt-dlp in a thread."""
 
     def extract() -> Track:
+        def _normalize_related_url(raw: str | None) -> str | None:
+            if not raw:
+                return None
+            raw = str(raw).strip()
+            if not raw:
+                return None
+            if raw.startswith(("http://", "https://")):
+                return raw
+            if raw.startswith("//"):
+                return f"https:{raw}"
+            if raw.startswith("www.youtube.com/") or raw.startswith("youtube.com/"):
+                return f"https://{raw}"
+            if raw.startswith("youtu.be/"):
+                return f"https://{raw}"
+            if raw.startswith("/watch?v="):
+                return f"https://www.youtube.com{raw}"
+            if raw.startswith("watch?v="):
+                return f"https://www.youtube.com/{raw}"
+            if re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
+                return f"https://www.youtube.com/watch?v={raw}"
+            return None
+
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
             info = ydl.extract_info(query, download=False)
             if "entries" in info:
@@ -768,11 +843,24 @@ async def yt_search(query: str) -> Track:
                     raise yt_dlp.utils.DownloadError("No results")
                 info = entries[0]
             headers = info.get("http_headers") or None
+            related: list[dict[str, str]] = []
+            for entry in (info.get("related_videos") or []):
+                if not isinstance(entry, dict):
+                    continue
+                title = str(entry.get("title") or "").strip()
+                raw_url = entry.get("webpage_url") or entry.get("url") or entry.get("id")
+                url = _normalize_related_url(raw_url)
+                if not title or not url:
+                    continue
+                related.append({"title": title, "url": url})
+                if len(related) >= 5:
+                    break
             return Track(
                 url=info["url"],
                 title=info.get("title", "Unknown"),
                 duration=info.get("duration", 0) or 0,
                 page_url=info.get("webpage_url", query),
+                related=related or None,
                 http_headers=headers,
             )
 
