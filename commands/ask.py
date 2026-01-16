@@ -923,7 +923,7 @@ def _env_choice(name: str, default: str, choices: set[str]) -> str:
 def _ask_reasoning_cfg() -> dict[str, Any]:
     effort = _env_choice(
         "ASK_REASONING_EFFORT",
-        "high",
+        "low",
         {"none", "low", "medium", "high", "xhigh"},
     )
     return {"effort": effort}
@@ -1249,7 +1249,7 @@ class _AskStatusUI:
         *,
         title: str = "⚙️ Status",
         ephemeral: bool = False,
-        max_lines: int = 3,
+        max_lines: int | None = None,
         edit_interval: float = 0.25,
     ) -> None:
         self.ctx = ctx
@@ -1258,12 +1258,13 @@ class _AskStatusUI:
         self.max_lines = max_lines
         self.edit_interval = edit_interval
 
+        self._max_desc = 4096
         self.loading = os.getenv("STATUS_LOADING_EMOJI") or "⏳"
         self.ok = os.getenv("STATUS_OK_EMOJI") or "✅"
         self.fail = os.getenv("STATUS_FAIL_EMOJI") or "❌"
 
         self._msg = None
-        self._items: deque[dict[str, Any]] = deque(maxlen=max_lines)
+        self._items: list[dict[str, Any]] = []
         self._by_id: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._dirty = False
@@ -1317,20 +1318,28 @@ class _AskStatusUI:
         emoji = self.loading if state == "loading" else self.ok if state == "ok" else self.fail
         return f"{emoji} {label}"
 
-    def _append_item(self, *, call_id: str, label: str, state: str = "loading") -> None:
-        if len(self._items) == self._items.maxlen:
-            old = self._items[0]
+    def _append_item(
+        self,
+        *,
+        call_id: str,
+        label: str,
+        state: str = "loading",
+        kind: str = "status",
+        tool_label: str | None = None,
+    ) -> None:
+        if self.max_lines is not None and len(self._items) >= self.max_lines:
+            old = self._items.pop(0)
             old_id = old.get("call_id")
             if isinstance(old_id, str):
                 self._by_id.pop(old_id, None)
 
-        item = {"call_id": call_id, "label": label, "state": state}
+        item = {"call_id": call_id, "label": label, "state": state, "kind": kind, "tool_label": tool_label}
         self._items.append(item)
         self._by_id[call_id] = item
 
     def _remove_item(self, call_id: str) -> None:
         self._by_id.pop(call_id, None)
-        self._items = deque([it for it in self._items if it.get("call_id") != call_id], maxlen=self.max_lines)
+        self._items = [it for it in self._items if it.get("call_id") != call_id]
 
     def _set_state(self, call_id: str, state: str, label: str | None = None) -> None:
         it = self._by_id.get(call_id)
@@ -1339,16 +1348,118 @@ class _AskStatusUI:
             if label is not None:
                 it["label"] = label
 
+    def _condense_items(self) -> list[dict[str, Any]]:
+        condensed: list[dict[str, Any]] = []
+        idx = 0
+        while idx < len(self._items):
+            item = self._items[idx]
+            kind = item.get("kind", "status")
+            if kind != "tool":
+                label = item["label"]
+                state = item["state"]
+                if condensed and condensed[-1]["label"] == label and condensed[-1]["state"] == state:
+                    condensed[-1]["display_count"] += 1
+                    condensed[-1]["raw_count"] += 1
+                else:
+                    condensed.append(
+                        {"label": label, "state": state, "display_count": 1, "raw_count": 1}
+                    )
+                idx += 1
+                continue
+
+            tool_counts: dict[str, int] = {}
+            tool_labels: list[str] = []
+            block_states: list[str] = []
+            total = 0
+            while idx < len(self._items) and self._items[idx].get("kind") == "tool":
+                tool_label = self._items[idx].get("tool_label") or self._items[idx]["label"]
+                if tool_label not in tool_counts:
+                    tool_labels.append(tool_label)
+                    tool_counts[tool_label] = 0
+                tool_counts[tool_label] += 1
+                block_states.append(self._items[idx]["state"])
+                total += 1
+                idx += 1
+
+            if "fail" in block_states:
+                state = "fail"
+            elif "loading" in block_states:
+                state = "loading"
+            else:
+                state = "ok"
+
+            parts = []
+            for tool_label in tool_labels:
+                count = tool_counts[tool_label]
+                parts.append(f"{tool_label} ×{count}" if count > 1 else tool_label)
+
+            max_parts = 6
+            label_parts = parts[:max_parts]
+            remaining = len(parts) - len(label_parts)
+            if remaining > 0:
+                label_parts.append(f"…+{remaining} more")
+
+            prefix = "tool" if total == 1 else f"tools ×{total}"
+            detail = ", ".join(label_parts)
+            label = f"{prefix}: {detail}" if detail else prefix
+            condensed.append(
+                {"label": label, "state": state, "display_count": 1, "raw_count": total}
+            )
+        return condensed
+
+    def _render_lines(self) -> list[str]:
+        condensed = self._condense_items()
+        if not condensed:
+            return [f"{self.loading} thinking…"]
+
+        lines: list[str] = []
+        used = 0
+        displayed_entries = 0
+
+        for entry in reversed(condensed):
+            label = entry["label"]
+            state = entry["state"]
+            display_count = entry["display_count"]
+            suffix = f" ×{display_count}" if display_count > 1 else ""
+            line = self._line(state, f"{label}{suffix}")
+            line_len = len(line) + (1 if lines else 0)
+            if used + line_len > self._max_desc:
+                break
+            lines.append(line)
+            used += line_len
+            displayed_entries += 1
+
+        total_entries = len(condensed)
+        omitted_items = sum(
+            entry["raw_count"] for entry in condensed[: total_entries - displayed_entries]
+        )
+        if omitted_items:
+            more_line = f"…and {omitted_items} more"
+            more_len = len(more_line) + (1 if lines else 0)
+            while used + more_len > self._max_desc and lines:
+                removed = lines.pop()
+                used -= len(removed) + (1 if lines else 0)
+                displayed_entries -= 1
+                omitted_items = sum(
+                    entry["raw_count"] for entry in condensed[: total_entries - displayed_entries]
+                )
+                more_line = f"…and {omitted_items} more"
+                more_len = len(more_line) + (1 if lines else 0)
+            if used + more_len <= self._max_desc:
+                lines.append(more_line)
+
+        lines.reverse()
+        return lines
+
     def _render(self) -> discord.Embed:
-        lines = [self._line(it["state"], it["label"]) for it in self._items]
-        desc = "\n".join(lines).strip() or f"{self.loading} thinking…"
+        desc = "\n".join(self._render_lines()).strip() or f"{self.loading} thinking…"
         return discord.Embed(title=self.title, description=desc)
 
     async def start(self) -> None:
         if self._msg is not None:
             return
         async with self._lock:
-            self._append_item(call_id=self._thinking_id, label="thinking", state="loading")
+            self._append_item(call_id=self._thinking_id, label="thinking", state="loading", kind="status")
             self._dirty = True
         self._msg = await self._send(embed=self._render())
 
@@ -1396,7 +1507,9 @@ class _AskStatusUI:
                 turn = evt.get("turn")
                 async with self._lock:
                     if self._thinking_id not in self._by_id:
-                        self._append_item(call_id=self._thinking_id, label="thinking", state="loading")
+                        self._append_item(
+                            call_id=self._thinking_id, label="thinking", state="loading", kind="status"
+                        )
                     self._set_state(self._thinking_id, "loading", f"thinking (turn {turn})")
                     self._dirty = True
                 await self._schedule_flush()
@@ -1411,7 +1524,15 @@ class _AskStatusUI:
 
                 async with self._lock:
                     self._set_state(self._thinking_id, "ok")
-                    self._append_item(call_id=call_id, label=label, state="loading")
+                    self._remove_item(self._thinking_id)
+                    self._append_item(
+                        call_id=call_id,
+                        label=label,
+                        state="loading",
+                        kind="tool",
+                        tool_label=label,
+                    )
+                    self._append_item(call_id=self._thinking_id, label="thinking", state="loading", kind="status")
                     self._dirty = True
                 await self._schedule_flush()
                 return
@@ -1422,7 +1543,7 @@ class _AskStatusUI:
                 async with self._lock:
                     self._set_state(call_id, "ok" if ok else "fail")
                     self._remove_item(self._thinking_id)
-                    self._append_item(call_id=self._thinking_id, label="thinking", state="loading")
+                    self._append_item(call_id=self._thinking_id, label="thinking", state="loading", kind="status")
                     self._dirty = True
                 await self._schedule_flush()
                 return
@@ -1430,14 +1551,14 @@ class _AskStatusUI:
             if typ == "final":
                 async with self._lock:
                     self._remove_item(self._thinking_id)
-                    self._append_item(call_id=self._summ_id, label="summarizing", state="loading")
+                    self._append_item(call_id=self._summ_id, label="summarizing", state="loading", kind="status")
                     self._dirty = True
                 await self._schedule_flush()
                 return
 
             if typ == "error":
                 async with self._lock:
-                    self._append_item(call_id="__error__", label="failed", state="fail")
+                    self._append_item(call_id="__error__", label="failed", state="fail", kind="status")
                     self._dirty = True
                 await self._schedule_flush()
                 return
