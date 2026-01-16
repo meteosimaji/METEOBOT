@@ -257,7 +257,7 @@ class Play(commands.Cog):
 
             remove_tip = (
                 f"Undo a mistaken add with /remove or `{BOT_PREFIX}remove`; "
-                "leave steps empty or use 1 to drop the latest track."
+                "use /remove 1 for the latest track."
             )
             if count == 1 and first:
                 embed = discord.Embed(
@@ -267,6 +267,8 @@ class Play(commands.Cog):
                     ),
                     color=0x1DB954,
                 )
+                add_id = f"A{first.add_id}" if first.add_id is not None else "A?"
+                embed.add_field(name="ID", value=add_id)
                 embed.set_footer(text=remove_tip)
                 await ctx.reply(embed=embed, mention_author=False)
             else:
@@ -306,13 +308,30 @@ class Play(commands.Cog):
             result = await resolve_track(source)
         except yt_dlp.utils.DownloadError:
             log.exception("yt-dlp extraction failed")
-            return await safe_reply(ctx, "No results found.", ephemeral=True, mention_author=False)
+            return await safe_reply(
+                ctx,
+                "No results found. Try adding 'MV' or the official artist name, "
+                "or paste the exact video URL if you have it.",
+                ephemeral=True,
+                mention_author=False,
+            )
         except (URLError, socket.gaierror, ConnectionError, TimeoutError):
             log.exception("Network error during yt-dlp extraction")
-            return await safe_reply(ctx, "The source service is unreachable; try again later.", ephemeral=True, mention_author=False)
+            return await safe_reply(
+                ctx,
+                "The source service is unreachable; try again later. If you have the exact URL, "
+                "you can paste it to avoid search misses.",
+                ephemeral=True,
+                mention_author=False,
+            )
         except Exception:
             log.exception("yt-dlp extraction failed")
-            return await safe_reply(ctx, "Failed to fetch that track.", ephemeral=True, mention_author=False)
+            return await safe_reply(
+                ctx,
+                "Failed to fetch that track. If this is a specific video, try the direct URL.",
+                ephemeral=True,
+                mention_author=False,
+            )
 
         log.info("%s requested %s", ctx.author, source)
 
@@ -334,10 +353,20 @@ class Play(commands.Cog):
                         )
                         if track.duration:
                             embed.add_field(name="Duration", value=humanize_delta(track.duration))
+                        add_id = f"A{track.add_id}" if track.add_id is not None else "A?"
+                        embed.add_field(name="ID", value=add_id)
+                        if track.related:
+                            related_lines = [
+                                f"R{i + 1}. [{item['title']}]({item['url']})"
+                                for i, item in enumerate(track.related[:3])
+                            ]
+                            if related_lines:
+                                embed.add_field(name="Related", value="\n".join(related_lines), inline=False)
                         embed.set_footer(
                             text=(
                                 f"To cancel this add, run /remove or `{BOT_PREFIX}remove`; "
-                                "blank steps or 1 deletes the latest track."
+                                "use /remove 1 for the latest track. "
+                                "If it's wrong, use a Related URL with /play to lock the exact video."
                             )
                         )
                         message = await ctx.reply(embed=embed, mention_author=False)
@@ -354,7 +383,7 @@ class Play(commands.Cog):
                 embed.set_footer(
                     text=(
                         f"Undo mistaken additions with /remove or `{BOT_PREFIX}remove`; "
-                        "leave steps empty or use 1 to drop the most recent track."
+                        "use /remove 1 for the most recent track."
                     )
                 )
                 await message.edit(embed=embed)
@@ -370,10 +399,19 @@ class Play(commands.Cog):
         )
         if track.duration:
             embed.add_field(name="Duration", value=humanize_delta(track.duration))
+        add_id = f"A{track.add_id}" if track.add_id is not None else "A?"
+        embed.add_field(name="ID", value=add_id)
+        if track.related:
+            related_lines = [
+                f"R{i + 1}. [{item['title']}]({item['url']})" for i, item in enumerate(track.related[:3])
+            ]
+            if related_lines:
+                embed.add_field(name="Related", value="\n".join(related_lines), inline=False)
         embed.set_footer(
             text=(
                 f"Need to cancel? Run /remove or `{BOT_PREFIX}remove`; "
-                "blank steps or 1 removes this track."
+                "use /remove 1 for the latest track. "
+                "If it's wrong, use a Related URL with /play to lock the exact video."
             )
         )
         await ctx.reply(embed=embed, mention_author=False)
