@@ -384,10 +384,9 @@ class MusicPlayer:
 
             if not track:
                 log.info("Queue ended")
-                if self.auto_leave and not self._playlist_loading:
-                    await self.cleanup()
-                else:
-                    self._request_auto_leave_check()
+                if self.current and self.loop != "track":
+                    self.current = None
+                self._request_auto_leave_check()
                 return
 
             # Note: we intentionally keep currently playing tracks in
@@ -835,6 +834,25 @@ async def yt_search(query: str) -> Track:
                 return f"https://www.youtube.com/watch?v={raw}"
             return None
 
+        def _entry_url(entry: dict[str, Any]) -> str | None:
+            raw = entry.get("webpage_url") or entry.get("url") or entry.get("id")
+            normalized = _normalize_related_url(raw)
+            if normalized:
+                return normalized
+            if raw and urlparse(str(raw)).scheme:
+                return str(raw)
+            return None
+
+        def _is_youtube_video_url(url: str | None) -> bool:
+            if not url:
+                return False
+            return (
+                "youtube.com/watch" in url
+                or "youtu.be/" in url
+                or "youtube.com/shorts/" in url
+                or "youtube.com/live/" in url
+            )
+
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
             info = ydl.extract_info(query, download=False)
             if "entries" in info:
@@ -842,6 +860,18 @@ async def yt_search(query: str) -> Track:
                 if not entries:
                     raise yt_dlp.utils.DownloadError("No results")
                 info = entries[0]
+                entry_url = _entry_url(info)
+                if _is_youtube_video_url(entry_url):
+                    for candidate in entries:
+                        candidate_url = _entry_url(candidate)
+                        if _is_youtube_video_url(candidate_url):
+                            info = candidate
+                            entry_url = candidate_url
+                            break
+                if _is_youtube_video_url(entry_url) and not info.get("related_videos"):
+                    refreshed = ydl.extract_info(entry_url, download=False)
+                    if "entries" not in refreshed:
+                        info = refreshed
             headers = info.get("http_headers") or None
             related: list[dict[str, str]] = []
             for entry in (info.get("related_videos") or []):

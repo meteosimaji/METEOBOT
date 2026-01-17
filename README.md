@@ -46,4 +46,4 @@ Prefix commands work with either the configured `BOT_PREFIX` or by mentioning th
 
 ## Events
 - `flag_translate` — Translate a message when a user reacts with a country flag emoji (any channel that supports text chat; includes embeds and images, notifies about cooldowns/permissions, requires permission to read message history).
-- `voice_auto_leave` — Leave voice automatically when only bots remain in the voice channel (Auto Leave must be on).
+- `voice_auto_leave` — Leave voice automatically when only bots remain in the voice channel (Auto Leave must be on) and clear queues when the bot is disconnected.
