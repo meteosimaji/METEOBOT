@@ -20,7 +20,8 @@
 - `play` — Queue music by URL or search phrase (YouTube/Spotify/Niconico). Prefix usage also supports file attachments.
 - `purge` — Bulk delete messages using flexible filters.
 - `queue` — Show interactive queue panel (pause/resume, loop, skip, bye, remove, speed/pitch, toggle Auto Leave).
-- `remove` — Show recent additions when called without a number; pass a number or ID (e.g., `A12`) to remove by addition order (1=latest, 2=previous, etc.).
+- `remove` — Show recent additions when called without a number; pass a number or ID (e.g., `A12`) to remove by addition order (1=latest, 2=previous, etc.) or a comma-separated list like `A12,3,A14`.
+- `searchplay` — Search YouTube with yt-dlp without queuing; list candidates to pick before running `/play` (URLs should go to `/play` directly).
 - `seek` — Seek within the current track (e.g. `1:23`, `+30`, `-10`).
 - `serverinfo` — Display a polished snapshot of the current server.
 - `settime` — Configure a server's timezone with interactive buttons.

@@ -42,6 +42,79 @@ def progress_bar(position: float, duration: float) -> tuple[str, float]:
     return "▰" * filled + "▱" * empty, ratio * 100.0
 
 
+def _normalize_related_url(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    if raw.startswith(("http://", "https://")):
+        return raw
+    if raw.startswith("//"):
+        return f"https:{raw}"
+    if raw.startswith("www.youtube.com/") or raw.startswith("youtube.com/"):
+        return f"https://{raw}"
+    if raw.startswith("youtu.be/"):
+        return f"https://{raw}"
+    if raw.startswith("/watch?v="):
+        return f"https://www.youtube.com{raw}"
+    if raw.startswith("watch?v="):
+        return f"https://www.youtube.com/{raw}"
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
+        return f"https://www.youtube.com/watch?v={raw}"
+    return None
+
+
+def _entry_url(entry: dict[str, Any]) -> str | None:
+    raw = entry.get("webpage_url") or entry.get("url") or entry.get("id")
+    normalized = _normalize_related_url(raw)
+    if normalized:
+        return normalized
+    if raw and urlparse(str(raw)).scheme:
+        return str(raw)
+    return None
+
+
+def _is_youtube_video_url(url: str | None) -> bool:
+    if not url:
+        return False
+    return (
+        "youtube.com/watch" in url
+        or "youtu.be/" in url
+        or "youtube.com/shorts/" in url
+        or "youtube.com/live/" in url
+    )
+
+
+def _build_related_from_entries(
+    entries: list[dict[str, Any]], selected_url: str | None, youtube_only: bool
+) -> list[dict[str, Any]]:
+    related: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        url = _entry_url(entry)
+        if not url or (selected_url and url == selected_url):
+            continue
+        if youtube_only and not _is_youtube_video_url(url):
+            continue
+        title = str(entry.get("title") or "").strip()
+        if not title:
+            continue
+        duration = entry.get("duration")
+        related.append(
+            {
+                "title": title,
+                "url": url,
+                "duration": int(duration) if isinstance(duration, (int, float)) else None,
+                "uploader": entry.get("uploader") or entry.get("channel"),
+            }
+        )
+        if len(related) >= 5:
+            break
+    return related
+
+
 def _chain_atempo(tempo: float) -> list[str]:
     """Return a list of atempo filters that stays within ffmpeg's 0.5–2.0 bounds."""
 
@@ -89,7 +162,7 @@ class Track:
     duration: float   # seconds (0 if unknown)
     page_url: str     # webpage URL for display
     add_id: int | None = None
-    related: list[dict[str, str]] | None = None
+    related: list[dict[str, Any]] | None = None
     http_headers: dict[str, str] | None = None
 
 
@@ -812,79 +885,55 @@ async def yt_search(query: str) -> Track:
     """Fetch track information using yt-dlp in a thread."""
 
     def extract() -> Track:
-        def _normalize_related_url(raw: str | None) -> str | None:
-            if not raw:
-                return None
-            raw = str(raw).strip()
-            if not raw:
-                return None
-            if raw.startswith(("http://", "https://")):
-                return raw
-            if raw.startswith("//"):
-                return f"https:{raw}"
-            if raw.startswith("www.youtube.com/") or raw.startswith("youtube.com/"):
-                return f"https://{raw}"
-            if raw.startswith("youtu.be/"):
-                return f"https://{raw}"
-            if raw.startswith("/watch?v="):
-                return f"https://www.youtube.com{raw}"
-            if raw.startswith("watch?v="):
-                return f"https://www.youtube.com/{raw}"
-            if re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
-                return f"https://www.youtube.com/watch?v={raw}"
-            return None
-
-        def _entry_url(entry: dict[str, Any]) -> str | None:
-            raw = entry.get("webpage_url") or entry.get("url") or entry.get("id")
-            normalized = _normalize_related_url(raw)
-            if normalized:
-                return normalized
-            if raw and urlparse(str(raw)).scheme:
-                return str(raw)
-            return None
-
-        def _is_youtube_video_url(url: str | None) -> bool:
-            if not url:
-                return False
-            return (
-                "youtube.com/watch" in url
-                or "youtu.be/" in url
-                or "youtube.com/shorts/" in url
-                or "youtube.com/live/" in url
-            )
-
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
             info = ydl.extract_info(query, download=False)
+            search_related: list[dict[str, Any]] = []
             if "entries" in info:
                 entries = info.get("entries") or []
                 if not entries:
                     raise yt_dlp.utils.DownloadError("No results")
                 info = entries[0]
                 entry_url = _entry_url(info)
-                if _is_youtube_video_url(entry_url):
+                youtube_only = any(
+                    _is_youtube_video_url(_entry_url(candidate))
+                    for candidate in entries
+                    if isinstance(candidate, dict)
+                )
+                if youtube_only:
                     for candidate in entries:
                         candidate_url = _entry_url(candidate)
                         if _is_youtube_video_url(candidate_url):
                             info = candidate
                             entry_url = candidate_url
                             break
+                search_related = _build_related_from_entries(entries, entry_url, youtube_only)
                 if _is_youtube_video_url(entry_url) and not info.get("related_videos"):
                     refreshed = ydl.extract_info(entry_url, download=False)
                     if "entries" not in refreshed:
                         info = refreshed
             headers = info.get("http_headers") or None
-            related: list[dict[str, str]] = []
-            for entry in (info.get("related_videos") or []):
-                if not isinstance(entry, dict):
-                    continue
-                title = str(entry.get("title") or "").strip()
-                raw_url = entry.get("webpage_url") or entry.get("url") or entry.get("id")
-                url = _normalize_related_url(raw_url)
-                if not title or not url:
-                    continue
-                related.append({"title": title, "url": url})
-                if len(related) >= 5:
-                    break
+            related: list[dict[str, Any]] = []
+            if search_related:
+                related = search_related
+            else:
+                for entry in (info.get("related_videos") or []):
+                    if not isinstance(entry, dict):
+                        continue
+                    title = str(entry.get("title") or "").strip()
+                    url = _normalize_related_url(entry.get("webpage_url") or entry.get("url") or entry.get("id"))
+                    if not title or not url:
+                        continue
+                    duration = entry.get("duration")
+                    related.append(
+                        {
+                            "title": title,
+                            "url": url,
+                            "duration": int(duration) if isinstance(duration, (int, float)) else None,
+                            "uploader": entry.get("uploader") or entry.get("channel"),
+                        }
+                    )
+                    if len(related) >= 5:
+                        break
             return Track(
                 url=info["url"],
                 title=info.get("title", "Unknown"),
@@ -893,6 +942,46 @@ async def yt_search(query: str) -> Track:
                 related=related or None,
                 http_headers=headers,
             )
+
+    return await asyncio.to_thread(extract)
+
+
+async def yt_search_results(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Return search results without queuing."""
+
+    def extract() -> list[dict[str, Any]]:
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+        entries = info.get("entries") or []
+        results: list[dict[str, Any]] = []
+        youtube_only = any(
+            _is_youtube_video_url(_entry_url(entry)) for entry in entries if isinstance(entry, dict)
+        )
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            url = _entry_url(entry)
+            if not url:
+                continue
+            if youtube_only and not _is_youtube_video_url(url):
+                continue
+            title = str(entry.get("title") or "").strip()
+            if not title:
+                continue
+            duration = entry.get("duration")
+            results.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "duration": int(duration) if isinstance(duration, (int, float)) else None,
+                    "uploader": entry.get("uploader") or entry.get("channel"),
+                }
+            )
+            if len(results) >= limit:
+                break
+        if not results:
+            raise yt_dlp.utils.DownloadError("No results")
+        return results
 
     return await asyncio.to_thread(extract)
 
