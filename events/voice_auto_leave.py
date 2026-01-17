@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import discord
 from discord.ext import commands
 
 from events import EventInfo
 from music import get_player
+
+log = logging.getLogger(__name__)
 
 
 EVENT_INFO = EventInfo(
@@ -18,6 +23,40 @@ EVENT_INFO = EventInfo(
 class VoiceAutoLeave(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._cleanup_tasks: dict[int, asyncio.Task] = {}
+
+    def cog_unload(self) -> None:
+        for task in self._cleanup_tasks.values():
+            task.cancel()
+        self._cleanup_tasks.clear()
+
+    def _spawn_cleanup(self, player, guild_id: int) -> None:
+        existing = self._cleanup_tasks.pop(guild_id, None)
+        if existing:
+            existing.cancel()
+
+        async def _run() -> None:
+            await asyncio.sleep(10)
+            player.sync_voice_client()
+            if player.voice and player.voice.is_connected():
+                return
+            await player.cleanup()
+
+        task = asyncio.create_task(_run())
+        self._cleanup_tasks[guild_id] = task
+
+        def _done(t: asyncio.Task) -> None:
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("voice_auto_leave cleanup task failed")
+            finally:
+                if self._cleanup_tasks.get(guild_id) is t:
+                    self._cleanup_tasks.pop(guild_id, None)
+
+        task.add_done_callback(_done)
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -27,6 +66,13 @@ class VoiceAutoLeave(commands.Cog):
         after: discord.VoiceState,
     ) -> None:
         if member.bot:
+            if self.bot.user and member.id == self.bot.user.id:
+                if before.channel is not None and after.channel is None:
+                    player = get_player(self.bot, before.channel.guild)
+                    player.sync_voice_client()
+                    player.last_channel_id = None
+                    player.ignore_after = True
+                    self._spawn_cleanup(player, before.channel.guild.id)
             return
 
         channel = before.channel or after.channel
