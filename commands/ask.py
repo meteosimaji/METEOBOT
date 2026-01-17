@@ -2561,6 +2561,12 @@ class Ask(commands.Cog):
                 messages = await self._collect_bot_messages(ctx, after=history_after)
                 if messages:
                     response["messages"] = messages
+                message_links = self._pop_recent_message_links(ctx)
+                if message_links:
+                    response["message_links"] = {
+                        "note": "Message links only; fetch details via discord_fetch_message.",
+                        "items": message_links,
+                    }
                 return response
             except Exception as exc:  # noqa: BLE001
                 return {
@@ -2578,6 +2584,12 @@ class Ask(commands.Cog):
             messages = await self._collect_bot_messages(ctx, after=history_after)
             if messages:
                 response["messages"] = messages
+            message_links = self._pop_recent_message_links(ctx)
+            if message_links:
+                response["message_links"] = {
+                    "note": "Message links only; fetch details via discord_fetch_message.",
+                    "items": message_links,
+                }
             return response
         except Exception as exc:  # noqa: BLE001
             return {
@@ -2658,7 +2670,12 @@ class Ask(commands.Cog):
 
         collected: list[dict[str, Any]] = []
         for message in messages:
-            entry: dict[str, Any] = {"text": "", "attachments": [], "embed_images": []}
+            entry: dict[str, Any] = {
+                "text": "",
+                "attachments": [],
+                "embed_images": [],
+                "message_url": message.jump_url,
+            }
 
             text_parts: list[str] = []
 
@@ -2727,6 +2744,16 @@ class Ask(commands.Cog):
                 collected.append(entry)
 
         return collected
+
+    def _pop_recent_message_links(self, ctx: commands.Context) -> list[dict[str, str]]:
+        links = getattr(ctx, "recent_message_links", None)
+        if not links:
+            return []
+        with contextlib.suppress(Exception):
+            delattr(ctx, "recent_message_links")
+        if isinstance(links, list):
+            return [entry for entry in links if isinstance(entry, dict) and entry.get("url")]
+        return []
 
     async def _reply(self, ctx: commands.Context, **kwargs: Any) -> None:
         if ctx.interaction:
@@ -3176,6 +3203,7 @@ class Ask(commands.Cog):
             "to show the /help entry for /image. "
             "When invoking commands, always fill arg: e.g., bot_invoke({'name': 'image', 'arg': 'Draw a clean cartoon portrait of me https://cdn.discordapp.com/...'}). "
             "For commands that truly take no argument, pass an empty arg like bot_invoke({'name': 'ping', 'arg': ''}). "
+            "For /messages, you can pass keywords plus filters like from:, mentions:, has:, before:, after:, during:, before_id:, after_id:, pinned:true/false, or scan:; during: uses the server timezone from /settime and omitting a count defaults to 50. "
             "Before /image: always call discord_fetch_message (use url:'' for the current request, or a link for other messages)"
             " to collect attachment or linked images; never skip this step when an image might be present. "
             "Use /image only when the user explicitly requests an image; do not call it for pure analysis (e.g., counting people)"
