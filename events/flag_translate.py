@@ -217,6 +217,8 @@ class FlagTranslate(commands.Cog):
         )
         if not self.enabled:
             return
+        if self.bot.user and payload.user_id == self.bot.user.id:
+            return
         if payload.member and payload.member.bot:
             return
 
@@ -345,9 +347,6 @@ class FlagTranslate(commands.Cog):
                 return
             except discord.HTTPException:
                 log.exception("Failed to fetch message for flag translation")
-                return
-
-            if message.author.bot and self.bot.user and message.author.id == self.bot.user.id:
                 return
 
             suppress_embeds = bool(
