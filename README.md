@@ -30,6 +30,7 @@
 - `tune` — Set speed and pitch (`/tune 1.2 0.9`).
 - `uptime` — Show how long the bot has been running.
 - `userinfo` — Show a member's profile with timestamps, roles, and bot status.
+- `video` — Generate or remix short videos with Sora from a prompt, a reference image (first frame), or a `video_...` ID; best prompts describe shot type, subject, action, setting, and lighting. Attach images, HTTPS URLs, or Discord message links to use as reference. Optional tokens: `model:sora-2` or `model:sora-2-pro`, `seconds:4|8|12`, `size:720x1280|1280x720|1024x1792|1792x1024`.
 
 ### Music prerequisites
 - Install **FFmpeg** and ensure `ffmpeg` is on PATH (required for audio decoding).
