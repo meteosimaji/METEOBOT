@@ -9,6 +9,8 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import ipaddress
+import json
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ext import commands
@@ -39,6 +41,9 @@ MAX_VIDEO_BYTES = 8 * 1024 * 1024
 DEFAULT_MODEL = "sora-2"
 DEFAULT_SECONDS = "8"
 DEFAULT_SIZE = "1280x720"
+LIMITS_PATH = Path(".data/video_limits.json")
+USER_DAILY_LIMIT = 1
+GUILD_WEEKLY_LIMIT = 2
 ALLOWED_IMAGE_TYPES = {
     "image/png",
     "image/jpeg",
@@ -67,7 +72,7 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
 ]
-ALLOWED_VIDEO_SIZES = {"1280x720", "720x1280", "1024x1792", "1792x1024"}
+ALLOWED_VIDEO_SIZES = {"1280x720", "720x1280"}
 
 _openai_module = importlib.import_module("openai")
 OpenAI = getattr(_openai_module, "OpenAI")
@@ -191,6 +196,40 @@ def _parse_size(size: str) -> tuple[int, int]:
         raise ValueError(f"Invalid size format: {size}") from exc
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_day_key(now: datetime) -> str:
+    return now.date().isoformat()
+
+
+def _utc_week_start(now: datetime) -> datetime:
+    days_since_sunday = (now.weekday() + 1) % 7
+    start = now - timedelta(days=days_since_sunday)
+    return start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _format_utc(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _extract_video_error(video: object) -> str | None:
+    for attr in ("error", "last_error", "reason"):
+        value = getattr(video, attr, None)
+        if not value:
+            continue
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            message = value.get("message") or value.get("error") or value.get("reason")
+            if message:
+                return str(message)
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+    return None
+
+
 def _resize_reference_image(
     img: PILImage.Image, target: tuple[int, int]
 ) -> PILImage.Image:
@@ -218,6 +257,86 @@ class Video(commands.Cog):
         else:
             self.client = OpenAI(api_key=token)
             self._async_client = False
+        self._limit_lock = asyncio.Lock()
+
+    async def _load_limits(self) -> dict[str, dict[str, dict[str, object]]]:
+        if not LIMITS_PATH.exists():
+            return {"users": {}, "guilds": {}}
+        try:
+            raw = LIMITS_PATH.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except Exception:
+            log.warning("Failed to read %s; starting fresh.", LIMITS_PATH)
+            return {"users": {}, "guilds": {}}
+        if not isinstance(data, dict):
+            return {"users": {}, "guilds": {}}
+        data.setdefault("users", {})
+        data.setdefault("guilds", {})
+        return data  # type: ignore[return-value]
+
+    async def _save_limits(self, data: dict[str, dict[str, dict[str, object]]]) -> None:
+        LIMITS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LIMITS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    async def _check_and_consume_limits(self, ctx: commands.Context) -> str | None:
+        now = _utc_now()
+        day_key = _utc_day_key(now)
+        next_day = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = _utc_week_start(now)
+        week_key = week_start.date().isoformat()
+        next_week = week_start + timedelta(days=7)
+
+        user_id = str(ctx.author.id)
+        guild_id = str(ctx.guild.id) if ctx.guild else None
+
+        async with self._limit_lock:
+            data = await self._load_limits()
+            users = data.setdefault("users", {})
+            guilds = data.setdefault("guilds", {})
+
+            errors: list[str] = []
+            user_entry = users.get(user_id, {})
+            user_day = user_entry.get("day")
+            user_count = int(user_entry.get("count", 0) or 0)
+            if user_day != day_key:
+                user_count = 0
+            if user_count >= USER_DAILY_LIMIT:
+                errors.append(
+                    "You already used /video today (per-user daily limit across all servers). "
+                    f"Next reset: {_format_utc(next_day)}."
+                )
+
+            if guild_id:
+                guild_entry = guilds.get(guild_id, {})
+                guild_week = guild_entry.get("week_start")
+                count = int(guild_entry.get("count", 0) or 0)
+                if guild_week != week_key:
+                    count = 0
+                if count >= GUILD_WEEKLY_LIMIT:
+                    errors.append(
+                        "This server has reached its weekly /video limit "
+                        f"({GUILD_WEEKLY_LIMIT} per week shared across users). "
+                        f"Next reset: {_format_utc(next_week)}."
+                    )
+
+            if errors:
+                return "\n".join(f"• {line}" for line in errors)
+
+            users[user_id] = {
+                "day": day_key,
+                "count": user_count + 1,
+                "last_used": now.isoformat(),
+            }
+            if guild_id:
+                guild_entry = guilds.get(guild_id, {})
+                if guild_entry.get("week_start") != week_key:
+                    guild_entry = {"week_start": week_key, "count": 0}
+                guild_entry["count"] = int(guild_entry.get("count", 0) or 0) + 1
+                guilds[guild_id] = guild_entry
+
+            await self._save_limits(data)
+
+        return None
 
     async def _videos_create(self, **kwargs):
         if self._async_client:
@@ -728,28 +847,31 @@ class Video(commands.Cog):
     @commands.hybrid_command(
         name="video",
         description="Generate a video from a text prompt using Sora.",
-        cooldown_after_parsing=True,
-        cooldown=commands.CooldownMapping.from_cooldown(1, 20, commands.BucketType.user),
         help=(
             "Generate a short video with Sora and wait for completion. Attach an image, include a public HTTPS image URL, or paste a Discord message link with an attachment to use it as the first frame (video edit). "
             "Include a Sora video ID (video_...) or link to remix an existing video.\n\n"
             "Prompts work best when they describe shot type, subject, action, setting, and lighting.\n\n"
             "**Usage**: `/video <prompt>`\n"
-            "**Options**: `seconds` = `4`, `8`, or `12`, `size` = `720x1280`, `1280x720`, `1024x1792`, or `1792x1024`.\n"
+            "**Options**: `seconds` = `4`, `8`, or `12`, `size` = `720x1280` or `1280x720`.\n"
             "**Examples**: `/video Wide tracking shot of a teal coupe driving through a desert highway, heat ripples visible, hard sun overhead.`\n"
             "`/video Close-up of a steaming coffee cup on a wooden table, morning light through blinds, soft depth of field.`\n"
             "`/video video_abc123 Shift the color palette to teal, sand, and rust, with a warm backlight.`\n"
-            "`/video seconds:12 size:1792x1024 A cinematic drone shot over a misty rainforest at sunrise.`\n"
+            "`/video seconds:12 size:720x1280 A cinematic drone shot over a misty rainforest at sunrise.`\n"
             f"`{BOT_PREFIX}video a cozy cabin in falling snow at night` (with an attachment to use as the first frame)\n\n"
             "Bot defaults: model `sora-2`, size `1280x720`, seconds `8`. Reference images are resized to the target size"
-            " with letterboxing. Results are asynchronous and can take a few minutes."
+            " with letterboxing. Results are asynchronous and can take a few minutes.\n\n"
+            "Limits: each user can run /video once per day across all servers; each server can run /video twice per week "
+            "shared across users. Weekly limits reset at Sunday 00:00 UTC."
         ),
         extras={
             "category": "AI",
-            "destination": "Generate or remix videos with Sora from prompts, reference images, or a video ID.",
+            "destination": (
+                "Generate or remix videos with Sora from prompts, reference images, or a video ID "
+                "(daily per-user and weekly per-server limits apply)."
+            ),
             "plus": (
                 "Attach/URL/link an image to use it as the first frame (auto-resized to target size), "
-                "or include a video_... ID to remix. Optional tokens: seconds:12, size:1792x1024."
+                "or include a video_... ID to remix. Optional tokens: seconds:12, size:720x1280."
                 " HTTPS URLs only."
             ),
             "pro": "Uses the Video API with Sora (sora-2), supports remixing, attachments, reply images, ask-injected images, HTTPS URLs, and message links that contain attachments.",
@@ -805,6 +927,23 @@ class Video(commands.Cog):
             await safe_reply(ctx, embed=error_embed, ephemeral=True, mention_author=False)
             return
 
+        if not getattr(self.client, "api_key", None):
+            return await safe_reply(
+                ctx,
+                "OPENAI_TOKEN is not set, so I can't generate videos right now.",
+                ephemeral=True,
+                mention_author=False,
+            )
+
+        limit_error = await self._check_and_consume_limits(ctx)
+        if limit_error:
+            return await safe_reply(
+                ctx,
+                "⏳ Video usage limit reached:\n" + limit_error,
+                ephemeral=True,
+                mention_author=False,
+            )
+
         status_embed = discord.Embed(
             title=(
                 "🎬 Remixing video…"
@@ -824,14 +963,6 @@ class Video(commands.Cog):
                 status_msg = await ctx.reply(embed=status_embed, mention_author=False)
         except Exception:
             status_msg = None
-
-        if not getattr(self.client, "api_key", None):
-            return await safe_reply(
-                ctx,
-                "OPENAI_TOKEN is not set, so I can't generate videos right now.",
-                ephemeral=True,
-                mention_author=False,
-            )
 
         try:
             if remix_id and images:
@@ -900,7 +1031,13 @@ class Video(commands.Cog):
                 video = await self._videos_create_and_poll(**request_kwargs)
             status = getattr(video, "status", None)
             if status != "completed":
-                raise RuntimeError(f"Video creation failed with status {status}")
+                error_detail = _extract_video_error(video)
+                if error_detail:
+                    notes.append(f"Provider error: {error_detail}")
+                raise RuntimeError(
+                    f"Video creation failed with status {status}"
+                    + (f": {error_detail}" if error_detail else "")
+                )
 
             video_bytes = await self._download_content(video.id, variant="video")
             max_upload_bytes = (
@@ -961,6 +1098,11 @@ class Video(commands.Cog):
         except Exception as exc:
             log.exception("Failed to generate video")
             description = "An error occurred while generating the video. Try again later."
+            if isinstance(exc, RuntimeError) and "Video creation failed with status" in str(exc):
+                description = (
+                    "The video provider reported a failed job status. "
+                    "Try adjusting the prompt or reference image and try again."
+                )
             if isinstance(exc, BadRequestError):
                 detail = getattr(exc, "message", str(exc))
                 description = f"OpenAI rejected the request: {detail}"

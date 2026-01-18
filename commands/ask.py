@@ -3219,11 +3219,12 @@ class Ask(commands.Cog):
             "For /video: call bot_invoke with name='video' and the prompt in arg; describe shot type, subject, action, setting,"
             " and lighting for best results. If an image is available, it becomes the first frame (video edit); otherwise it"
             " generates from text only. To remix, include a Sora video ID (video_...) or link containing it and describe the"
-            " change in the prompt; do not combine remix IDs with reference images. If the only image source is a URL from"
+            " change in the prompt; do not combine remix IDs with reference images. Limits: each user can run /video once per day"
+            " across all servers, and each server can run /video twice per week shared across users (weekly reset Sunday 00:00 UTC)."
+            " If the only image source is a URL from"
             " discord_fetch_message, include that HTTPS URL in arg alongside the prompt. Reference images are auto-resized to"
             " the target size with letterboxing. If the user requests a different duration or size, include tokens like"
-            " seconds:12 or size:1792x1024 in arg. Allowed values: seconds=4|8|12,"
-            " size=720x1280|1280x720|1024x1792|1792x1024."
+            " seconds:12 or size:720x1280 in arg. Allowed values: seconds=4|8|12, size=720x1280|1280x720."
         )
 
         tools = [
