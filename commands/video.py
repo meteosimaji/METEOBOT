@@ -50,7 +50,7 @@ ALLOWED_IMAGE_TYPES = {
 URL_PATTERN = re.compile(r"https?://[^\s<>]+")
 VIDEO_ID_PATTERN = re.compile(r"video_[a-zA-Z0-9]+")
 VIDEO_URL_PATTERN = re.compile(r"https?://[^\s<>]*video_[a-zA-Z0-9]+[^\s<>]*")
-MODEL_OPTION_PATTERN = re.compile(r"\bmodel:(sora-2(?:-pro)?)\b", re.IGNORECASE)
+MODEL_OPTION_PATTERN = re.compile(r"\bmodel:[^\s]+\b", re.IGNORECASE)
 SECONDS_OPTION_PATTERN = re.compile(r"\bseconds:(4|8|12)\b")
 SIZE_OPTION_PATTERN = re.compile(r"\bsize:(\d{3,4}x\d{3,4})\b", re.IGNORECASE)
 MESSAGE_LINK_PATTERN = re.compile(
@@ -153,15 +153,14 @@ def _extract_remix_target(prompt: str) -> tuple[str | None, str]:
     return remix_id, cleaned
 
 
-def _extract_video_options(prompt: str) -> tuple[str, str, str, str, str | None]:
+def _extract_video_options(prompt: str) -> tuple[str, str, str, str, list[str]]:
     model = DEFAULT_MODEL
     seconds = DEFAULT_SECONDS
     size = DEFAULT_SIZE
-    size_note: str | None = None
+    notes: list[str] = []
 
-    model_match = MODEL_OPTION_PATTERN.search(prompt)
-    if model_match:
-        model = model_match.group(1).lower()
+    if MODEL_OPTION_PATTERN.search(prompt):
+        notes.append("Model selection is disabled; using sora-2.")
         prompt = MODEL_OPTION_PATTERN.sub("", prompt)
 
     seconds_match = SECONDS_OPTION_PATTERN.search(prompt)
@@ -175,13 +174,13 @@ def _extract_video_options(prompt: str) -> tuple[str, str, str, str, str | None]
         if candidate in ALLOWED_VIDEO_SIZES:
             size = candidate
         else:
-            size_note = (
+            notes.append(
                 f"Requested size {candidate} isn't supported; using {DEFAULT_SIZE}."
             )
         prompt = SIZE_OPTION_PATTERN.sub("", prompt)
 
     prompt = re.sub(r"\s+", " ", prompt).strip()
-    return model, seconds, size, prompt, size_note
+    return model, seconds, size, prompt, notes
 
 
 def _parse_size(size: str) -> tuple[int, int]:
@@ -736,11 +735,11 @@ class Video(commands.Cog):
             "Include a Sora video ID (video_...) or link to remix an existing video.\n\n"
             "Prompts work best when they describe shot type, subject, action, setting, and lighting.\n\n"
             "**Usage**: `/video <prompt>`\n"
-            "**Options**: `model` = `sora-2` or `sora-2-pro`, `seconds` = `4`, `8`, or `12`, `size` = `720x1280`, `1280x720`, `1024x1792`, or `1792x1024`.\n"
+            "**Options**: `seconds` = `4`, `8`, or `12`, `size` = `720x1280`, `1280x720`, `1024x1792`, or `1792x1024`.\n"
             "**Examples**: `/video Wide tracking shot of a teal coupe driving through a desert highway, heat ripples visible, hard sun overhead.`\n"
             "`/video Close-up of a steaming coffee cup on a wooden table, morning light through blinds, soft depth of field.`\n"
             "`/video video_abc123 Shift the color palette to teal, sand, and rust, with a warm backlight.`\n"
-            "`/video model:sora-2-pro seconds:12 size:1792x1024 A cinematic drone shot over a misty rainforest at sunrise.`\n"
+            "`/video seconds:12 size:1792x1024 A cinematic drone shot over a misty rainforest at sunrise.`\n"
             f"`{BOT_PREFIX}video a cozy cabin in falling snow at night` (with an attachment to use as the first frame)\n\n"
             "Bot defaults: model `sora-2`, size `1280x720`, seconds `8`. Reference images are resized to the target size"
             " with letterboxing. Results are asynchronous and can take a few minutes."
@@ -750,10 +749,10 @@ class Video(commands.Cog):
             "destination": "Generate or remix videos with Sora from prompts, reference images, or a video ID.",
             "plus": (
                 "Attach/URL/link an image to use it as the first frame (auto-resized to target size), "
-                "or include a video_... ID to remix. Optional tokens: model:sora-2-pro, seconds:12, size:1792x1024."
+                "or include a video_... ID to remix. Optional tokens: seconds:12, size:1792x1024."
                 " HTTPS URLs only."
             ),
-            "pro": "Uses the Video API with Sora (sora-2, sora-2-pro), supports remixing, attachments, reply images, ask-injected images, HTTPS URLs, and message links that contain attachments.",
+            "pro": "Uses the Video API with Sora (sora-2), supports remixing, attachments, reply images, ask-injected images, HTTPS URLs, and message links that contain attachments.",
         },
     )
     async def video(self, ctx: commands.Context, *, prompt: str) -> None:
@@ -782,14 +781,14 @@ class Video(commands.Cog):
                 ephemeral=True,
                 mention_author=False,
             )
-        model, seconds, size, prompt, size_note = _extract_video_options(prompt)
+        model, seconds, size, prompt, option_notes = _extract_video_options(prompt)
         await defer_interaction(ctx)
 
         images, notes, had_candidates, cleaned_prompt = await self._gather_images(ctx, prompt)
         if cleaned_prompt:
             prompt = cleaned_prompt
-        if size_note:
-            notes.append(size_note)
+        if option_notes:
+            notes.extend(option_notes)
         display_prompt = _summarize_prompt_for_embed(prompt)
 
         if had_candidates and not images and notes and not remix_id:
