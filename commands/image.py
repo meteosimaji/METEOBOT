@@ -13,7 +13,7 @@ import ipaddress
 
 import discord
 from discord.ext import commands
-from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
+from PIL import Image as PILImage, ImageOps, UnidentifiedImageError, features as PILFeatures
 
 HEIF_ENABLED = False
 try:  # Optional HEIC/HEIF support
@@ -94,7 +94,7 @@ def _summarize_prompt_for_embed(prompt: str, max_len: int = 300) -> str:
 
 
 def _normalize_discord_cdn_url(url: str) -> str:
-    """Prefer original CDN assets over preview variants."""
+    """Strip transform query params from Discord CDN/preview URLs when safe."""
 
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -111,9 +111,6 @@ def _normalize_discord_cdn_url(url: str) -> str:
     if any(key in query_dict for key in ("ex", "is", "hm")):
         return url
 
-    if host == "media.discordapp.net":
-        parsed = parsed._replace(netloc="cdn.discordapp.com")
-
     query_pairs = [
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
@@ -122,6 +119,39 @@ def _normalize_discord_cdn_url(url: str) -> str:
 
     parsed = parsed._replace(query=urlencode(query_pairs, doseq=True))
     return urlunparse(parsed)
+
+
+def _with_discord_cdn_format(
+    url: str, image_format: str, *, prefer_media: bool = False
+) -> str | None:
+    """Return a Discord CDN URL with a forced format, when safe to modify."""
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"media.discordapp.net", "cdn.discordapp.com"}:
+        return None
+
+    query_dict = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if any(key in query_dict for key in ("ex", "is", "hm")):
+        return None
+
+    if prefer_media and host != "media.discordapp.net":
+        parsed = parsed._replace(netloc="media.discordapp.net")
+
+    if query_dict.get("format") == image_format and not prefer_media:
+        return None
+
+    query_dict["format"] = image_format
+    return urlunparse(parsed._replace(query=urlencode(query_dict, doseq=True)))
+
+
+def _describe_header(data: bytes) -> str:
+    if not data:
+        return "empty"
+    header = data[:12]
+    hex_part = header.hex(" ")
+    ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in header)
+    return f"{hex_part} | {ascii_part}"
 
 _openai_module = importlib.import_module("openai")
 OpenAI = getattr(_openai_module, "OpenAI")
@@ -193,6 +223,13 @@ class Image(commands.Cog):
                 DecompressionBombError,
                 DecompressionBombWarning,
             ):
+                log.warning(
+                    "Image decode failed for %s (content_type=%s size=%s header=%s).",
+                    source,
+                    content_type_hint or "unknown",
+                    len(data) if data else 0,
+                    _describe_header(data),
+                )
                 is_heic = lower_hint.endswith((".heic", ".heif")) or content_type_hint in {
                     "image/heic",
                     "image/heif",
@@ -339,7 +376,7 @@ class Image(commands.Cog):
             await _read_attachment(att, source)
 
         # URLs embedded in the prompt
-        url_matches = URL_PATTERN.findall(prompt)
+        url_matches = [match.rstrip("),.;&") for match in URL_PATTERN.findall(prompt)]
         if url_matches:
             had_candidates = True
             import aiohttp
@@ -388,7 +425,7 @@ class Image(commands.Cog):
                     # suffixes break the signed CDN query string and lead to HTML/403
                     # bodies that Pillow cannot decode. Strip common trailing noise
                     # before normalization/fetching.
-                    url = raw_url.rstrip("),.;&")
+                    url = raw_url
                     normalized_url = _normalize_discord_cdn_url(url)
                     if normalized_url in seen_urls:
                         continue
@@ -462,6 +499,9 @@ class Image(commands.Cog):
                         redirect_statuses = {301, 302, 303, 307, 308}
                         current_url = normalized_url
                         redirect_hops = 0
+                        attempted_png_fallback = False
+                        attempted_retry = False
+                        used_png_fallback = False
                         while True:
                             resp = await session.get(current_url, allow_redirects=False)
                             try:
@@ -492,6 +532,9 @@ class Image(commands.Cog):
                                     break
 
                                 parsed_final = urlparse(current_url)
+                                png_fallback_url = _with_discord_cdn_format(
+                                    current_url, "png", prefer_media=True
+                                )
 
                                 content_type = (resp.headers.get("Content-Type", "") or "").split(
                                     ";", 1
@@ -523,9 +566,23 @@ class Image(commands.Cog):
                                             f"Attempting decode based on file extension despite content type {content_type or 'missing'}: {current_url}"
                                         )
 
+                                if (
+                                    content_type == "image/webp"
+                                    and not PILFeatures.check("webp")
+                                    and png_fallback_url
+                                    and not attempted_png_fallback
+                                ):
+                                    attempted_png_fallback = True
+                                    used_png_fallback = True
+                                    current_url = png_fallback_url
+                                    continue
+
                                 content_length = resp.headers.get("Content-Length")
+                                content_length_val: int | None = None
                                 try:
-                                    if content_length is not None and int(content_length) >= MAX_IMAGE_BYTES:
+                                    if content_length is not None:
+                                        content_length_val = int(content_length)
+                                    if content_length_val is not None and content_length_val >= MAX_IMAGE_BYTES:
                                         notes.append(
                                             f"Skipped URL: file exceeded {MAX_IMAGE_BYTES // (1024 * 1024)}MB"
                                         )
@@ -548,10 +605,31 @@ class Image(commands.Cog):
                                     content_type or ext_type_hint,
                                 )
                                 if not normalized:
+                                    if (
+                                        png_fallback_url
+                                        and not attempted_png_fallback
+                                        and png_fallback_url != current_url
+                                    ):
+                                        attempted_png_fallback = True
+                                        used_png_fallback = True
+                                        current_url = png_fallback_url
+                                        continue
+                                    if (
+                                        not attempted_retry
+                                        and content_length_val is not None
+                                        and len(data) < content_length_val
+                                    ):
+                                        attempted_retry = True
+                                        continue
                                     break
 
                                 norm_data, norm_name = normalized
                                 images.append((norm_data, norm_name))
+                                if used_png_fallback:
+                                    notes.append(
+                                        "Used Discord CDN PNG fallback "
+                                        f"(orig: {normalized_url}, used: {current_url})."
+                                    )
                                 break
                             finally:
                                 resp.release()
