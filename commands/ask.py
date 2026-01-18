@@ -3051,10 +3051,13 @@ class Ask(commands.Cog):
             att: discord.Attachment, content_type: str
         ) -> tuple[str | None, str | None]:
             filename = getattr(att, "filename", "image") or "image"
-            url = getattr(att, "url", "") or ""
+            url = (getattr(att, "url", "") or "").rstrip("),.;&")
             size = getattr(att, "size", 0) or 0
+            url_host = (urlparse(url).hostname or "").lower() if url else ""
+            is_discord_cdn = url_host in {"cdn.discordapp.com", "media.discordapp.net"}
 
-            if url and size and size <= MAX_IMAGE_BYTES:
+            # Non-Discord URLs are safe to pass through directly (avoid base64 bloat).
+            if url and not is_discord_cdn and (size == 0 or size <= MAX_IMAGE_BYTES):
                 return url, None
 
             try:
@@ -3067,13 +3070,19 @@ class Ask(commands.Cog):
 
             data_len = len(data)
 
-            if url and (size == 0 or size <= MAX_IMAGE_BYTES) and data_len <= MAX_IMAGE_BYTES:
-                return url, None
+            def _data_url_budget(prefix: str) -> int:
+                return max(0, (MAX_IMAGE_BYTES - len(prefix)) * 3 // 4 - 1024)
 
-            if not url and data_len <= MAX_IMAGE_BYTES:
+            data_url_prefix = f"data:{content_type};base64,"
+            data_url_budget = _data_url_budget(data_url_prefix)
+            if not url and data_len <= data_url_budget:
                 b64 = base64.b64encode(data).decode("ascii")
-                return f"data:{content_type};base64,{b64}", None
+                return f"{data_url_prefix}{b64}", None
 
+            if is_discord_cdn and data_len <= data_url_budget:
+                b64 = base64.b64encode(data).decode("ascii")
+                note = f"Embedded {filename} to avoid Discord CDN timeouts."
+                return f"{data_url_prefix}{b64}", note
             try:
                 img = PILImage.open(BytesIO(data))
                 img = ImageOps.exif_transpose(img)
@@ -3102,18 +3111,20 @@ class Ask(commands.Cog):
                 image.save(out, format="JPEG", quality=quality, optimize=True, progressive=True)
                 return out.getvalue()
 
+            jpeg_prefix = "data:image/jpeg;base64,"
+            jpeg_budget = _data_url_budget(jpeg_prefix)
             attempt = img
             for shrink_round in range(3):
                 width, height = attempt.size
                 for quality in (85, 75, 65, 55, 45, 35, 30):
                     jpeg_bytes = _encode_jpeg(attempt, quality)
-                    if len(jpeg_bytes) <= MAX_IMAGE_BYTES:
+                    if len(jpeg_bytes) <= jpeg_budget:
                         b64 = base64.b64encode(jpeg_bytes).decode("ascii")
                         note = (
                             f"Compressed {filename} to {len(jpeg_bytes):,} bytes at "
                             f"{width}x{height} (q={quality})."
                         )
-                        return f"data:image/jpeg;base64,{b64}", note
+                        return f"{jpeg_prefix}{b64}", note
 
                 attempt = attempt.resize(
                     (max(1, width // 2), max(1, height // 2)),
@@ -3123,10 +3134,10 @@ class Ask(commands.Cog):
             if url:
                 return (
                     url,
-                    f"Used original URL for {filename} after compression exceeded {MAX_IMAGE_BYTES:,} bytes.",
+                    f"Used original URL for {filename} after compression exceeded {jpeg_budget:,} bytes.",
                 )
 
-            return None, f"Couldn't compress {filename} under {MAX_IMAGE_BYTES:,} bytes."
+            return None, f"Couldn't compress {filename} under {jpeg_budget:,} bytes."
 
         if len(image_atts) > 3:
             skipped_notes.append("Only the first 3 images were processed.")
@@ -3214,6 +3225,10 @@ class Ask(commands.Cog):
             " when you already have attachments; do NOT paste the same URL twice. "
             "If the only image source is a URL from discord_fetch_message, include that HTTPS URL in arg alongside the prompt"
             " so the edit has a base image. Do not invent filenames or inline binary data. "
+            "Never claim you're using an attached image unless discord_fetch_message confirms an attachment or link; "
+            "if the user says 'this image' but no attachments/links are present, ask them to re-upload the file. "
+            "If you must use a Discord avatar/CDN URL, include the URL explicitly and prefer adding format=png when it's safe "
+            "(no signed ex/is/hm params) to avoid decode failures. "
             "Before /video: call discord_fetch_message for Discord message links or replies so attachments are available"
             " to the command; you can skip it for regular HTTPS image URLs since /video fetches them itself. "
             "For /video: call bot_invoke with name='video' and the prompt in arg; describe shot type, subject, action, setting,"
