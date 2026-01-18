@@ -44,6 +44,7 @@ DEFAULT_SIZE = "1280x720"
 LIMITS_PATH = Path(".data/video_limits.json")
 USER_DAILY_LIMIT = 1
 GUILD_WEEKLY_LIMIT = 2
+GLOBAL_DAILY_LIMIT = 2
 ALLOWED_IMAGE_TYPES = {
     "image/png",
     "image/jpeg",
@@ -261,17 +262,18 @@ class Video(commands.Cog):
 
     async def _load_limits(self) -> dict[str, dict[str, dict[str, object]]]:
         if not LIMITS_PATH.exists():
-            return {"users": {}, "guilds": {}}
+            return {"users": {}, "guilds": {}, "global": {}}
         try:
             raw = LIMITS_PATH.read_text(encoding="utf-8")
             data = json.loads(raw)
         except Exception:
             log.warning("Failed to read %s; starting fresh.", LIMITS_PATH)
-            return {"users": {}, "guilds": {}}
+            return {"users": {}, "guilds": {}, "global": {}}
         if not isinstance(data, dict):
-            return {"users": {}, "guilds": {}}
+            return {"users": {}, "guilds": {}, "global": {}}
         data.setdefault("users", {})
         data.setdefault("guilds", {})
+        data.setdefault("global", {})
         return data  # type: ignore[return-value]
 
     async def _save_limits(self, data: dict[str, dict[str, dict[str, object]]]) -> None:
@@ -293,6 +295,7 @@ class Video(commands.Cog):
             data = await self._load_limits()
             users = data.setdefault("users", {})
             guilds = data.setdefault("guilds", {})
+            global_limits = data.setdefault("global", {})
 
             errors: list[str] = []
             user_entry = users.get(user_id, {})
@@ -319,6 +322,17 @@ class Video(commands.Cog):
                         f"Next reset: {_format_utc(next_week)}."
                     )
 
+            global_day = global_limits.get("day")
+            global_count = int(global_limits.get("count", 0) or 0)
+            if global_day != day_key:
+                global_count = 0
+            if global_count >= GLOBAL_DAILY_LIMIT:
+                errors.append(
+                    "Global /video daily limit reached "
+                    f"({GLOBAL_DAILY_LIMIT} per day across all servers). "
+                    f"Next reset: {_format_utc(next_day)}."
+                )
+
             if errors:
                 return "\n".join(f"• {line}" for line in errors)
 
@@ -333,6 +347,12 @@ class Video(commands.Cog):
                     guild_entry = {"week_start": week_key, "count": 0}
                 guild_entry["count"] = int(guild_entry.get("count", 0) or 0) + 1
                 guilds[guild_id] = guild_entry
+
+            if global_limits.get("day") != day_key:
+                global_limits = {"day": day_key, "count": 0}
+            global_limits["count"] = int(global_limits.get("count", 0) or 0) + 1
+            global_limits["day"] = day_key
+            data["global"] = global_limits
 
             await self._save_limits(data)
 
@@ -860,14 +880,15 @@ class Video(commands.Cog):
             f"`{BOT_PREFIX}video a cozy cabin in falling snow at night` (with an attachment to use as the first frame)\n\n"
             "Bot defaults: model `sora-2`, size `1280x720`, seconds `8`. Reference images are resized to the target size"
             " with letterboxing. Results are asynchronous and can take a few minutes.\n\n"
-            "Limits: each user can run /video once per day across all servers; each server can run /video twice per week "
-            "shared across users. Weekly limits reset at Sunday 00:00 UTC."
+            "Limits: global usage is capped at 2 videos per day across all servers; each user can run /video once per day "
+            "across all servers; each server can run /video twice per week shared across users. Weekly limits reset at "
+            "Sunday 00:00 UTC."
         ),
         extras={
             "category": "AI",
             "destination": (
                 "Generate or remix videos with Sora from prompts, reference images, or a video ID "
-                "(daily per-user and weekly per-server limits apply)."
+                "(daily global, daily per-user, and weekly per-server limits apply)."
             ),
             "plus": (
                 "Attach/URL/link an image to use it as the first frame (auto-resized to target size), "
