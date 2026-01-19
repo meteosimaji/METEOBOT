@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import types
+import uuid
 from io import BytesIO
 from collections import deque
 from dataclasses import dataclass
@@ -25,7 +26,15 @@ from discord.ext import commands
 from PIL import Image as PILImage, ImageOps, UnidentifiedImageError
 from PIL.Image import Image as PILImageType
 
-from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, build_suggestions, defer_interaction, humanize_delta
+from utils import (
+    ASK_ERROR_TAG,
+    BOT_PREFIX,
+    LONG_VIEW_TIMEOUT_S,
+    build_suggestions,
+    defer_interaction,
+    humanize_delta,
+    tag_error_embed,
+)
 from cogs.settime import fmt_ofs, get_guild_offset
 from music import get_player
 
@@ -960,6 +969,23 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 
 MAX_TOOL_TURNS = _env_int("ASK_MAX_TOOL_TURNS", 50, minimum=1)
 TOOL_WARNING_TURN = min(MAX_TOOL_TURNS, _env_int("ASK_TOOL_WARNING_TURN", 40, minimum=1))
+ASK_AUTO_DELETE_DELAY_S = 5
+ASK_AUTO_DELETE_HISTORY_LIMIT = _env_int("ASK_AUTO_DELETE_HISTORY_LIMIT", 50, minimum=1)
+# Override auto-delete behavior for specific commands invoked via /ask.
+# Commands not listed here will auto-delete by default.
+ASK_AUTO_DELETE_OVERRIDES: dict[str, bool] = {
+    "help": False,
+    "image": False,
+    "queue": False,
+    "settime": False,
+    "tex": False,
+    "video": False,
+}
+ASK_AUTO_DELETE_NOTICE = (
+    "This message will auto-delete about "
+    f"{ASK_AUTO_DELETE_DELAY_S} seconds after the final /ask reply. "
+    "Use the stop button to cancel."
+)
 
 MESSAGE_LINK_RE = re.compile(
     r"^https?://(?:ptb\.|canary\.)?(?:discord(?:app)?\.com)/channels/"
@@ -1286,7 +1312,7 @@ class _AskStatusUI:
                 await self.ctx.interaction.response.send_message(**kwargs, ephemeral=eph)
                 return await self.ctx.interaction.original_response()
 
-            return await self.ctx.send(**kwargs)
+            return await self.ctx.reply(**kwargs, mention_author=False)
         except Exception:
             return None
 
@@ -1616,6 +1642,43 @@ class _ResetConfirmView(discord.ui.View):
         self.stop()
 
 
+class _AskAutoDeleteButton(discord.ui.Button):
+    def __init__(self, cog: "Ask", message_id: int, author_id: int) -> None:
+        super().__init__(label="Stop auto-delete", style=discord.ButtonStyle.secondary)
+        self._cog = cog
+        self._message_id = message_id
+        self._author_id = author_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self._author_id:
+            await interaction.response.send_message(
+                "Only the person who ran the command can use this button.", ephemeral=True
+            )
+            return
+
+        if not self._cog.cancel_ask_auto_delete(self._message_id):
+            await interaction.response.send_message(
+                "This message has already been deleted or can't be stopped.", ephemeral=True
+            )
+            return
+
+        embeds = []
+        try:
+            embeds = list(getattr(interaction.message, "embeds", []) or [])
+        except Exception:
+            embeds = []
+        cleaned_embeds = self._cog._strip_auto_delete_notice(embeds)
+
+        view = self.view
+        if view is not None:
+            view.remove_item(self)
+        try:
+            await interaction.response.edit_message(embeds=cleaned_embeds, view=None)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await interaction.followup.send("Auto-delete stopped.", ephemeral=True)
+
+
 class Ask(commands.Cog):
     """Ask the AI (with optional web search)."""
 
@@ -1633,9 +1696,19 @@ class Ask(commands.Cog):
 
         repo_root = Path(__file__).resolve().parent.parent
         self.shell_executor = ReadOnlyShellExecutor(ShellPolicy(root_dir=repo_root))
+        self._ask_autodelete_tasks: dict[int, asyncio.Task] = {}
+        self._ask_autodelete_pending: dict[str, dict[int, discord.Message]] = {}
+        self._ask_run_ids_by_ctx: dict[int, list[str]] = {}
 
         if not hasattr(self.bot, "ai_last_response_id"):
             self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
+
+    def _ctx_key(self, ctx: commands.Context) -> int:
+        if getattr(ctx, "interaction", None) is not None and ctx.interaction:
+            return ctx.interaction.id
+        if getattr(ctx, "message", None) is not None and ctx.message:
+            return ctx.message.id
+        return id(ctx)
 
     async def cog_load(self) -> None:
         existing = self.bot.tree.get_command("ask", type=AppCommandType.chat_input)
@@ -1658,6 +1731,10 @@ class Ask(commands.Cog):
             self.bot.tree.remove_command("ask", type=AppCommandType.chat_input)
         except Exception:
             log.exception("Failed to unregister /ask slash command")
+        for task in self._ask_autodelete_tasks.values():
+            task.cancel()
+        self._ask_autodelete_tasks.clear()
+        self._ask_autodelete_pending.clear()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -2308,6 +2385,13 @@ class Ask(commands.Cog):
             reason = str(exc) or exc.__class__.__name__
             return False, reason
 
+    def _requires_admin(self, command: commands.Command) -> bool:
+        for check in getattr(command, "checks", []) or []:
+            perms = getattr(check, "guild_permissions", None)
+            if perms and getattr(perms, "administrator", False):
+                return True
+        return False
+
     async def _function_router(
         self, ctx: commands.Context, name: str, args: dict[str, Any]
     ) -> dict[str, Any] | str:
@@ -2388,6 +2472,11 @@ class Ask(commands.Cog):
                 ),
             }
 
+        if self._requires_admin(command):
+            perms = getattr(ctx.author, "guild_permissions", None) if ctx.guild else None
+            if not perms or not getattr(perms, "administrator", False):
+                return {"ok": False, "error": "no_permission", "reason": "admin_only"}
+
         if not can_run:
             return {"ok": False, "error": "no_permission", "reason": can_run_reason}
 
@@ -2435,6 +2524,9 @@ class Ask(commands.Cog):
                 ),
             }
 
+        run_id = uuid.uuid4().hex
+        ctx_key = self._ctx_key(ctx)
+        run_ids = self._ask_run_ids_by_ctx.setdefault(ctx_key, [])
         history_after = self._history_after(ctx)
 
         if arg:
@@ -2481,7 +2573,17 @@ class Ask(commands.Cog):
                         player = get_player(self.bot, ctx.guild)
                         before_add_count = len(player.added_tracks)
 
+                history_after = datetime.now(timezone.utc) - timedelta(seconds=2)
                 await ctx.invoke(command, **{single_param.name: converted})
+                bot_messages = await self._collect_bot_message_objects(
+                    ctx,
+                    after=history_after,
+                    limit=ASK_AUTO_DELETE_HISTORY_LIMIT,
+                    author_id=ctx.author.id,
+                )
+                await self._attach_ask_auto_delete(ctx, bot_messages, root_name=root_name, run_id=run_id)
+                if run_ids is not None:
+                    run_ids.append(run_id)
                 ran = f"{command.qualified_name} {arg}".strip()
                 response: dict[str, Any] = {"ok": True, "ran": ran}
                 if ctx.guild is not None and root_name in {"play", "remove"}:
@@ -2579,7 +2681,17 @@ class Ask(commands.Cog):
             return {"ok": False, "error": "arguments_not_supported"}
 
         try:
+            history_after = datetime.now(timezone.utc) - timedelta(seconds=2)
             await ctx.invoke(command)
+            bot_messages = await self._collect_bot_message_objects(
+                ctx,
+                after=history_after,
+                limit=ASK_AUTO_DELETE_HISTORY_LIMIT,
+                author_id=ctx.author.id,
+            )
+            await self._attach_ask_auto_delete(ctx, bot_messages, root_name=root_name, run_id=run_id)
+            if run_ids is not None:
+                run_ids.append(run_id)
             response: dict[str, Any] = {"ok": True, "ran": command.qualified_name}
             messages = await self._collect_bot_messages(ctx, after=history_after)
             if messages:
@@ -2604,6 +2716,200 @@ class Ask(commands.Cog):
         if getattr(ctx, "interaction", None) is not None and ctx.interaction:
             return discord.utils.snowflake_time(ctx.interaction.id)
         return datetime.now(timezone.utc)
+
+    def _should_auto_delete_command(self, root_name: str) -> bool:
+        return ASK_AUTO_DELETE_OVERRIDES.get(root_name, True)
+
+    def cancel_ask_auto_delete(self, message_id: int) -> bool:
+        task = self._ask_autodelete_tasks.pop(message_id, None)
+        if task and not task.done():
+            task.cancel()
+        pending_found = False
+        for run_id in list(self._ask_autodelete_pending.keys()):
+            bucket = self._ask_autodelete_pending.get(run_id, {})
+            if message_id in bucket:
+                bucket.pop(message_id, None)
+                pending_found = True
+            if not bucket:
+                self._ask_autodelete_pending.pop(run_id, None)
+        return bool(task or pending_found)
+
+    def _is_error_message(self, message: discord.Message) -> bool:
+        content = message.content or ""
+        if ASK_ERROR_TAG in content:
+            return True
+
+        for embed in message.embeds or []:
+            footer_text = embed.footer.text if embed.footer else ""
+            if footer_text and ASK_ERROR_TAG in footer_text:
+                return True
+            if embed.description and ASK_ERROR_TAG in embed.description:
+                return True
+        return False
+
+    def _build_autodelete_view(
+        self, message: discord.Message, *, author_id: int
+    ) -> tuple[discord.ui.View | None, bool]:
+        if message.components:
+            return None, False
+
+        view = discord.ui.View(timeout=LONG_VIEW_TIMEOUT_S)
+        view.add_item(_AskAutoDeleteButton(self, message.id, author_id))
+        return view, True
+
+    def _is_auto_delete_notice_embed(self, embed: discord.Embed) -> bool:
+        if embed.description != ASK_AUTO_DELETE_NOTICE:
+            return False
+        if embed.title:
+            return False
+        if embed.fields:
+            return False
+        if embed.footer and embed.footer.text:
+            return False
+        if embed.author:
+            return False
+        if embed.image and embed.image.url:
+            return False
+        if embed.thumbnail and embed.thumbnail.url:
+            return False
+        return True
+
+    def _strip_auto_delete_notice(self, embeds: list[discord.Embed]) -> list[discord.Embed]:
+        if not embeds:
+            return []
+        updated: list[discord.Embed] = []
+        applied = False
+        for embed in embeds:
+            if self._is_auto_delete_notice_embed(embed):
+                continue
+            if not applied:
+                copy = embed.copy()
+                footer_text = ""
+                if copy.footer and copy.footer.text:
+                    footer_text = copy.footer.text
+                needle = f" • {ASK_AUTO_DELETE_NOTICE}"
+                if footer_text.endswith(needle):
+                    footer_text = footer_text[: -len(needle)]
+                elif footer_text == ASK_AUTO_DELETE_NOTICE:
+                    footer_text = ""
+                if footer_text:
+                    copy.set_footer(text=footer_text)
+                else:
+                    copy.set_footer(text=None)
+                updated.append(copy)
+                applied = True
+            else:
+                updated.append(embed)
+        return updated
+
+    async def _collect_bot_message_objects(
+        self,
+        ctx: commands.Context,
+        *,
+        after: datetime,
+        limit: int = ASK_AUTO_DELETE_HISTORY_LIMIT,
+        author_id: int | None = None,
+    ) -> list[discord.Message]:
+        channel = getattr(ctx, "channel", None)
+        if channel is None:
+            return []
+
+        bot_user = getattr(self.bot, "user", None)
+        if bot_user is None:
+            return []
+
+        try:
+            messages = []
+            async for message in channel.history(limit=limit, after=after):
+                if message.author.id != bot_user.id:
+                    continue
+                if author_id is not None:
+                    interaction = getattr(message, "interaction", None)
+                    ctx_interaction = getattr(ctx, "interaction", None)
+                    if interaction:
+                        if ctx_interaction is not None:
+                            if interaction.id != ctx_interaction.id:
+                                continue
+                        elif interaction.user.id != author_id:
+                            continue
+                    else:
+                        ctx_message = getattr(ctx, "message", None)
+                        if ctx_message:
+                            if not message.reference or not message.reference.message_id:
+                                continue
+                            if message.reference.message_id != ctx_message.id:
+                                continue
+                        elif ctx_interaction is not None:
+                            continue
+                messages.append(message)
+        except Exception:
+            return []
+
+        messages.sort(key=lambda m: m.created_at)
+        return messages
+
+    def _apply_auto_delete_notice(self, embeds: list[discord.Embed]) -> list[discord.Embed]:
+        if any(self._is_auto_delete_notice_embed(embed) for embed in embeds):
+            return list(embeds)
+
+        notice_embed = discord.Embed(description=ASK_AUTO_DELETE_NOTICE, color=0x95A5A6)
+        if not embeds:
+            return [notice_embed]
+        return [*embeds, notice_embed]
+
+    async def _attach_ask_auto_delete(
+        self,
+        ctx: commands.Context,
+        messages: list[discord.Message],
+        *,
+        root_name: str,
+        run_id: str,
+    ) -> None:
+        pending = self._ask_autodelete_pending.setdefault(run_id, {})
+        for message in messages:
+            if message.id in self._ask_autodelete_tasks or message.id in pending:
+                continue
+            if not self._should_auto_delete_command(root_name) and not self._is_error_message(message):
+                continue
+            if message.components:
+                if self._is_error_message(message):
+                    pending[message.id] = message
+                continue
+
+            try:
+                view, _ = self._build_autodelete_view(message, author_id=ctx.author.id)
+                embeds = self._apply_auto_delete_notice(list(message.embeds or []))
+                if view is not None:
+                    await message.edit(embeds=embeds, view=view)
+                else:
+                    await message.edit(embeds=embeds)
+            except Exception:
+                pass
+
+            pending[message.id] = message
+
+    def _start_pending_ask_auto_delete(self, run_id: str) -> None:
+        pending = self._ask_autodelete_pending.pop(run_id, {})
+        if not pending:
+            return
+
+        for message_id, message in pending.items():
+            if message_id in self._ask_autodelete_tasks:
+                continue
+
+            async def _delete_later(msg: discord.Message) -> None:
+                try:
+                    await asyncio.sleep(ASK_AUTO_DELETE_DELAY_S)
+                    await msg.delete()
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    return
+                finally:
+                    self._ask_autodelete_tasks.pop(msg.id, None)
+
+            task = asyncio.create_task(_delete_later(message))
+            self._ask_autodelete_tasks[message_id] = task
 
     async def _responses_create(self, **kwargs: Any):
         if self._async_client:
@@ -2762,7 +3068,7 @@ class Ask(commands.Cog):
             else:
                 await ctx.interaction.response.send_message(**kwargs)
         else:
-            await ctx.send(**kwargs)
+            await ctx.reply(**kwargs, mention_author=False)
 
     @commands.command(
         name="ask",
@@ -2961,7 +3267,7 @@ class Ask(commands.Cog):
                     )
                     prompt_message = await ctx.interaction.original_response()
                 else:
-                    prompt_message = await ctx.send(embed=prompt_embed, view=view)
+                    prompt_message = await ctx.reply(embed=prompt_embed, view=view, mention_author=False)
             except Exception:
                 log.exception("Failed to send ask reset confirmation")
                 return
@@ -3203,6 +3509,8 @@ class Ask(commands.Cog):
             "For clean math rendering, call /tex (single arg) only when the user wants a rendered equation or when plain text would break; keep your text response short and reference the attached image. Wrap equations with math delimiters ($...$ or \\[...\\]); single-line expressions auto-wrap by default but explicit delimiters are preferred. For multi-line equations, use \\[\\begin{aligned} ... \\end{aligned}\\] and align equals with &. Example /tex calls: bot_invoke({'name': 'tex', 'arg': '\\[E=mc^2\\]'}); for full documents: bot_invoke({'name': 'tex', 'arg': '\\documentclass[preview]{standalone}\\n\\usepackage{amsmath}\\n\\begin{document}\\n\\[a^2+b^2=c^2\\]\\n\\end{document}\\n'}). "
             "Use bot_invoke only for safe commands. bot_invoke always requires an arg field: "
             "use arg:'' only when the command truly takes no argument or you want to omit an optional one. "
+            "Replies from commands run via bot_invoke auto-delete after 5 seconds (use the stop button to cancel). "
+            "However, /image, /video, /tex, /help, /queue, and /settime usually remain (errors are deleted). "
             f"{required_arg_note}"
             "For optional single-argument commands (e.g., /help topic or /userinfo @name), include arg when needed; "
             "otherwise pass ''. "
@@ -3360,6 +3668,8 @@ class Ask(commands.Cog):
             embed.set_footer(text=" | ".join(footer_parts))
 
             await self._reply(ctx, embed=embed)
+            for run_id in self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), []):
+                self._start_pending_ask_auto_delete(run_id)
             with contextlib.suppress(Exception):
                 await status_ui.finish(ok=True)
 
@@ -3373,10 +3683,13 @@ class Ask(commands.Cog):
                 description="An error occurred while calling the OpenAI API. Check the logs for details.",
                 color=0xFF0000,
             )
+            error_embed = tag_error_embed(error_embed)
             try:
                 await self._reply(ctx, embed=error_embed)
             except Exception:
                 pass
+            for run_id in self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), []):
+                self._start_pending_ask_auto_delete(run_id)
 
 
 async def setup(bot: commands.Bot) -> None:

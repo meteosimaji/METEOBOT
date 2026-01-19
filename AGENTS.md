@@ -13,6 +13,9 @@
   and event so the `/help` output is easy to understand.
 - Whenever a command or event is added or changed, update the README's lists of
   commands and events (sorted alphabetically).
+- `/ask` tool-call auto-delete behavior is configured in `commands/ask.py` via
+  `ASK_AUTO_DELETE_OVERRIDES`; if you change the defaults, update the README's
+  "Ask tool auto-delete" section to match.
 
 - For any code change run syntax checks with:
   ```bash

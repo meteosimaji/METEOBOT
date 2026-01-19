@@ -16,7 +16,7 @@ import discord
 from discord.ext import commands
 from PIL import Image as PILImage, ImageOps, UnidentifiedImageError, features as PILFeatures
 
-from utils import BOT_PREFIX, defer_interaction, safe_reply
+from utils import BOT_PREFIX, defer_interaction, safe_reply, tag_error_embed, tag_error_text
 
 HEIF_ENABLED = False
 try:  # Optional HEIC/HEIF support
@@ -980,7 +980,9 @@ class Video(commands.Cog):
         if not prompt or not prompt.strip():
             return await safe_reply(
                 ctx,
-                "Tell me what to create first. Describe shot type, subject, action, setting, and lighting.",
+                tag_error_text(
+                    "Tell me what to create first. Describe shot type, subject, action, setting, and lighting."
+                ),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -991,14 +993,14 @@ class Video(commands.Cog):
         except ValueError as exc:
             return await safe_reply(
                 ctx,
-                str(exc),
+                tag_error_text(str(exc)),
                 ephemeral=True,
                 mention_author=False,
             )
         if remix_id and not prompt:
             return await safe_reply(
                 ctx,
-                "Remix requests need a prompt describing the change.",
+                tag_error_text("Remix requests need a prompt describing the change."),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -1021,6 +1023,7 @@ class Video(commands.Cog):
                 ),
                 color=0xFF0000,
             )
+            error_embed = tag_error_embed(error_embed)
             note_text = "\n".join(notes)
             error_embed.add_field(name="Notes", value=note_text[:1024], inline=False)
             await safe_reply(ctx, embed=error_embed, ephemeral=True, mention_author=False)
@@ -1029,7 +1032,7 @@ class Video(commands.Cog):
         if not getattr(self.client, "api_key", None):
             return await safe_reply(
                 ctx,
-                "OPENAI_TOKEN is not set, so I can't generate videos right now.",
+                tag_error_text("OPENAI_TOKEN is not set, so I can't generate videos right now."),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -1038,7 +1041,7 @@ class Video(commands.Cog):
         if limit_error:
             return await safe_reply(
                 ctx,
-                "⏳ Video usage limit reached:\n" + limit_error,
+                tag_error_text("⏳ Video usage limit reached:\n" + limit_error),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -1072,6 +1075,7 @@ class Video(commands.Cog):
                     ),
                     color=0xFF0000,
                 )
+                conflict_embed = tag_error_embed(conflict_embed)
                 if notes:
                     conflict_embed.add_field(
                         name="Notes",
@@ -1215,6 +1219,7 @@ class Video(commands.Cog):
                 description=description,
                 color=0xFF0000,
             )
+            error_embed = tag_error_embed(error_embed)
             if notes:
                 note_text = "\n".join(notes)
                 error_embed.add_field(name="Notes", value=note_text[:1024], inline=False)

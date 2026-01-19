@@ -13,7 +13,7 @@ from typing import Iterable
 import discord
 from discord.ext import commands
 
-from utils import BOT_PREFIX, defer_interaction, sanitize
+from utils import BOT_PREFIX, defer_interaction, sanitize, tag_error_text
 
 log = logging.getLogger(__name__)
 LINK_RE = re.compile(r"https?://", re.IGNORECASE)
@@ -371,21 +371,22 @@ class Messages(commands.Cog):
             amount = max(1, min(50, int(parsed.limit)))
 
             if not hasattr(ctx.channel, "history"):
+                error_message = tag_error_text("This channel type is not supported.")
                 if ctx.interaction and ctx.interaction.response.is_done():
                     await ctx.interaction.followup.send(
-                        "This channel type is not supported.",
+                        error_message,
                         ephemeral=True,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 elif ctx.interaction:
                     await ctx.interaction.response.send_message(
-                        "This channel type is not supported.",
+                        error_message,
                         ephemeral=True,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 else:
                     await ctx.reply(
-                        "This channel type is not supported.",
+                        error_message,
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
@@ -481,7 +482,7 @@ class Messages(commands.Cog):
                 )
         except discord.Forbidden:
             log.exception("Missing permissions to fetch channel history")
-            message = "I don't have permission to read messages in this channel."
+            message = tag_error_text("I don't have permission to read messages in this channel.")
             if ctx.interaction:
                 if ctx.interaction.response.is_done():
                     await ctx.interaction.followup.send(
@@ -497,7 +498,7 @@ class Messages(commands.Cog):
                 )
         except discord.HTTPException:
             log.exception("Discord API rejected messages response")
-            message = "Discord rejected the response. Please try a smaller count."
+            message = tag_error_text("Discord rejected the response. Please try a smaller count.")
             if ctx.interaction:
                 if ctx.interaction.response.is_done():
                     await ctx.interaction.followup.send(
@@ -513,7 +514,7 @@ class Messages(commands.Cog):
                 )
         except Exception:
             log.exception("Failed to fetch messages")
-            message = "Could not fetch messages right now."
+            message = tag_error_text("Could not fetch messages right now.")
             if ctx.interaction:
                 if ctx.interaction.response.is_done():
                     await ctx.interaction.followup.send(

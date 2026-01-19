@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, safe_reply
+from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, safe_reply, tag_error_text
 
 DATA_PATH = Path("guild_timezones.json")  # { "<guild_id>": int_offset }
 MIN_OFS, MAX_OFS = -12, 14  # UTC-12 .. UTC+14
@@ -116,8 +116,15 @@ class TzView(discord.ui.View):
         await interaction.response.edit_message(embed=make_embed(self.guild, self.ofs), view=self)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                tag_error_text("Only the admin who invoked this can use these buttons."), ephemeral=True
+            )
+            return False
         if interaction.user and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only administrators can use this action.", ephemeral=True)
+            await interaction.response.send_message(
+                tag_error_text("Only administrators can use this action."), ephemeral=True
+            )
             return False
         return True
 
@@ -184,7 +191,12 @@ class SetTime(commands.Cog):
     async def settime(self, ctx: commands.Context):
         await defer_interaction(ctx)
         if ctx.guild is None:
-            await safe_reply(ctx, "Please use this inside a server.", mention_author=False, ephemeral=True)
+            await safe_reply(
+                ctx,
+                tag_error_text("Please use this inside a server."),
+                mention_author=False,
+                ephemeral=True,
+            )
             return
         ofs = get_guild_offset(self.bot, ctx.guild.id)
         view = TzView(self.bot, ctx.guild, ofs, author_id=ctx.author.id)

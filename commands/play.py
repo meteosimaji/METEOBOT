@@ -15,7 +15,7 @@ from discord.ext import commands
 import yt_dlp
 
 from music import Track, VoiceConnectionError, get_player, resolve_track
-from utils import humanize_delta, defer_interaction, safe_reply, BOT_PREFIX
+from utils import BOT_PREFIX, defer_interaction, humanize_delta, safe_reply, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -149,7 +149,9 @@ class Play(commands.Cog):
     ) -> None:
         """Play music from a search term or URL (LLM/tooling must supply one text arg)."""
         if ctx.guild is None:
-            return await safe_reply(ctx, "This command can only be used in a server.", mention_author=False)
+            return await safe_reply(
+                ctx, tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
 
         # Attachments (prefix or slash) count as file candidates.
@@ -172,7 +174,12 @@ class Play(commands.Cog):
             is_direct_file = _is_url(source) and (ext in SUPPORTED)
 
         if not source and not has_attachments:
-            return await safe_reply(ctx, "Provide a song name, URL or attach a file.", ephemeral=True, mention_author=False)
+            return await safe_reply(
+                ctx,
+                tag_error_text("Provide a song name, URL or attach a file."),
+                ephemeral=True,
+                mention_author=False,
+            )
 
         # File-mode: attachments, direct file URLs, or (admin-only) local paths.
         if has_attachments or is_local_path or is_direct_file:
@@ -211,7 +218,11 @@ class Play(commands.Cog):
                 candidates = unique
 
             if not candidates and not rejected:
-                return await safe_reply(ctx, "Attach a file or provide a URL/path first.", mention_author=False)
+                return await safe_reply(
+                    ctx,
+                    tag_error_text("Attach a file or provide a URL/path first."),
+                    mention_author=False,
+                )
 
             accepted: list[tuple[str, str]] = []
             for title, src, ext in candidates:
@@ -224,22 +235,28 @@ class Play(commands.Cog):
                 if direct_rejects:
                     return await safe_reply(
                         ctx,
-                        "🚫 Direct URLs to private or local addresses are not allowed.",
+                        tag_error_text("🚫 Direct URLs to private or local addresses are not allowed."),
                         mention_author=False,
                     )
                 if policy_rejects and set(rejected) == set(policy_rejects):
-                    return await safe_reply(ctx, "🚫 Local file paths are **admin-only** for security.", mention_author=False)
+                    return await safe_reply(
+                        ctx,
+                        tag_error_text("🚫 Local file paths are **admin-only** for security."),
+                        mention_author=False,
+                    )
                 return await safe_reply(
                     ctx,
-                    "❌ This file type isn't supported.\n"
-                    "Direct files: wav/flac/mp3/m4a/aac/ogg/opus/mp4/mkv/webm/mov/mka\n"
-                    "Tip: YouTube/Spotify/Niconico URLs are not direct links, so just paste them as-is.",
+                    tag_error_text(
+                        "❌ This file type isn't supported.\n"
+                        "Direct files: wav/flac/mp3/m4a/aac/ogg/opus/mp4/mkv/webm/mov/mka\n"
+                        "Tip: YouTube/Spotify/Niconico URLs are not direct links, so just paste them as-is."
+                    ),
                     mention_author=False,
                 )
 
             ok, res = await _ensure_joined(ctx)
             if not ok:
-                return await safe_reply(ctx, str(res), ephemeral=True, mention_author=False)
+                return await safe_reply(ctx, tag_error_text(str(res)), ephemeral=True, mention_author=False)
             player = res  # type: ignore[assignment]
 
             first: Track | None = None
@@ -284,11 +301,23 @@ class Play(commands.Cog):
             if rejected:
                 ext_rejected = [r for r in rejected if r not in policy_rejects + direct_rejects]
                 if ext_rejected:
-                    await safe_reply(ctx, "⚠️ Skipped unsupported: " + ", ".join(ext_rejected), mention_author=False)
+                    await safe_reply(
+                        ctx,
+                        tag_error_text("⚠️ Skipped unsupported: " + ", ".join(ext_rejected)),
+                        mention_author=False,
+                    )
                 if policy_rejects:
-                    await safe_reply(ctx, "🚫 Skipped local path (admin-only): " + ", ".join(policy_rejects), mention_author=False)
+                    await safe_reply(
+                        ctx,
+                        tag_error_text("🚫 Skipped local path (admin-only): " + ", ".join(policy_rejects)),
+                        mention_author=False,
+                    )
                 if direct_rejects:
-                    await safe_reply(ctx, "🚫 Skipped unsafe direct URL: " + ", ".join(direct_rejects), mention_author=False)
+                    await safe_reply(
+                        ctx,
+                        tag_error_text("🚫 Skipped unsafe direct URL: " + ", ".join(direct_rejects)),
+                        mention_author=False,
+                    )
             return
 
         # Search / page URL mode => yt-dlp resolve
@@ -296,11 +325,13 @@ class Play(commands.Cog):
 
     async def _queue_from_resolve(self, ctx: commands.Context, source: str | None) -> None:
         if not source:
-            return await safe_reply(ctx, "Provide a song name or URL.", ephemeral=True, mention_author=False)
+            return await safe_reply(
+                ctx, tag_error_text("Provide a song name or URL."), ephemeral=True, mention_author=False
+            )
 
         ok, res = await _ensure_joined(ctx)
         if not ok:
-            return await safe_reply(ctx, str(res), ephemeral=True, mention_author=False)
+            return await safe_reply(ctx, tag_error_text(str(res)), ephemeral=True, mention_author=False)
         player = res  # type: ignore[assignment]
 
         # resolve_track may return Track or AsyncIterator[Track] for playlists.
@@ -310,8 +341,10 @@ class Play(commands.Cog):
             log.exception("yt-dlp extraction failed")
             return await safe_reply(
                 ctx,
-                "No results found. Try adding 'MV' or the official artist name, "
-                "or paste the exact video URL if you have it.",
+                tag_error_text(
+                    "No results found. Try adding 'MV' or the official artist name, "
+                    "or paste the exact video URL if you have it."
+                ),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -319,8 +352,10 @@ class Play(commands.Cog):
             log.exception("Network error during yt-dlp extraction")
             return await safe_reply(
                 ctx,
-                "The source service is unreachable; try again later. If you have the exact URL, "
-                "you can paste it to avoid search misses.",
+                tag_error_text(
+                    "The source service is unreachable; try again later. If you have the exact URL, "
+                    "you can paste it to avoid search misses."
+                ),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -328,7 +363,7 @@ class Play(commands.Cog):
             log.exception("yt-dlp extraction failed")
             return await safe_reply(
                 ctx,
-                "Failed to fetch that track. If this is a specific video, try the direct URL.",
+                tag_error_text("Failed to fetch that track. If this is a specific video, try the direct URL."),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -373,7 +408,9 @@ class Play(commands.Cog):
             finally:
                 await player.end_playlist()
             if count == 0:
-                return await safe_reply(ctx, "No tracks found.", ephemeral=True, mention_author=False)
+                return await safe_reply(
+                    ctx, tag_error_text("No tracks found."), ephemeral=True, mention_author=False
+                )
             if count > 1 and message and first:
                 embed = discord.Embed(
                     title="🎵 Playlist Added",

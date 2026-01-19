@@ -14,7 +14,7 @@ import discord
 from discord.ext import commands
 from PIL import Image
 
-from utils import defer_interaction
+from utils import defer_interaction, tag_error_embed, tag_error_text
 
 
 DEFAULT_DPI = 300
@@ -725,9 +725,10 @@ class Tex(commands.Cog):
                 description=f"```\n{msg}\n```",
                 color=0xE74C3C,
             )
+            error_embed = tag_error_embed(error_embed)
             await _send_response(
                 ctx,
-                content=f"TeX render failed:\n```\n{msg}\n```",
+                content=tag_error_text(f"TeX render failed:\n```\n{msg}\n```"),
                 embed=error_embed,
                 mention_author=False,
             )
@@ -738,9 +739,10 @@ class Tex(commands.Cog):
                 description=f"```\n{repr(e)}\n```",
                 color=0xE74C3C,
             )
+            error_embed = tag_error_embed(error_embed)
             await _send_response(
                 ctx,
-                content=f"Unexpected TeX error:\n```\n{repr(e)}\n```",
+                content=tag_error_text(f"Unexpected TeX error:\n```\n{repr(e)}\n```"),
                 embed=error_embed,
                 mention_author=False,
             )
@@ -750,8 +752,10 @@ class Tex(commands.Cog):
             error_msg = "Internal error: rendered PNG variant counts differ."
             await _send_response(
                 ctx,
-                content=error_msg,
-                embed=discord.Embed(title="⚠️ TeX Render Failed", description=error_msg, color=0xE74C3C),
+                content=tag_error_text(error_msg),
+                embed=tag_error_embed(
+                    discord.Embed(title="⚠️ TeX Render Failed", description=error_msg, color=0xE74C3C)
+                ),
             )
             return
 
@@ -808,9 +812,10 @@ class Tex(commands.Cog):
                     description="Internal error: render completed but no previews were produced.",
                     color=0xE74C3C,
                 )
+                error_embed = tag_error_embed(error_embed)
                 await _send_response(
                     ctx,
-                    content=error_embed.description,
+                    content=tag_error_text(error_embed.description or ""),
                     embed=error_embed,
                     mention_author=False,
                 )

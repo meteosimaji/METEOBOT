@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 
 from music import get_player
-from utils import BOT_PREFIX, defer_interaction, safe_reply
+from utils import BOT_PREFIX, defer_interaction, safe_reply, tag_error_text
 
 
 class AutoLeave(commands.Cog):
@@ -32,7 +32,9 @@ class AutoLeave(commands.Cog):
     )
     async def autoleave(self, ctx: commands.Context, state: str | None = None) -> None:
         if ctx.guild is None:
-            return await safe_reply(ctx, "This command can only be used in a server.", mention_author=False)
+            return await safe_reply(
+                ctx, tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
 
         player = get_player(self.bot, ctx.guild)
@@ -41,7 +43,7 @@ class AutoLeave(commands.Cog):
         if normalized not in {"on", "off", "now"}:
             return await safe_reply(
                 ctx,
-                "Choose **ON**, **OFF**, or **NOW** (case-insensitive).",
+                tag_error_text("Choose **ON**, **OFF**, or **NOW** (case-insensitive)."),
                 mention_author=False,
             )
 

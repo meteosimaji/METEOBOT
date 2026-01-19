@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
-from utils import defer_interaction, BOT_PREFIX
+from utils import BOT_PREFIX, defer_interaction, tag_error_embed
 
 log = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ class Ping(commands.Cog):
             if ctx.interaction:
                 await ctx.interaction.followup.send(embed=embed)
             else:
-                await ctx.send(embed=embed)
+                await ctx.reply(embed=embed, mention_author=False)
         except Exception:
             log.exception("Failed to execute ping command")
             error_embed = discord.Embed(
@@ -82,11 +82,12 @@ class Ping(commands.Cog):
                 description="An error occurred while measuring latency.",
                 color=0xFF0000,
             )
+            error_embed = tag_error_embed(error_embed)
             try:
                 if ctx.interaction:
                     await ctx.interaction.followup.send(embed=error_embed, ephemeral=True)
                 else:
-                    await ctx.send(embed=error_embed)
+                    await ctx.reply(embed=error_embed, mention_author=False)
             except Exception:
                 pass
 

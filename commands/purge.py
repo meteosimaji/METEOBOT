@@ -15,7 +15,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, safe_reply, strip_markdown
+from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, safe_reply, strip_markdown, tag_error_text
 
 CONFIRM_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
@@ -437,52 +437,58 @@ class Purge(commands.Cog):
         await defer_interaction(ctx)
 
         if ctx.guild is None:
-            return await safe_reply(ctx, "Use this in a server text channel.", mention_author=False)
+            return await safe_reply(
+                ctx, tag_error_text("Use this in a server text channel."), mention_author=False
+            )
 
         try:
             tokens = shlex.split(query or "")
         except ValueError:
             return await safe_reply(
                 ctx,
-                "Invalid quotes in the query. If you use phrases, wrap them like: `/purge \"spam*\"`",
+                tag_error_text(
+                    "Invalid quotes in the query. If you use phrases, wrap them like: `/purge \"spam*\"`"
+                ),
                 ephemeral=True,
                 mention_author=False,
             )
 
         if not tokens:
             return await safe_reply(
-                ctx, "Specify an amount or filter.", ephemeral=True, mention_author=False
+                ctx, tag_error_text("Specify an amount or filter."), ephemeral=True, mention_author=False
             )
 
         try:
             data = await parse_query(ctx, tokens)
         except ValueError as e:
-            return await safe_reply(ctx, str(e), ephemeral=True, mention_author=False)
+            return await safe_reply(ctx, tag_error_text(str(e)), ephemeral=True, mention_author=False)
 
         channel = data.channel
         if not isinstance(channel, discord.abc.Messageable):
-            return await safe_reply(ctx, "Channel not found.", ephemeral=True, mention_author=False)
+            return await safe_reply(
+                ctx, tag_error_text("Channel not found."), ephemeral=True, mention_author=False
+            )
 
         try:
             target_ids, counts, mentions = await _collect_targets(ctx, data)
         except discord.Forbidden:
             return await safe_reply(
                 ctx,
-                "I don't have permission to read message history in that channel.",
+                tag_error_text("I don't have permission to read message history in that channel."),
                 ephemeral=True,
                 mention_author=False,
             )
         except discord.NotFound:
             return await safe_reply(
                 ctx,
-                "One of the referenced messages couldn't be found.",
+                tag_error_text("One of the referenced messages couldn't be found."),
                 ephemeral=True,
                 mention_author=False,
             )
         except Exception:
             return await safe_reply(
                 ctx,
-                "Failed to build a purge list. Check links/IDs and permissions.",
+                tag_error_text("Failed to build a purge list. Check links/IDs and permissions."),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -493,7 +499,7 @@ class Purge(commands.Cog):
         if not target_ids:
             return await safe_reply(
                 ctx,
-                "No messages matched the query.",
+                tag_error_text("No messages matched the query."),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -571,7 +577,13 @@ class Purge(commands.Cog):
             with contextlib.suppress(Exception):
                 await msg.delete()
         else:
-            await ctx.send(f"Deleted {deleted} message(s).", delete_after=5)
+            reference = ctx.message.to_reference(fail_if_not_exists=False)
+            await ctx.reply(
+                f"Deleted {deleted} message(s).",
+                delete_after=5,
+                mention_author=False,
+                reference=reference,
+            )
 
 
 async def setup(bot: commands.Bot) -> None:

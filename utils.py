@@ -9,6 +9,7 @@ from typing import Iterable, List, Sequence, Tuple
 BOT_PREFIX = os.getenv("BOT_PREFIX", "c!")
 LONG_VIEW_TIMEOUT_S = 60 * 60 * 24 * 7  # 7 days
 SUGGESTION_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
+ASK_ERROR_TAG = "\u2063ASKERR\u2063"
 
 
 def humanize_delta(seconds: float) -> str:
@@ -32,8 +33,23 @@ def format_timestamp(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def tag_error_embed(embed: discord.Embed) -> discord.Embed:
+    footer_text = ""
+    if embed.footer and embed.footer.text:
+        footer_text = embed.footer.text
+    if ASK_ERROR_TAG not in footer_text:
+        embed.set_footer(text=f"{footer_text} {ASK_ERROR_TAG}".strip() if footer_text else ASK_ERROR_TAG)
+    return embed
+
+
+def tag_error_text(text: str) -> str:
+    if ASK_ERROR_TAG in text:
+        return text
+    return f"{text}\n{ASK_ERROR_TAG}"
+
+
 def error_embed(title: str = "⚠️ Error", desc: str = "Something went wrong.") -> discord.Embed:
-    return discord.Embed(title=title, description=desc, color=0xFF0000)
+    return tag_error_embed(discord.Embed(title=title, description=desc, color=0xFF0000))
 
 
 async def defer_interaction(ctx: commands.Context) -> None:
@@ -73,7 +89,10 @@ async def ensure_voice(ctx: commands.Context) -> bool:
         or ctx.author.voice.channel != guild.voice_client.channel
     ):
         await safe_reply(
-            ctx, "Join my voice channel first.", mention_author=False, ephemeral=True
+            ctx,
+            tag_error_text("Join my voice channel first."),
+            mention_author=False,
+            ephemeral=True,
         )
         return False
     return True

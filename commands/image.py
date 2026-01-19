@@ -29,7 +29,7 @@ PILImage.MAX_IMAGE_PIXELS = 4096 * 4096 * 4
 DecompressionBombError = getattr(PILImage, "DecompressionBombError", OSError)
 DecompressionBombWarning = getattr(PILImage, "DecompressionBombWarning", Warning)
 
-from utils import BOT_PREFIX, defer_interaction, safe_reply
+from utils import BOT_PREFIX, defer_interaction, safe_reply, tag_error_embed, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -662,7 +662,12 @@ class Image(commands.Cog):
     )
     async def image(self, ctx: commands.Context, *, prompt: str) -> None:
         if not prompt or not prompt.strip():
-            return await safe_reply(ctx, "Tell me what to draw first.", ephemeral=True, mention_author=False)
+            return await safe_reply(
+                ctx,
+                tag_error_text("Tell me what to draw first."),
+                ephemeral=True,
+                mention_author=False,
+            )
 
         prompt = prompt.strip()
         await defer_interaction(ctx)
@@ -679,6 +684,7 @@ class Image(commands.Cog):
                 ),
                 color=0xFF0000,
             )
+            error_embed = tag_error_embed(error_embed)
             note_text = "\n".join(notes)
             error_embed.add_field(name="Notes", value=note_text[:1024], inline=False)
             await safe_reply(ctx, embed=error_embed, ephemeral=True, mention_author=False)
@@ -701,7 +707,7 @@ class Image(commands.Cog):
         if not getattr(self.client, "api_key", None):
             return await safe_reply(
                 ctx,
-                "OPENAI_TOKEN is not set, so I can't generate images right now.",
+                tag_error_text("OPENAI_TOKEN is not set, so I can't generate images right now."),
                 ephemeral=True,
                 mention_author=False,
             )
@@ -896,6 +902,7 @@ class Image(commands.Cog):
                 description=description,
                 color=0xFF0000,
             )
+            error_embed = tag_error_embed(error_embed)
             if notes:
                 note_text = "\n".join(notes)
                 error_embed.add_field(name="Notes", value=note_text[:1024], inline=False)
