@@ -5,7 +5,7 @@ import logging
 from discord.ext import commands
 
 from music import get_player
-from utils import defer_interaction, ensure_voice, BOT_PREFIX
+from utils import BOT_PREFIX, defer_interaction, ensure_voice, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -29,16 +29,18 @@ class Pause(commands.Cog):
     )
     async def pause(self, ctx: commands.Context) -> None:
         if ctx.guild is None:
-            return await ctx.reply("This command can only be used in a server.", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
         if not await ensure_voice(ctx):
             return
 
         player = get_player(self.bot, ctx.guild)
         if not player.voice or (not player.voice.is_playing() and not player.voice.is_paused()):
-            return await ctx.reply("Nothing is playing.", mention_author=False)
+            return await ctx.reply(tag_error_text("Nothing is playing."), mention_author=False)
         if player.voice.is_paused():
-            return await ctx.reply("Playback is already paused.", mention_author=False)
+            return await ctx.reply(tag_error_text("Playback is already paused."), mention_author=False)
 
         await player.pause()
         log.info("%s paused playback", ctx.author)

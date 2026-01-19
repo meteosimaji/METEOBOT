@@ -6,7 +6,7 @@ import discord
 from discord.ext import commands
 
 from music import get_player, progress_bar
-from utils import humanize_delta, format_timestamp, defer_interaction, BOT_PREFIX
+from utils import BOT_PREFIX, defer_interaction, format_timestamp, humanize_delta, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -33,11 +33,13 @@ class Now(commands.Cog):
     )
     async def now(self, ctx: commands.Context) -> None:
         if ctx.guild is None:
-            return await ctx.reply("This command can only be used in a server.", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
         player = get_player(self.bot, ctx.guild)
         if not player.current or not player.voice:
-            return await ctx.reply("Nothing is playing.", mention_author=False)
+            return await ctx.reply(tag_error_text("Nothing is playing."), mention_author=False)
         position = player.get_position()
         bar, pct = progress_bar(position, player.current.duration)
         embed = discord.Embed(

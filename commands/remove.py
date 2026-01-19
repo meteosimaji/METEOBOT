@@ -6,7 +6,7 @@ import discord
 from discord.ext import commands
 
 from music import get_player
-from utils import BOT_PREFIX, defer_interaction, safe_reply, ensure_voice, sanitize
+from utils import BOT_PREFIX, defer_interaction, safe_reply, ensure_voice, sanitize, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +40,9 @@ class Remove(commands.Cog):
     async def remove(self, ctx: commands.Context, steps: str | None = None) -> None:
         """Remove the Nth most recent pending track (1 = latest)."""
         if ctx.guild is None:
-            return await safe_reply(ctx, "This command can only be used in a server.", mention_author=False)
+            return await safe_reply(
+                ctx, tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
         if not await ensure_voice(ctx):
             return
@@ -56,7 +58,9 @@ class Remove(commands.Cog):
         if steps is None:
             recent = list(player.added_tracks)[::-1]
             if not recent:
-                return await safe_reply(ctx, "No recent additions to remove.", mention_author=False)
+                return await safe_reply(
+                    ctx, tag_error_text("No recent additions to remove."), mention_author=False
+                )
 
             header = "Recent additions (latest first). Use `/remove <number>` or `/remove A<id>` to delete:\n"
             lines = []
@@ -97,19 +101,28 @@ class Remove(commands.Cog):
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 else:
-                    await ctx.send(
+                    await ctx.reply(
                         chunk,
+                        mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
             return
 
         raw_steps = steps.strip()
         if not raw_steps:
-            return await safe_reply(ctx, "Provide a number or ID (e.g., 1 or A12).", mention_author=False)
+            return await safe_reply(
+                ctx,
+                tag_error_text("Provide a number or ID (e.g., 1 or A12)."),
+                mention_author=False,
+            )
 
         parts = [part.strip() for part in raw_steps.split(",") if part.strip()]
         if not parts:
-            return await safe_reply(ctx, "Provide a number or ID (e.g., 1 or A12).", mention_author=False)
+            return await safe_reply(
+                ctx,
+                tag_error_text("Provide a number or ID (e.g., 1 or A12)."),
+                mention_author=False,
+            )
         if len(parts) > 25:
             return await safe_reply(
                 ctx,
@@ -236,8 +249,9 @@ class Remove(commands.Cog):
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             else:
-                await ctx.send(
+                await ctx.reply(
                     chunk,
+                    mention_author=False,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
 

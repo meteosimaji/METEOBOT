@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 
 from music import get_player
-from utils import BOT_PREFIX, defer_interaction, safe_reply
+from utils import BOT_PREFIX, defer_interaction, safe_reply, tag_error_text
 
 
 class LoopMode(commands.Cog):
@@ -32,7 +32,9 @@ class LoopMode(commands.Cog):
     )
     async def loopmode(self, ctx: commands.Context, state: str | None = None) -> None:
         if ctx.guild is None:
-            return await safe_reply(ctx, "This command can only be used in a server.", mention_author=False)
+            return await safe_reply(
+                ctx, tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
 
         player = get_player(self.bot, ctx.guild)
@@ -42,7 +44,9 @@ class LoopMode(commands.Cog):
         if normalized not in choices:
             return await safe_reply(
                 ctx,
-                "Choose **OFF**, **TRACK**, **QUEUE**, or **NOW** (case-insensitive). `ON` is accepted for queue looping.",
+                tag_error_text(
+                    "Choose **OFF**, **TRACK**, **QUEUE**, or **NOW** (case-insensitive). `ON` is accepted for queue looping."
+                ),
                 mention_author=False,
             )
 

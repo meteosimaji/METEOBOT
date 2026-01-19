@@ -6,7 +6,7 @@ from typing import Optional
 from discord.ext import commands
 
 from music import get_player
-from utils import defer_interaction, format_timestamp, ensure_voice, BOT_PREFIX
+from utils import BOT_PREFIX, defer_interaction, ensure_voice, format_timestamp, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -62,21 +62,26 @@ class Seek(commands.Cog):
     async def seek(self, ctx: commands.Context, *, timestamp: str | None = None) -> None:
         # timestamp is optional to make it LLM-invokable (single optional arg).
         if ctx.guild is None:
-            return await ctx.reply("This command can only be used in a server.", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
         if not await ensure_voice(ctx):
             return
 
         if not timestamp:
-            return await ctx.reply("Give me a timestamp like `1:23` or `+30`.", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("Give me a timestamp like `1:23` or `+30`."),
+                mention_author=False,
+            )
 
         player = get_player(self.bot, ctx.guild)
         if not player.voice or (not player.voice.is_playing() and not player.voice.is_paused()) or not player.current:
-            return await ctx.reply("Nothing is playing.", mention_author=False)
+            return await ctx.reply(tag_error_text("Nothing is playing."), mention_author=False)
 
         secs = parse_timestamp(timestamp)
         if secs is None:
-            return await ctx.reply("Invalid timestamp.", mention_author=False)
+            return await ctx.reply(tag_error_text("Invalid timestamp."), mention_author=False)
 
         relative = timestamp.strip().startswith(("+", "-"))
         target = (player.get_position() + secs) if relative else secs
@@ -90,7 +95,7 @@ class Seek(commands.Cog):
 
         success = await player.seek(target)
         if not success:
-            return await ctx.reply("Failed to seek.", mention_author=False)
+            return await ctx.reply(tag_error_text("Failed to seek."), mention_author=False)
         await ctx.reply(f"Seeking to {format_timestamp(target)}", mention_author=False)
 
 

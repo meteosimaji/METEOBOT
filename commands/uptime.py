@@ -30,7 +30,7 @@ class Uptime(commands.Cog):
             else:
                 await ctx.interaction.response.send_message(**kwargs)
         else:
-            await ctx.send(**kwargs)
+            await ctx.reply(**kwargs, mention_author=False)
 
     @commands.hybrid_command(
         name="uptime",

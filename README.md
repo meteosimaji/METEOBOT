@@ -32,6 +32,18 @@
 - `userinfo` — Show a member's profile with timestamps, roles, and bot status.
 - `video` — Generate or remix short videos with Sora from a prompt, a reference image (first frame), or a `video_...` ID; best prompts describe shot type, subject, action, setting, and lighting. Attach images, HTTPS URLs, or Discord message links to use as reference. Optional tokens: `seconds:4|8|12`, `size:720x1280|1280x720`. Limits: global usage is capped at 2 videos per day across all servers; each user can run /video once per day across all servers; each server can run /video twice per week shared across users (weekly reset Sunday 00:00 UTC).
 
+### Ask tool auto-delete
+When `/ask` uses `bot_invoke`, the bot's response message will auto-delete 5 seconds after the final `/ask` reply is sent. A "stop auto-delete" button appears on replies that do not already contain interactive components; pressing it cancels deletion for that message only. Messages that already include buttons/menus are not modified to avoid breaking their UI and are excluded from auto-delete unless they are tagged as errors. By default, all commands invoked via `/ask` auto-delete unless explicitly disabled in `commands/ask.py` via `ASK_AUTO_DELETE_OVERRIDES`. The current default exclusions (no auto-delete) are:
+
+- `help`
+- `image`
+- `queue`
+- `settime`
+- `tex`
+- `video`
+
+Error responses for excluded commands (for example, the `/video` usage limit notice) still auto-delete so error spam does not linger.
+
 ### Music prerequisites
 - Install **FFmpeg** and ensure `ffmpeg` is on PATH (required for audio decoding).
 - Install Python deps: `yt-dlp` and `PyNaCl` (voice).

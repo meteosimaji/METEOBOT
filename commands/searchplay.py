@@ -9,7 +9,7 @@ from discord.ext import commands
 import yt_dlp
 
 from music import yt_search_results
-from utils import BOT_PREFIX, defer_interaction, safe_reply, sanitize, humanize_delta
+from utils import BOT_PREFIX, defer_interaction, safe_reply, sanitize, humanize_delta, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -63,25 +63,43 @@ class SearchPlay(commands.Cog):
     async def searchplay(self, ctx: commands.Context, *, query: str | None = None) -> None:
         """Search for tracks without adding them to the queue."""
         if ctx.guild is None:
-            return await safe_reply(ctx, "This command can only be used in a server.", mention_author=False)
+            return await safe_reply(
+                ctx, tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
 
         if not query:
-            return await safe_reply(ctx, "Provide a search query.", mention_author=False)
+            return await safe_reply(ctx, tag_error_text("Provide a search query."), mention_author=False)
 
         parsed = urlparse(query)
         if parsed.scheme and parsed.netloc:
-            return await safe_reply(ctx, "This command is for search terms. Use /play for URLs.", mention_author=False)
+            return await safe_reply(
+                ctx,
+                tag_error_text("This command is for search terms. Use /play for URLs."),
+                mention_author=False,
+            )
         if query.startswith(("www.", "youtube.com/", "youtu.be/")):
-            return await safe_reply(ctx, "This command is for search terms. Use /play for URLs.", mention_author=False)
+            return await safe_reply(
+                ctx,
+                tag_error_text("This command is for search terms. Use /play for URLs."),
+                mention_author=False,
+            )
 
         try:
             results = await yt_search_results(query, limit=5)
         except yt_dlp.utils.DownloadError:
-            return await safe_reply(ctx, "No results found. Try a different search phrase.", mention_author=False)
+            return await safe_reply(
+                ctx,
+                tag_error_text("No results found. Try a different search phrase."),
+                mention_author=False,
+            )
         except Exception:
             log.exception("searchplay failed for query %s", query)
-            return await safe_reply(ctx, "Search failed. Please try again in a moment.", mention_author=False)
+            return await safe_reply(
+                ctx,
+                tag_error_text("Search failed. Please try again in a moment."),
+                mention_author=False,
+            )
 
         lines: list[str] = []
         structured_results: list[dict[str, object]] = []

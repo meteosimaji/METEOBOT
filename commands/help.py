@@ -1,7 +1,14 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, SuggestionView, build_suggestions, defer_interaction
+from utils import (
+    BOT_PREFIX,
+    LONG_VIEW_TIMEOUT_S,
+    SuggestionView,
+    build_suggestions,
+    defer_interaction,
+    tag_error_text,
+)
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Iterable, List, Tuple
@@ -272,7 +279,7 @@ class Help(commands.Cog):
             else:
                 await ctx.interaction.response.send_message(**kwargs)
         else:
-            await ctx.send(**kwargs)
+            await ctx.reply(**kwargs, mention_author=False)
 
     @commands.hybrid_command(
         name="help",
@@ -322,7 +329,7 @@ class Help(commands.Cog):
                     f"Use /help or {prefix}help to search for commands and events."
                 )
             view = SuggestionView(extras) if extras else None
-            return await self._reply(ctx, content=message, view=view)
+            return await self._reply(ctx, content=tag_error_text(message), view=view)
         else:
             view = HelpView(self.bot, "All")
             await self._reply(ctx, embed=view.pages[0], view=view)

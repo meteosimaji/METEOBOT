@@ -8,7 +8,7 @@ import discord
 from discord.ext import commands
 
 from music import get_player, progress_bar
-from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, format_timestamp
+from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, format_timestamp, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -33,13 +33,15 @@ class ControlView(discord.ui.View):
         self.player.sync_voice_client()
         user = interaction.user
         if not user or not getattr(user, "voice", None) or not user.voice or not user.voice.channel:
-            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
+            await interaction.response.send_message(tag_error_text("Join a voice channel first."), ephemeral=True)
             return False
         if not self.player.voice or not getattr(self.player.voice, "channel", None):
-            await interaction.response.send_message("I'm not in voice right now.", ephemeral=True)
+            await interaction.response.send_message(tag_error_text("I'm not in voice right now."), ephemeral=True)
             return False
         if user.voice.channel.id != self.player.voice.channel.id:
-            await interaction.response.send_message("Use the controls from my current voice channel.", ephemeral=True)
+            await interaction.response.send_message(
+                tag_error_text("Use the controls from my current voice channel."), ephemeral=True
+            )
             return False
         return True
 
@@ -190,7 +192,7 @@ class ControlView(discord.ui.View):
     async def btn_remove(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.player.sync_voice_client()
         if not self.player.queue:
-            return await interaction.response.send_message("Queue is empty.", ephemeral=True)
+            return await interaction.response.send_message(tag_error_text("Queue is empty."), ephemeral=True)
         view = RemoveView(self.player, self)
         log.info("%s opened remove view", interaction.user)
         await interaction.response.send_message("Select a track to remove:", view=view, ephemeral=True)
@@ -208,9 +210,11 @@ class SpeedModal(discord.ui.Modal):
         try:
             speed = float(self.value.value)
         except ValueError:
-            return await interaction.response.send_message("That's not a number.", ephemeral=True)
+            return await interaction.response.send_message(tag_error_text("That's not a number."), ephemeral=True)
         if not 0.5 <= speed <= 2.0:
-            return await interaction.response.send_message("Try a value between 0.5× and 2.0×.", ephemeral=True)
+            return await interaction.response.send_message(
+                tag_error_text("Try a value between 0.5× and 2.0×."), ephemeral=True
+            )
 
         pos = self.player.get_position()
         old_speed = self.player.speed
@@ -223,7 +227,9 @@ class SpeedModal(discord.ui.Modal):
             err = str(exc)
         if not ok:
             self.player.speed = old_speed
-            return await interaction.response.send_message(f"Failed to apply speed: {err or 'seek failed'}", ephemeral=True)
+            return await interaction.response.send_message(
+                tag_error_text(f"Failed to apply speed: {err or 'seek failed'}"), ephemeral=True
+            )
 
         self.control.update_labels()
         if self.control.message:
@@ -243,9 +249,11 @@ class PitchModal(discord.ui.Modal):
         try:
             pitch = float(self.value.value)
         except ValueError:
-            return await interaction.response.send_message("That's not a number.", ephemeral=True)
+            return await interaction.response.send_message(tag_error_text("That's not a number."), ephemeral=True)
         if not 0.5 <= pitch <= 2.0:
-            return await interaction.response.send_message("Try a value between 0.5× and 2.0×.", ephemeral=True)
+            return await interaction.response.send_message(
+                tag_error_text("Try a value between 0.5× and 2.0×."), ephemeral=True
+            )
 
         pos = self.player.get_position()
         old_pitch = self.player.pitch
@@ -258,7 +266,9 @@ class PitchModal(discord.ui.Modal):
             err = str(exc)
         if not ok:
             self.player.pitch = old_pitch
-            return await interaction.response.send_message(f"Failed to apply pitch: {err or 'seek failed'}", ephemeral=True)
+            return await interaction.response.send_message(
+                tag_error_text(f"Failed to apply pitch: {err or 'seek failed'}"), ephemeral=True
+            )
 
         self.control.update_labels()
         if self.control.message:
@@ -283,13 +293,15 @@ class RemoveView(discord.ui.View):
         self.player.sync_voice_client()
         user = interaction.user
         if not user or not getattr(user, "voice", None) or not user.voice or not user.voice.channel:
-            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
+            await interaction.response.send_message(tag_error_text("Join a voice channel first."), ephemeral=True)
             return False
         if not self.player.voice or not getattr(self.player.voice, "channel", None):
-            await interaction.response.send_message("I'm not in voice right now.", ephemeral=True)
+            await interaction.response.send_message(tag_error_text("I'm not in voice right now."), ephemeral=True)
             return False
         if user.voice.channel.id != self.player.voice.channel.id:
-            await interaction.response.send_message("Use the controls from my current voice channel.", ephemeral=True)
+            await interaction.response.send_message(
+                tag_error_text("Use the controls from my current voice channel."), ephemeral=True
+            )
             return False
         return True
 
@@ -299,7 +311,7 @@ class RemoveView(discord.ui.View):
         async with self.player._add_lock:
             track = self.player.remove_at(index)
         if not track:
-            await interaction.followup.send("Invalid selection.", ephemeral=True)
+            await interaction.followup.send(tag_error_text("Invalid selection."), ephemeral=True)
             return
         self.control.update_labels()
         if self.control.message:
@@ -369,11 +381,13 @@ class Queue(commands.Cog):
     )
     async def queue(self, ctx: commands.Context) -> None:
         if ctx.guild is None:
-            return await ctx.reply("This command can only be used in a server.", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
         player = get_player(self.bot, ctx.guild)
         if not player.voice:
-            return await ctx.reply("Nothing is playing.", mention_author=False)
+            return await ctx.reply(tag_error_text("Nothing is playing."), mention_author=False)
         view = ControlView(player)
         embed = make_queue_embed(player)
         msg = await ctx.reply(embed=embed, view=view, mention_author=False)

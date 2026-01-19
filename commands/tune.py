@@ -5,7 +5,7 @@ import logging
 from discord.ext import commands
 
 from music import get_player
-from utils import defer_interaction, ensure_voice, BOT_PREFIX
+from utils import BOT_PREFIX, defer_interaction, ensure_voice, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -47,27 +47,39 @@ class Tune(commands.Cog):
     async def tune(self, ctx: commands.Context, *, values: str | None = None) -> None:
         # values is optional to satisfy LLM invocation (single optional arg)
         if ctx.guild is None:
-            return await ctx.reply("This command can only be used in a server.", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("This command can only be used in a server."), mention_author=False
+            )
         await defer_interaction(ctx)
         if not await ensure_voice(ctx):
             return
 
         if not values:
-            return await ctx.reply("Give me two numbers like `1.2 0.9` (speed pitch).", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("Give me two numbers like `1.2 0.9` (speed pitch)."),
+                mention_author=False,
+            )
 
         parsed = _parse_two_floats(values)
         if not parsed:
-            return await ctx.reply("Invalid format. Use: `<speed> <pitch>` (e.g. `1.2 0.9`).", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("Invalid format. Use: `<speed> <pitch>` (e.g. `1.2 0.9`)."),
+                mention_author=False,
+            )
 
         speed, pitch = parsed
         if not 0.5 <= speed <= 2.0:
-            return await ctx.reply("Speed must be between 0.5× and 2.0×.", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("Speed must be between 0.5× and 2.0×."), mention_author=False
+            )
         if not 0.5 <= pitch <= 2.0:
-            return await ctx.reply("Pitch must be between 0.5× and 2.0×.", mention_author=False)
+            return await ctx.reply(
+                tag_error_text("Pitch must be between 0.5× and 2.0×."), mention_author=False
+            )
 
         player = get_player(self.bot, ctx.guild)
         if not player.voice or not player.current:
-            return await ctx.reply("Nothing is playing.", mention_author=False)
+            return await ctx.reply(tag_error_text("Nothing is playing."), mention_author=False)
 
         position = player.get_position()
         old_speed, old_pitch = player.speed, player.pitch
@@ -77,7 +89,7 @@ class Tune(commands.Cog):
         if not success:
             player.speed = old_speed
             player.pitch = old_pitch
-            return await ctx.reply("Failed to retune.", mention_author=False)
+            return await ctx.reply(tag_error_text("Failed to retune."), mention_author=False)
 
         await ctx.reply(f"Set speed to {speed:.2f}× and pitch to {pitch:.2f}×.", mention_author=False)
 
