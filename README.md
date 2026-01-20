@@ -13,7 +13,7 @@
 - `help` — Browse commands and events or get detailed help.
 - `image` — Generate or edit a 1024x1024 PNG with gpt-image-1.5; attach images, include public HTTPS image URLs, or paste Discord message links with attachments in the prompt to edit (first image is the base, the rest are references; up to 16 inputs, each under 50MB). HEIC/HEIF uploads are accepted and converted internally when `pillow-heif` is available.
 - `loopmode` — Set looping to off, track, or queue (or display the current mode).
-- `messages` — Show recent messages in the current channel; supports keyword search plus filters like from:, mentions:, has:, before:, after:, during:, before_id:, after_id:, in:, scope:, pinned:true/false, and scan: (during: uses the server timezone; in: can target other channels across servers but requires both user + bot access, and channel-name lookups only resolve within the current server; scope: supports all/global/category=... to scan across multiple channels; when filters are used without scan:, all available history is scanned; tool output includes message links for fetching details when invoked via /ask).
+- `messages` — Show recent messages in the current channel; supports keyword search plus filters like from:, mentions:, has:, before:, after:, during:, before_id:, after_id:, in:, scope:, server:, pinned:true/false, and scan: (during: uses the server timezone; in: can target other channels across servers but requires both user + bot access, and channel-name lookups only resolve within the current server; scope: supports all/global/category=... to scan across multiple channels and server: can target a specific server; when filters are used without scan:, all available history is scanned; tool output includes message links for fetching details when invoked via /ask).
 - `now` — Show the current track with a progress bar.
 - `pause` / `resume` — Pause or resume playback.
 - `ping` — Check the bot's responsiveness with style and speed!
@@ -23,7 +23,7 @@
 - `remove` — Show recent additions when called without a number; pass a number or ID (e.g., `A12`) to remove by addition order (1=latest, 2=previous, etc.) or a comma-separated list like `A12,3,A14`.
 - `searchplay` — Search YouTube with yt-dlp without queuing; list candidates to pick before running `/play` (URLs should go to `/play` directly).
 - `seek` — Seek within the current track (e.g. `1:23`, `+30`, `-10`).
-- `serverinfo` — Display a polished snapshot of the current server.
+- `serverinfo` — Display a polished snapshot of the current server, including public channel lists and voice activity.
 - `settime` — Configure a server's timezone with interactive buttons.
 - `skip` — Skip the current track.
 - `tex` — Render LaTeX to crisp PNGs with both white and transparent backgrounds plus a PDF; both preview variants are attached together. Supports up to four pages (keeps Discord attachments under the cap) and works great when invoked via `/ask` tool-calling.

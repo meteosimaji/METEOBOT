@@ -29,6 +29,39 @@ def _summarize_mentions(items: list[str], *, limit: int = 950, separator: str = 
     return separator.join(parts)
 
 
+def _chunk_lines(lines: list[str], *, limit: int = 1024) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    total = 0
+    for line in lines:
+        addition = len(line) + (1 if current else 0)
+        if current and total + addition > limit:
+            chunks.append("\n".join(current))
+            current = [line]
+            total = len(line)
+        else:
+            current.append(line)
+            total += addition
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _channel_label(channel: discord.abc.GuildChannel) -> str:
+    if isinstance(channel, discord.TextChannel):
+        channel_type = "text"
+    elif isinstance(channel, discord.VoiceChannel):
+        channel_type = "voice"
+    elif isinstance(channel, discord.StageChannel):
+        channel_type = "stage"
+    elif isinstance(channel, discord.ForumChannel):
+        channel_type = "forum"
+    else:
+        channel_type = getattr(getattr(channel, "type", None), "name", "unknown")
+    return f"{channel.mention} ({channel_type})"
+
+
 class Info(commands.Cog):
     """Show details about users or the current server."""
 
@@ -85,10 +118,17 @@ class Info(commands.Cog):
         if guild.members:
             humans = sum(1 for member in guild.members if not member.bot)
             bots = sum(1 for member in guild.members if member.bot)
-        text_channels = len(guild.text_channels)
-        voice_channels = len(guild.voice_channels)
-        stage_channels = len(getattr(guild, "stage_channels", []))
-        forum_channels = len(getattr(guild, "forum_channels", []))
+        default_role = guild.default_role
+        visible_channels = [
+            channel
+            for channel in guild.channels
+            if not isinstance(channel, discord.CategoryChannel)
+            and channel.permissions_for(default_role).view_channel
+        ]
+        text_channels = sum(1 for channel in visible_channels if isinstance(channel, discord.TextChannel))
+        voice_channels = sum(1 for channel in visible_channels if isinstance(channel, discord.VoiceChannel))
+        stage_channels = sum(1 for channel in visible_channels if isinstance(channel, discord.StageChannel))
+        forum_channels = sum(1 for channel in visible_channels if isinstance(channel, discord.ForumChannel))
         total_channels = text_channels + voice_channels + stage_channels + forum_channels
         top_roles = [role.mention for role in guild.roles[1:6]]
         created_ts = int(guild.created_at.replace(tzinfo=timezone.utc).timestamp())
@@ -123,6 +163,38 @@ class Info(commands.Cog):
             ),
             inline=True,
         )
+        grouped_channels: dict[int | None, list[discord.abc.GuildChannel]] = {}
+        for channel in visible_channels:
+            grouped_channels.setdefault(channel.category_id, []).append(channel)
+
+        visible_lines: list[str] = []
+        if grouped_channels:
+            if None in grouped_channels:
+                visible_lines.append("**No Category**")
+                for channel in sorted(grouped_channels[None], key=lambda ch: ch.position):
+                    visible_lines.append(f"• {_channel_label(channel)}")
+            for category in sorted(guild.categories, key=lambda cat: cat.position):
+                if category.id not in grouped_channels:
+                    continue
+                visible_lines.append(f"**{category.name}** (`{category.id}`)")
+                for channel in sorted(grouped_channels[category.id], key=lambda ch: ch.position):
+                    visible_lines.append(f"• {_channel_label(channel)}")
+        else:
+            visible_lines.append("No publicly visible channels.")
+
+        channel_chunks = _chunk_lines(visible_lines, limit=1024)
+        max_channel_fields = 5
+        if len(channel_chunks) > max_channel_fields:
+            visible_overflow = len(channel_chunks) - max_channel_fields
+            channel_chunks = channel_chunks[:max_channel_fields]
+            channel_chunks[-1] = f"{channel_chunks[-1]}\n… (+{visible_overflow} more)"
+        for index, chunk in enumerate(channel_chunks, start=1):
+            suffix = f" ({index}/{len(channel_chunks)})" if len(channel_chunks) > 1 else ""
+            embed.add_field(
+                name=f"Visible Channels (Everyone){suffix}",
+                value=chunk,
+                inline=False,
+            )
         channel = ctx.channel
         channel_name = getattr(channel, "name", None) or "Unknown"
         channel_category = getattr(getattr(channel, "category", None), "name", None) or "None"
@@ -143,15 +215,38 @@ class Info(commands.Cog):
             ),
             inline=True,
         )
-        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-            voice_members = list(getattr(channel, "members", []))
-            mentions = [member.mention for member in voice_members]
+        voice_activity_lines: list[str] = []
+        visible_voice_channels = [
+            channel
+            for channel in visible_channels
+            if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+        ]
+        for voice_channel in sorted(visible_voice_channels, key=lambda ch: ch.position):
+            members = list(getattr(voice_channel, "members", []))
+            if not members:
+                continue
+            mentions = [member.mention for member in members]
+            voice_activity_lines.append(f"**{voice_channel.name}** ({voice_channel.mention})")
+            voice_activity_lines.append(f"In Call: {len(members)}")
+            voice_activity_lines.append(f"Users: {_summarize_mentions(mentions)}")
+        if voice_activity_lines:
+            voice_chunks = _chunk_lines(voice_activity_lines, limit=1024)
+            max_voice_fields = 5
+            if len(voice_chunks) > max_voice_fields:
+                voice_overflow = len(voice_chunks) - max_voice_fields
+                voice_chunks = voice_chunks[:max_voice_fields]
+                voice_chunks[-1] = f"{voice_chunks[-1]}\n… (+{voice_overflow} more)"
+            for index, chunk in enumerate(voice_chunks, start=1):
+                suffix = f" ({index}/{len(voice_chunks)})" if len(voice_chunks) > 1 else ""
+                embed.add_field(
+                    name=f"Voice Activity{suffix}",
+                    value=chunk,
+                    inline=False,
+                )
+        else:
             embed.add_field(
                 name="Voice Activity",
-                value=(
-                    f"In Call: {len(voice_members)}\n"
-                    f"Users: {_summarize_mentions(mentions)}"
-                ),
+                value="No active voice calls.",
                 inline=False,
             )
         embed.add_field(
