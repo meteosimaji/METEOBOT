@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import difflib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -23,6 +24,12 @@ MESSAGE_LINK_RE = re.compile(
     r"(?:@me|\d+)/\d+/(?P<message_id>\d+)",
     re.IGNORECASE,
 )
+CHANNEL_LINK_RE = re.compile(
+    r"https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/"
+    r"(?:@me|\d+)/(?P<channel_id>\d+)",
+    re.IGNORECASE,
+)
+CHANNEL_MENTION_RE = re.compile(r"<#(\d+)>")
 
 
 @dataclass
@@ -41,6 +48,11 @@ class MessageQuery:
     during: datetime | None = None
     after_id: int | None = None
     before_id: int | None = None
+    in_channel_ids: set[int] = field(default_factory=set)
+    in_channel_names: list[str] = field(default_factory=list)
+    scope: str | None = None
+    scope_category_ids: set[int] = field(default_factory=set)
+    scope_category_names: list[str] = field(default_factory=list)
 
 
 def _parse_date(value: str) -> datetime | None:
@@ -72,6 +84,33 @@ def _parse_message_id(value: str) -> int | None:
     if cleaned.isdigit():
         return int(cleaned)
     return None
+
+
+def _parse_channel_id(value: str) -> int | None:
+    raw = value.strip().strip("<>.,)")
+    mention_match = CHANNEL_MENTION_RE.match(raw)
+    if mention_match:
+        return int(mention_match.group(1))
+    cleaned = raw.strip("<>")
+    if cleaned.startswith("#"):
+        cleaned = cleaned[1:]
+    link_match = CHANNEL_LINK_RE.match(cleaned)
+    if link_match:
+        return int(link_match.group("channel_id"))
+    if cleaned.isdigit():
+        return int(cleaned)
+    return None
+
+
+def _normalize_channel_name(raw: str) -> str:
+    token = (raw or "").strip()
+    if token.startswith("#"):
+        token = token[1:]
+    return token.casefold()
+
+
+def _normalize_category_name(raw: str) -> str:
+    return (raw or "").strip().casefold()
 
 
 def _parse_query(raw: str | None) -> MessageQuery:
@@ -153,6 +192,28 @@ def _parse_query(raw: str | None) -> MessageQuery:
             continue
 
         if key == "in":
+            parts = [p.strip() for p in value.split(",") if p.strip()]
+            for part in parts:
+                channel_id = _parse_channel_id(part)
+                if channel_id is not None:
+                    query.in_channel_ids.add(channel_id)
+                else:
+                    query.in_channel_names.append(part)
+            continue
+
+        if key == "scope":
+            scope_value = value.casefold()
+            if scope_value in {"all", "global"}:
+                query.scope = scope_value
+                continue
+            if scope_value.startswith("category="):
+                query.scope = "category"
+                raw_category = scope_value.split("category=", 1)[1].strip()
+                if raw_category.isdigit():
+                    query.scope_category_ids.add(int(raw_category))
+                elif raw_category:
+                    query.scope_category_names.append(raw_category)
+                continue
             continue
 
         query.keywords.append(token)
@@ -286,12 +347,27 @@ def _message_matches_query(message: discord.Message, query: MessageQuery) -> boo
     return _message_has_filter(message, query.has_filters)
 
 
-def _format_messages(messages: Iterable[discord.Message], *, limit: int = 3900) -> str:
+def _format_messages(
+    messages: Iterable[discord.Message],
+    *,
+    limit: int = 3900,
+    show_channel: bool = False,
+    show_guild: bool = False,
+) -> str:
     lines: list[str] = []
     total_length = 0
     truncated = False
 
     for msg in messages:
+        channel_label = ""
+        if show_channel:
+            channel = getattr(msg, "channel", None)
+            channel_name = getattr(channel, "name", None) or "unknown-channel"
+            if show_guild:
+                guild = getattr(getattr(channel, "guild", None), "name", None) or "unknown-server"
+                channel_label = f"[{sanitize(guild)} #{sanitize(channel_name)}] "
+            else:
+                channel_label = f"[#{sanitize(channel_name)}] "
         snippet = sanitize(msg.content.strip()) if msg.content else ""
         if not snippet:
             details: list[str] = []
@@ -310,7 +386,7 @@ def _format_messages(messages: Iterable[discord.Message], *, limit: int = 3900) 
             if hasattr(msg.author, "display_name")
             else sanitize(str(msg.author))
         )
-        line = f"• <t:{ts}:t> {author}: {snippet}"
+        line = f"• {channel_label}<t:{ts}:t> {author}: {snippet}"
         projected = total_length + len(line) + (1 if lines else 0)
         if projected > limit:
             truncated = True
@@ -341,14 +417,21 @@ class Messages(commands.Cog):
             "Retrieve and filter messages in the current channel. Provide a number "
             "to change how many are shown (defaults to 50, min 1 / max 50). You can also "
             "use search filters like from:, mentions:, has:, before:, after:, during:, "
-            "before_id:, after_id:, pinned:true/false, and scan: (max history to scan). "
+            "before_id:, after_id:, in:, scope:, pinned:true/false, and scan: (max history to scan; "
+            "defaults to all history when filters are used). "
             "during: uses the server timezone (set via /settime) and ignores before_id:/after_id. "
+            "in: accepts channel mentions/IDs/links across servers; plain channel names "
+            "only resolve within the current server and may require disambiguation. "
+            "scope: supports all, global, or category=<id|name> to scan across multiple "
+            "channels (use either scope: or in:, not both). Multi-channel results include "
+            "the channel (and server for scope:global) next to each message. "
             "Text outside filters is "
             "treated as search keywords.\n\n"
             "**Usage**: `/messages [query]`\n"
             "**Examples**: `/messages`, `/messages 5`, `/messages おはよう from:1234`, "
             "`/messages has:link before:2026-01-01`, `/messages scan:1000 has:image`, "
-            "`/messages before_id:1234567890 scan:2000`\n"
+            "`/messages before_id:1234567890 scan:2000`, `/messages in:<#1234567890>`, "
+            "`/messages scope:all`\n"
             f"`{BOT_PREFIX}messages 15 from:@user`"
         ),
         extras={
@@ -356,9 +439,11 @@ class Messages(commands.Cog):
             "pro": (
                 "If no count is provided the command shows 50 messages by default. "
                 "The count is clamped to a maximum of 50. Query filters like from:, "
-                "mentions:, has:, before:, after:, during:, before_id:, after_id:, "
-                "pinned:true/false, and scan: are supported. Long outputs are trimmed to "
-                "fit Discord's embed limits."
+                "mentions:, has:, before:, after:, during:, before_id:, after_id:, in:, "
+                "scope:, pinned:true/false, and scan: are supported (in: accepts multiple values "
+                "separated by commas). When filters are used without scan:, the command "
+                "scans all available history. Long outputs are trimmed to fit Discord's "
+                "embed limits."
             ),
         },
     )
@@ -370,8 +455,24 @@ class Messages(commands.Cog):
             parsed = _parse_query(query)
             amount = max(1, min(50, int(parsed.limit)))
 
-            if not hasattr(ctx.channel, "history"):
-                error_message = tag_error_text("This channel type is not supported.")
+            if parsed.during:
+                tz = timezone.utc
+                if ctx.guild is not None:
+                    with contextlib.suppress(Exception):
+                        from cogs.settime import get_guild_offset
+
+                        tz = timezone(timedelta(hours=get_guild_offset(self.bot, ctx.guild.id)))
+                local_start = datetime.combine(parsed.during.date(), datetime.min.time(), tzinfo=tz)
+                parsed.after = local_start.astimezone(timezone.utc)
+                parsed.before = (local_start + timedelta(days=1)).astimezone(timezone.utc)
+                parsed.during = None
+                parsed.after_id = None
+                parsed.before_id = None
+
+            if parsed.scope and (parsed.in_channel_ids or parsed.in_channel_names):
+                error_message = tag_error_text(
+                    "Use either scope: or in: filters, not both in the same query."
+                )
                 if ctx.interaction and ctx.interaction.response.is_done():
                     await ctx.interaction.followup.send(
                         error_message,
@@ -392,19 +493,228 @@ class Messages(commands.Cog):
                     )
                 return
 
-            if parsed.during:
-                tz = timezone.utc
-                if ctx.guild is not None:
-                    with contextlib.suppress(Exception):
-                        from cogs.settime import get_guild_offset
+            if parsed.in_channel_names:
+                if ctx.guild is None:
+                    error_message = tag_error_text(
+                        "in: with a channel name only works inside a server. "
+                        "Use a channel mention (<#...>), ID, or link."
+                    )
+                    if ctx.interaction and ctx.interaction.response.is_done():
+                        await ctx.interaction.followup.send(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    elif ctx.interaction:
+                        await ctx.interaction.response.send_message(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    else:
+                        await ctx.reply(
+                            error_message,
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    return
 
-                        tz = timezone(timedelta(hours=get_guild_offset(self.bot, ctx.guild.id)))
-                local_start = datetime.combine(parsed.during.date(), datetime.min.time(), tzinfo=tz)
-                parsed.after = local_start.astimezone(timezone.utc)
-                parsed.before = (local_start + timedelta(days=1)).astimezone(timezone.utc)
-                parsed.during = None
-                parsed.after_id = None
-                parsed.before_id = None
+                searchable_channels: list[discord.abc.GuildChannel] = []
+                searchable_channels.extend(getattr(ctx.guild, "text_channels", []))
+                searchable_channels.extend(getattr(ctx.guild, "threads", []))
+
+                name_index: dict[str, list[discord.abc.GuildChannel]] = {}
+                for channel in searchable_channels:
+                    channel_name = getattr(channel, "name", None)
+                    if not channel_name:
+                        continue
+                    name_index.setdefault(channel_name.casefold(), []).append(channel)
+
+                unresolved: list[str] = []
+                ambiguous: list[tuple[str, list[discord.abc.GuildChannel]]] = []
+
+                for raw_name in parsed.in_channel_names:
+                    normalized = _normalize_channel_name(raw_name)
+                    if not normalized:
+                        unresolved.append(raw_name)
+                        continue
+                    matches = name_index.get(normalized, [])
+                    if len(matches) == 1:
+                        parsed.in_channel_ids.add(matches[0].id)
+                    elif len(matches) == 0:
+                        unresolved.append(raw_name)
+                    else:
+                        ambiguous.append((raw_name, matches))
+
+                if ambiguous or unresolved:
+                    parts: list[str] = []
+
+                    if ambiguous:
+                        shown: list[str] = []
+                        for raw_name, matches in ambiguous[:3]:
+                            candidates: list[str] = []
+                            for channel in matches[:5]:
+                                mention = getattr(channel, "mention", f"<#{channel.id}>")
+                                category = getattr(getattr(channel, "category", None), "name", None)
+                                candidates.append(f"{mention} ({category})" if category else mention)
+                            shown.append(f"{raw_name} -> {', '.join(candidates)}")
+                        parts.append(
+                            "Ambiguous in: channel name(s). Use a channel mention/ID/link to "
+                            f"disambiguate. {' | '.join(shown)}"
+                        )
+
+                    if unresolved:
+                        all_names = sorted(name_index.keys())
+                        suggestions: list[str] = []
+                        for raw_name in unresolved[:3]:
+                            normalized = _normalize_channel_name(raw_name)
+                            if not normalized:
+                                continue
+                            close = difflib.get_close_matches(normalized, all_names, n=3, cutoff=0.6)
+                            for candidate in close:
+                                channels = name_index.get(candidate, [])
+                                if channels:
+                                    suggestions.append(
+                                        getattr(channels[0], "mention", f"<#{channels[0].id}>")
+                                    )
+                        uniq: list[str] = []
+                        for suggestion in suggestions:
+                            if suggestion not in uniq:
+                                uniq.append(suggestion)
+                            if len(uniq) >= 5:
+                                break
+                        if uniq:
+                            parts.append(
+                                "Unknown in: channel name(s): "
+                                f"{', '.join(unresolved[:5])}. Did you mean: {', '.join(uniq)}"
+                            )
+                        else:
+                            parts.append(
+                                "Unknown in: channel name(s): " f"{', '.join(unresolved[:5])}."
+                            )
+
+                    error_message = tag_error_text(" ".join(parts))
+                    if ctx.interaction and ctx.interaction.response.is_done():
+                        await ctx.interaction.followup.send(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    elif ctx.interaction:
+                        await ctx.interaction.response.send_message(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    else:
+                        await ctx.reply(
+                            error_message,
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    return
+
+            if parsed.scope == "category":
+                if ctx.guild is None:
+                    error_message = tag_error_text(
+                        "scope:category only works inside a server. Use scope:global or in: instead."
+                    )
+                    if ctx.interaction and ctx.interaction.response.is_done():
+                        await ctx.interaction.followup.send(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    elif ctx.interaction:
+                        await ctx.interaction.response.send_message(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    else:
+                        await ctx.reply(
+                            error_message,
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    return
+
+                categories: list[discord.CategoryChannel] = []
+                if parsed.scope_category_ids:
+                    for category_id in parsed.scope_category_ids:
+                        category = ctx.guild.get_channel(category_id)
+                        if isinstance(category, discord.CategoryChannel):
+                            categories.append(category)
+                    if not categories:
+                        error_message = tag_error_text("scope:category did not match any categories.")
+                        if ctx.interaction and ctx.interaction.response.is_done():
+                            await ctx.interaction.followup.send(
+                                error_message,
+                                ephemeral=True,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        elif ctx.interaction:
+                            await ctx.interaction.response.send_message(
+                                error_message,
+                                ephemeral=True,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        else:
+                            await ctx.reply(
+                                error_message,
+                                mention_author=False,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        return
+                elif parsed.scope_category_names:
+                    normalized_targets = {_normalize_category_name(name) for name in parsed.scope_category_names}
+                    for category in ctx.guild.categories:
+                        if _normalize_category_name(category.name) in normalized_targets:
+                            categories.append(category)
+                    if not categories:
+                        error_message = tag_error_text("scope:category did not match any categories.")
+                        if ctx.interaction and ctx.interaction.response.is_done():
+                            await ctx.interaction.followup.send(
+                                error_message,
+                                ephemeral=True,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        elif ctx.interaction:
+                            await ctx.interaction.response.send_message(
+                                error_message,
+                                ephemeral=True,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        else:
+                            await ctx.reply(
+                                error_message,
+                                mention_author=False,
+                                allowed_mentions=discord.AllowedMentions.none(),
+                            )
+                        return
+                else:
+                    error_message = tag_error_text(
+                        "scope:category requires a category ID (scope:category=123) or name."
+                    )
+                    if ctx.interaction and ctx.interaction.response.is_done():
+                        await ctx.interaction.followup.send(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    elif ctx.interaction:
+                        await ctx.interaction.response.send_message(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    else:
+                        await ctx.reply(
+                            error_message,
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    return
 
             use_filters = bool(
                 parsed.keywords
@@ -419,11 +729,17 @@ class Messages(commands.Cog):
                 or parsed.after_id
                 or parsed.before_id
                 or parsed.scan_limit
+                or parsed.in_channel_ids
+                or parsed.in_channel_names
+                or parsed.scope
             )
             scan_limit = amount
             if use_filters:
                 requested_scan = parsed.scan_limit or 0
-                scan_limit = min(5000, max(amount, 200, requested_scan))
+                if parsed.scan_limit is None:
+                    scan_limit = None
+                else:
+                    scan_limit = max(amount, 200, requested_scan)
 
             history_kwargs: dict[str, object] = {"limit": scan_limit}
             if parsed.after_id:
@@ -435,11 +751,266 @@ class Messages(commands.Cog):
             elif parsed.before:
                 history_kwargs["before"] = parsed.before
 
-            history = [m async for m in ctx.channel.history(**history_kwargs)]
-            history.reverse()
+            target_channels: list[discord.abc.Messageable] = []
+            resolve_errors: list[str] = []
+            if parsed.scope:
+                def _guild_candidates(guild: discord.Guild) -> list[discord.abc.GuildChannel]:
+                    candidates: list[discord.abc.GuildChannel] = []
+                    candidates.extend(getattr(guild, "text_channels", []))
+                    candidates.extend(getattr(guild, "forum_channels", []))
+                    candidates.extend(getattr(guild, "threads", []))
+                    return candidates
 
-            if use_filters:
-                history = [m for m in history if _message_matches_query(m, parsed)]
+                async def _member_for_guild(guild: discord.Guild) -> discord.Member | None:
+                    member = guild.get_member(ctx.author.id)
+                    if member is None:
+                        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+                            member = await guild.fetch_member(ctx.author.id)
+                    return member
+
+                async def _bot_member_for_guild(guild: discord.Guild) -> discord.Member | None:
+                    bot_member = guild.me or guild.get_member(self.bot.user.id if self.bot.user else 0)
+                    if bot_member is None and self.bot.user is not None:
+                        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+                            bot_member = await guild.fetch_member(self.bot.user.id)
+                    return bot_member
+
+                if parsed.scope == "all":
+                    if ctx.guild is None:
+                        resolve_errors.append("scope:all requires a server context.")
+                    else:
+                        member = await _member_for_guild(ctx.guild)
+                        if member is None:
+                            resolve_errors.append("You are not a member of this server.")
+                        else:
+                            bot_member = await _bot_member_for_guild(ctx.guild)
+                            for channel in _guild_candidates(ctx.guild):
+                                if not hasattr(channel, "history"):
+                                    continue
+                                user_perms = channel.permissions_for(member)
+                                if not user_perms.view_channel or not user_perms.read_message_history:
+                                    continue
+                                if bot_member is not None:
+                                    bot_perms = channel.permissions_for(bot_member)
+                                    if not bot_perms.view_channel or not bot_perms.read_message_history:
+                                        continue
+                                target_channels.append(channel)
+                elif parsed.scope == "global":
+                    for guild in self.bot.guilds:
+                        member = await _member_for_guild(guild)
+                        if member is None:
+                            continue
+                        bot_member = await _bot_member_for_guild(guild)
+                        for channel in _guild_candidates(guild):
+                            if not hasattr(channel, "history"):
+                                continue
+                            user_perms = channel.permissions_for(member)
+                            if not user_perms.view_channel or not user_perms.read_message_history:
+                                continue
+                            if bot_member is not None:
+                                bot_perms = channel.permissions_for(bot_member)
+                                if not bot_perms.view_channel or not bot_perms.read_message_history:
+                                    continue
+                            target_channels.append(channel)
+                elif parsed.scope == "category":
+                    if ctx.guild is None:
+                        resolve_errors.append("scope:category requires a server context.")
+                    else:
+                        member = await _member_for_guild(ctx.guild)
+                        if member is None:
+                            resolve_errors.append("You are not a member of this server.")
+                        else:
+                            bot_member = await _bot_member_for_guild(ctx.guild)
+                            category_channels: list[discord.abc.GuildChannel] = []
+                            name_targets = {
+                                _normalize_category_name(name)
+                                for name in parsed.scope_category_names
+                            }
+                            for category in ctx.guild.categories:
+                                if (
+                                    parsed.scope_category_ids
+                                    and category.id not in parsed.scope_category_ids
+                                ):
+                                    continue
+                                if name_targets and _normalize_category_name(category.name) not in name_targets:
+                                    continue
+                                category_channels.extend(category.channels)
+                                for thread in getattr(ctx.guild, "threads", []):
+                                    parent = getattr(thread, "parent", None)
+                                    if parent and getattr(parent, "category_id", None) == category.id:
+                                        category_channels.append(thread)
+                            for channel in category_channels:
+                                if not hasattr(channel, "history"):
+                                    continue
+                                user_perms = channel.permissions_for(member)
+                                if not user_perms.view_channel or not user_perms.read_message_history:
+                                    continue
+                                if bot_member is not None:
+                                    bot_perms = channel.permissions_for(bot_member)
+                                    if not bot_perms.view_channel or not bot_perms.read_message_history:
+                                        continue
+                                target_channels.append(channel)
+            elif parsed.in_channel_ids:
+                for channel_id in sorted(parsed.in_channel_ids):
+                    channel = self.bot.get_channel(channel_id)
+                    if channel is None:
+                        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+                            channel = await self.bot.fetch_channel(channel_id)
+                    if channel is None:
+                        resolve_errors.append(f"<#{channel_id}>: channel not found.")
+                        continue
+                    if not hasattr(channel, "history"):
+                        resolve_errors.append(
+                            f"{getattr(channel, 'mention', f'<#{channel_id}>')}: channel does not support messages."
+                        )
+                        continue
+                    guild = getattr(channel, "guild", None)
+                    if guild is None:
+                        resolve_errors.append(
+                            f"{getattr(channel, 'mention', f'<#{channel_id}>')}: direct messages are not supported."
+                        )
+                        continue
+                    member = guild.get_member(ctx.author.id)
+                    if member is None:
+                        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+                            member = await guild.fetch_member(ctx.author.id)
+                    if member is None:
+                        resolve_errors.append(
+                            f"{getattr(channel, 'mention', f'<#{channel_id}>')}: you are not a member of {guild.name}."
+                        )
+                        continue
+                    user_perms = channel.permissions_for(member)
+                    if not user_perms.view_channel or not user_perms.read_message_history:
+                        resolve_errors.append(
+                            f"{getattr(channel, 'mention', f'<#{channel_id}>')}: you don't have permission to read messages."
+                        )
+                        continue
+                    bot_member = guild.me or guild.get_member(self.bot.user.id if self.bot.user else 0)
+                    if bot_member is None and self.bot.user is not None:
+                        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+                            bot_member = await guild.fetch_member(self.bot.user.id)
+                    if bot_member is not None:
+                        bot_perms = channel.permissions_for(bot_member)
+                        if not bot_perms.view_channel or not bot_perms.read_message_history:
+                            resolve_errors.append(
+                                f"{getattr(channel, 'mention', f'<#{channel_id}>')}: I don't have permission to read messages."
+                            )
+                            continue
+                    target_channels.append(channel)
+            else:
+                if not hasattr(ctx.channel, "history"):
+                    error_message = tag_error_text("This channel type is not supported.")
+                    if ctx.interaction and ctx.interaction.response.is_done():
+                        await ctx.interaction.followup.send(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    elif ctx.interaction:
+                        await ctx.interaction.response.send_message(
+                            error_message,
+                            ephemeral=True,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    else:
+                        await ctx.reply(
+                            error_message,
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    return
+                target_channels.append(ctx.channel)
+
+            warnings = resolve_errors
+            if warnings and not target_channels:
+                error_message = tag_error_text(" ".join(warnings))
+                if ctx.interaction and ctx.interaction.response.is_done():
+                    await ctx.interaction.followup.send(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                elif ctx.interaction:
+                    await ctx.interaction.response.send_message(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    await ctx.reply(
+                        error_message,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                return
+
+            if not target_channels:
+                error_message = tag_error_text("No channels are available to search.")
+                if ctx.interaction and ctx.interaction.response.is_done():
+                    await ctx.interaction.followup.send(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                elif ctx.interaction:
+                    await ctx.interaction.response.send_message(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    await ctx.reply(
+                        error_message,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                return
+
+            history: list[discord.Message] = []
+            for channel in target_channels:
+                if not hasattr(channel, "history"):
+                    continue
+                matches: list[discord.Message] = []
+                scanned = 0
+                try:
+                    async for message in channel.history(**history_kwargs):
+                        scanned += 1
+                        if scan_limit is not None and scanned > scan_limit:
+                            break
+                        if use_filters and not _message_matches_query(message, parsed):
+                            continue
+                        matches.append(message)
+                        if len(matches) >= amount:
+                            break
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    channel_id = getattr(channel, "id", "unknown")
+                    mention = getattr(channel, "mention", f"<#{channel_id}>")
+                    resolve_errors.append(f"{mention}: could not fetch messages.")
+                    continue
+                history.extend(matches)
+            history.sort(key=lambda m: m.created_at)
+
+            if resolve_errors and not history:
+                error_message = tag_error_text(" ".join(resolve_errors))
+                if ctx.interaction and ctx.interaction.response.is_done():
+                    await ctx.interaction.followup.send(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                elif ctx.interaction:
+                    await ctx.interaction.response.send_message(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    await ctx.reply(
+                        error_message,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                return
 
             if history:
                 selected = history[-amount:]
@@ -452,7 +1023,22 @@ class Messages(commands.Cog):
             if not selected:
                 content = "No recent messages found."
             else:
-                content = _format_messages(selected)
+                show_channel = bool(
+                    parsed.scope
+                    or parsed.in_channel_ids
+                    or parsed.in_channel_names
+                )
+                show_guild = parsed.scope == "global"
+                content = _format_messages(
+                    selected,
+                    show_channel=show_channel,
+                    show_guild=show_guild,
+                )
+            if warnings:
+                warning_text = " ".join(warnings)
+                if len(warning_text) > 500:
+                    warning_text = warning_text[:497] + "..."
+                content = f"{content}\n\n⚠️ {warning_text}"
 
             embed = discord.Embed(
                 title="\U0001F4DD Recent Messages",

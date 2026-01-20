@@ -123,6 +123,37 @@ class Info(commands.Cog):
             ),
             inline=True,
         )
+        channel = ctx.channel
+        channel_name = getattr(channel, "name", None) or "Unknown"
+        channel_category = getattr(getattr(channel, "category", None), "name", None) or "None"
+        channel_type = getattr(getattr(channel, "type", None), "name", None) or "unknown"
+        channel_link = getattr(channel, "mention", None) or "-"
+        ctx.serverinfo_meta = {
+            "channel_name": channel_name,
+            "channel_category": channel_category,
+            "channel_type": channel_type,
+            "channel_link": channel_link,
+        }
+        embed.add_field(
+            name="Current Channel",
+            value=(
+                f"Name: {channel_name}\n"
+                f"Category: {channel_category}\n"
+                f"Type: {channel_type}"
+            ),
+            inline=True,
+        )
+        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            voice_members = list(getattr(channel, "members", []))
+            mentions = [member.mention for member in voice_members]
+            embed.add_field(
+                name="Voice Activity",
+                value=(
+                    f"In Call: {len(voice_members)}\n"
+                    f"Users: {_summarize_mentions(mentions)}"
+                ),
+                inline=False,
+            )
         embed.add_field(
             name="Boosts",
             value=f"Level {guild.premium_tier} ({guild.premium_subscription_count or 0} boosts)",
