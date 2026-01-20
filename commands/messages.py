@@ -46,6 +46,9 @@ class MessageQuery:
     after: datetime | None = None
     before: datetime | None = None
     during: datetime | None = None
+    after_is_date: bool = False
+    before_is_date: bool = False
+    during_is_date: bool = False
     after_id: int | None = None
     before_id: int | None = None
     in_channel_ids: set[int] = field(default_factory=set)
@@ -61,12 +64,20 @@ class MessageQuery:
     scope_category_names: list[str] = field(default_factory=list)
 
 
-def _parse_date(value: str) -> datetime | None:
+def _parse_date(value: str) -> tuple[datetime | None, bool]:
+    if value.isdigit():
+        try:
+            timestamp = int(value)
+            if len(value) >= 13:
+                timestamp = timestamp // 1000
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc), False
+        except (OverflowError, OSError, ValueError):
+            return None, False
     try:
         parsed = datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
-        return None
-    return parsed.replace(tzinfo=timezone.utc)
+        return None, False
+    return parsed.replace(tzinfo=timezone.utc), True
 
 
 def _normalize_user_token(raw: str) -> tuple[int | None, str | None]:
@@ -178,15 +189,18 @@ def _parse_query(raw: str | None) -> MessageQuery:
             continue
 
         if key in {"before", "after", "during"}:
-            parsed = _parse_date(value)
+            parsed, is_date = _parse_date(value)
             if parsed is None:
                 continue
             if key == "before":
                 query.before = parsed
+                query.before_is_date = is_date
             elif key == "after":
                 query.after = parsed
+                query.after_is_date = is_date
             else:
                 query.during = parsed
+                query.during_is_date = is_date
             continue
 
         if key == "pinned":
@@ -476,14 +490,31 @@ class Messages(commands.Cog):
             parsed = _parse_query(query)
             amount = max(1, min(50, int(parsed.limit)))
 
-            if parsed.during:
-                tz = timezone.utc
-                if ctx.guild is not None:
-                    with contextlib.suppress(Exception):
-                        from cogs.settime import get_guild_offset
+            tz = timezone.utc
+            if ctx.guild is not None:
+                with contextlib.suppress(Exception):
+                    from cogs.settime import get_guild_offset
 
-                        tz = timezone(timedelta(hours=get_guild_offset(self.bot, ctx.guild.id)))
-                local_start = datetime.combine(parsed.during.date(), datetime.min.time(), tzinfo=tz)
+                    tz = timezone(timedelta(hours=get_guild_offset(self.bot, ctx.guild.id)))
+
+            if parsed.before and parsed.before_is_date:
+                local_before = datetime.combine(
+                    parsed.before.date(), datetime.min.time(), tzinfo=tz
+                )
+                parsed.before = local_before.astimezone(timezone.utc)
+
+            if parsed.after and parsed.after_is_date:
+                local_after = datetime.combine(
+                    parsed.after.date(), datetime.min.time(), tzinfo=tz
+                )
+                parsed.after = local_after.astimezone(timezone.utc)
+
+            if parsed.during:
+                if parsed.during_is_date:
+                    local_date = parsed.during.date()
+                else:
+                    local_date = parsed.during.astimezone(tz).date()
+                local_start = datetime.combine(local_date, datetime.min.time(), tzinfo=tz)
                 parsed.after = local_start.astimezone(timezone.utc)
                 parsed.before = (local_start + timedelta(days=1)).astimezone(timezone.utc)
                 parsed.during = None
