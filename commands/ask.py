@@ -2362,10 +2362,17 @@ class Ask(commands.Cog):
             }
 
         if ext == ".pdf" and _looks_garbled_pdf(text):
+            warning = (
+                "Extracted PDF text looks garbled; content may be partially readable. "
+                "If it's unusable, try a text-based PDF or OCR-ready image."
+            )
+            note = f"{note} {warning}".strip() if note else warning
             return {
-                "ok": False,
-                "error": "garbled_text",
-                "reason": "Extracted PDF text looks garbled; try a text-based PDF or OCR-ready image.",
+                "ok": True,
+                "text": text,
+                "truncated": truncated,
+                "note": note,
+                "warning": "garbled_text",
                 "filename": filename,
                 "content_type": content_type,
                 "size": path.stat().st_size if path.exists() else 0,
