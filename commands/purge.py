@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 import shlex
 from collections import Counter
@@ -16,6 +17,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from utils import BOT_PREFIX, LONG_VIEW_TIMEOUT_S, defer_interaction, safe_reply, strip_markdown, tag_error_text
+
+logger = logging.getLogger(__name__)
 
 CONFIRM_VIEW_TIMEOUT_S = LONG_VIEW_TIMEOUT_S
 
@@ -345,7 +348,7 @@ def _describe_query(ctx: commands.Context, data: PurgeQuery, total: int) -> str:
 
 async def _delete_by_ids(
     channel: discord.abc.Messageable, message_ids: list[int], *, reason: str | None = None
-) -> int:
+) -> tuple[int, Counter[str], str | None]:
     """Delete IDs efficiently: bulk for <14d (<=100 per call), individual otherwise."""
     now = discord.utils.utcnow()
     cutoff = now - timedelta(days=14)
@@ -360,27 +363,41 @@ async def _delete_by_ids(
             old.append(mid)
 
     deleted = 0
+    failures: Counter[str] = Counter()
+    first_error: str | None = None
+
+    def record_failure(kind: str, exc: Exception) -> None:
+        nonlocal first_error
+        failures[kind] += 1
+        if first_error is None:
+            first_error = f"{kind}: {type(exc).__name__}: {exc}"
 
     delete_messages = getattr(channel, "delete_messages", None)
-    if callable(delete_messages):
+    if callable(delete_messages) and recent:
         for i in range(0, len(recent), 100):
-            chunk = [discord.Object(id=x) for x in recent[i : i + 100]]
+            chunk_ids = recent[i : i + 100]
+            chunk = [discord.Object(id=x) for x in chunk_ids]
             try:
                 await delete_messages(chunk, reason=reason)
                 deleted += len(chunk)
-            except Exception:
-                # fallback to per-message deletes for this chunk
-                for obj in chunk:
-                    try:
-                        pm = getattr(channel, "get_partial_message", None)
-                        if callable(pm):
-                            await pm(obj.id).delete(reason=reason)
-                        else:
-                            msg = await channel.fetch_message(obj.id)  # type: ignore[attr-defined]
-                            await msg.delete(reason=reason)
-                        deleted += 1
-                    except Exception:
-                        pass
+            except discord.Forbidden as exc:
+                record_failure("Forbidden(bulk)", exc)
+                logger.warning(
+                    "Purge bulk delete forbidden in channel=%s", getattr(channel, "id", None)
+                )
+                old.extend(chunk_ids)
+                break
+            except discord.HTTPException as exc:
+                record_failure(f"HTTPException(bulk:{getattr(exc, 'status', 'na')})", exc)
+                logger.info(
+                    "Purge bulk delete failed in channel=%s; falling back to per-message (status=%s)",
+                    getattr(channel, "id", None),
+                    getattr(exc, "status", None),
+                )
+                old.extend(chunk_ids)
+            except Exception as exc:
+                record_failure("Exception(bulk)", exc)
+                old.extend(chunk_ids)
     else:
         old.extend(recent)
 
@@ -393,10 +410,20 @@ async def _delete_by_ids(
                 msg = await channel.fetch_message(mid)  # type: ignore[attr-defined]
                 await msg.delete(reason=reason)
             deleted += 1
-        except Exception:
-            pass
+        except discord.Forbidden as exc:
+            record_failure("Forbidden(single)", exc)
+            logger.warning(
+                "Purge per-message delete forbidden in channel=%s", getattr(channel, "id", None)
+            )
+            break
+        except discord.NotFound as exc:
+            record_failure("NotFound(single)", exc)
+        except discord.HTTPException as exc:
+            record_failure(f"HTTPException(single:{getattr(exc, 'status', 'na')})", exc)
+        except Exception as exc:
+            record_failure("Exception(single)", exc)
 
-    return deleted
+    return deleted, failures, first_error
 
 
 class Purge(commands.Cog):
@@ -560,7 +587,21 @@ class Purge(commands.Cog):
             with contextlib.suppress(Exception):
                 await prompt.delete()
 
-        deleted = await _delete_by_ids(
+        me = ctx.guild.me or ctx.guild.get_member(self.bot.user.id)  # type: ignore[union-attr]
+        perms_for = getattr(channel, "permissions_for", None)
+        if me is not None and callable(perms_for):
+            perms = perms_for(me)
+            if not getattr(perms, "manage_messages", False):
+                return await safe_reply(
+                    ctx,
+                    tag_error_text(
+                        "I need the **Manage Messages** permission in that channel to purge."
+                    ),
+                    ephemeral=True,
+                    mention_author=False,
+                )
+
+        deleted, failures, first_error = await _delete_by_ids(
             channel,
             target_ids,
             reason=f"Purge invoked by {ctx.author} ({ctx.author.id})",
@@ -571,6 +612,12 @@ class Purge(commands.Cog):
             f"✅ Purge complete — {deleted} message(s)\n"
             f"<t:{now}> · <t:{now}:R> · by {ctx.author.mention}"
         )
+        if failures:
+            top = failures.most_common(5)
+            summary = ", ".join([f"{key}: {count}" for key, count in top])
+            completion_text += f"\n⚠️ Failed: {summary}"
+            if first_error:
+                completion_text += f"\nFirst error: {first_error}"
         if ctx.interaction:
             try:
                 msg = await ctx.interaction.followup.send(
