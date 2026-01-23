@@ -3892,7 +3892,13 @@ class Ask(commands.Cog):
             else:
                 await ctx.interaction.response.send_message(**kwargs)
         else:
-            await ctx.reply(**kwargs, mention_author=False)
+            reference = None
+            if ctx.message:
+                reference = ctx.message.to_reference(fail_if_not_exists=False)
+            try:
+                await ctx.send(**kwargs, mention_author=False, reference=reference)
+            except discord.HTTPException:
+                await ctx.send(**kwargs, mention_author=False)
 
     @commands.command(
         name="ask",

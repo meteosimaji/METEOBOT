@@ -566,24 +566,33 @@ class Purge(commands.Cog):
             reason=f"Purge invoked by {ctx.author} ({ctx.author.id})",
         )
 
+        now = int(discord.utils.utcnow().timestamp())
+        completion_text = (
+            f"✅ Purge complete — {deleted} message(s)\n"
+            f"<t:{now}> · <t:{now}:R> · by {ctx.author.mention}"
+        )
         if ctx.interaction:
-            now = int(discord.utils.utcnow().timestamp())
-            msg = await ctx.interaction.followup.send(
-                f"✅ Purge complete — {deleted} message(s)\n"
-                f"<t:{now}> · <t:{now}:R> · by {ctx.author.mention}",
-                ephemeral=True,
-            )
-            await asyncio.sleep(5)
-            with contextlib.suppress(Exception):
-                await msg.delete()
-        else:
+            try:
+                msg = await ctx.interaction.followup.send(
+                    completion_text,
+                    ephemeral=True,
+                )
+                await asyncio.sleep(5)
+                with contextlib.suppress(Exception):
+                    await msg.delete()
+                return
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        if ctx.message:
             reference = ctx.message.to_reference(fail_if_not_exists=False)
-            await ctx.reply(
-                f"Deleted {deleted} message(s).",
-                delete_after=5,
-                mention_author=False,
-                reference=reference,
-            )
+        else:
+            reference = None
+        await channel.send(
+            completion_text,
+            delete_after=5,
+            reference=reference,
+        )
 
 
 async def setup(bot: commands.Bot) -> None:
