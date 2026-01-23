@@ -353,6 +353,32 @@ async def _delete_by_ids(
     now = discord.utils.utcnow()
     cutoff = now - timedelta(days=14)
 
+    async def _delete_one(mid: int) -> None:
+        """Delete a single message ID with best-effort API compatibility."""
+        pm = getattr(channel, "get_partial_message", None)
+        if callable(pm):
+            partial = pm(mid)
+            if reason is not None:
+                try:
+                    await partial.delete(reason=reason)
+                    return
+                except TypeError:
+                    pass
+            try:
+                await partial.delete()
+                return
+            except TypeError:
+                pass
+
+        msg = await channel.fetch_message(mid)  # type: ignore[attr-defined]
+        if reason is not None:
+            try:
+                await msg.delete(reason=reason)
+                return
+            except TypeError:
+                pass
+        await msg.delete()
+
     recent: list[int] = []
     old: list[int] = []
     for mid in message_ids:
@@ -378,7 +404,13 @@ async def _delete_by_ids(
             chunk_ids = recent[i : i + 100]
             chunk = [discord.Object(id=x) for x in chunk_ids]
             try:
-                await delete_messages(chunk, reason=reason)
+                if reason is not None:
+                    try:
+                        await delete_messages(chunk, reason=reason)
+                    except TypeError:
+                        await delete_messages(chunk)
+                else:
+                    await delete_messages(chunk)
                 deleted += len(chunk)
             except discord.Forbidden as exc:
                 record_failure("Forbidden(bulk)", exc)
@@ -403,12 +435,7 @@ async def _delete_by_ids(
 
     for mid in old:
         try:
-            pm = getattr(channel, "get_partial_message", None)
-            if callable(pm):
-                await pm(mid).delete(reason=reason)
-            else:
-                msg = await channel.fetch_message(mid)  # type: ignore[attr-defined]
-                await msg.delete(reason=reason)
+            await _delete_one(mid)
             deleted += 1
         except discord.Forbidden as exc:
             record_failure("Forbidden(single)", exc)
