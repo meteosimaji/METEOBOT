@@ -6,6 +6,7 @@ import contextlib
 import difflib
 import logging
 import re
+import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ from utils import BOT_PREFIX, defer_interaction, sanitize, tag_error_text
 log = logging.getLogger(__name__)
 LINK_RE = re.compile(r"https?://", re.IGNORECASE)
 MENTION_ID_RE = re.compile(r"<@!?(\d+)>")
+ROLE_ID_RE = re.compile(r"<@&(\d+)>")
 MESSAGE_LINK_RE = re.compile(
     r"https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/"
     r"(?:@me|\d+)/\d+/(?P<message_id>\d+)",
@@ -37,12 +39,26 @@ class MessageQuery:
     limit: int = 50
     scan_limit: int | None = None
     keywords: list[str] = field(default_factory=list)
+    exclude_keywords: list[str] = field(default_factory=list)
     from_ids: set[int] = field(default_factory=set)
     from_names: set[str] = field(default_factory=set)
+    exclude_from_ids: set[int] = field(default_factory=set)
+    exclude_from_names: set[str] = field(default_factory=set)
     mention_ids: set[int] = field(default_factory=set)
     mention_names: set[str] = field(default_factory=set)
+    exclude_mention_ids: set[int] = field(default_factory=set)
+    exclude_mention_names: set[str] = field(default_factory=set)
+    mention_role_ids: set[int] = field(default_factory=set)
+    exclude_mention_role_ids: set[int] = field(default_factory=set)
+    role_ids: set[int] = field(default_factory=set)
+    role_names: set[str] = field(default_factory=set)
+    exclude_role_ids: set[int] = field(default_factory=set)
+    exclude_role_names: set[str] = field(default_factory=set)
     has_filters: set[str] = field(default_factory=set)
+    exclude_has_filters: set[str] = field(default_factory=set)
     pinned: bool | None = None
+    author_is_bot: bool | None = None
+    exclude_author_is_bot: bool | None = None
     after: datetime | None = None
     before: datetime | None = None
     during: datetime | None = None
@@ -54,6 +70,9 @@ class MessageQuery:
     in_channel_ids: set[int] = field(default_factory=set)
     in_channel_names: list[str] = field(default_factory=list)
     in_provided: bool = False
+    exclude_in_channel_ids: set[int] = field(default_factory=set)
+    exclude_in_channel_names: list[str] = field(default_factory=list)
+    exclude_in_provided: bool = False
     scope: str | None = None
     scope_provided: bool = False
     scope_invalid: str | None = None
@@ -80,17 +99,69 @@ def _parse_date(value: str) -> tuple[datetime | None, bool]:
     return parsed.replace(tzinfo=timezone.utc), True
 
 
+def _extract_mention_id(raw: str, *, mention_prefixes: tuple[str, ...]) -> int | None:
+    if not raw:
+        return None
+    cleaned = raw.strip().strip("<>.,)")
+    if cleaned.startswith("<@") and cleaned.endswith(">"):
+        inner = cleaned[2:-1]
+        for prefix in mention_prefixes:
+            if prefix and inner.startswith(prefix):
+                inner = inner[len(prefix) :]
+                break
+        if inner.isdigit():
+            return int(inner)
+    cleaned = cleaned.lstrip("@")
+    for prefix in mention_prefixes:
+        if prefix:
+            cleaned = cleaned.lstrip(prefix)
+    if cleaned.isdigit():
+        return int(cleaned)
+    return None
+
+
 def _normalize_user_token(raw: str) -> tuple[int | None, str | None]:
     if not raw:
         return None, None
-    raw = raw.strip("<>.,)")
-    raw = raw.lstrip("@")
-    match = MENTION_ID_RE.match(raw)
+    mention_id = _extract_mention_id(raw, mention_prefixes=("!",))
+    if mention_id is None:
+        mention_id = _extract_mention_id(raw, mention_prefixes=("",))
+    if mention_id is not None:
+        return mention_id, None
+    cleaned = raw.strip("<>.,)")
+    cleaned = cleaned.lstrip("@")
+    return None, cleaned.casefold()
+
+
+def _normalize_role_token(raw: str) -> tuple[int | None, str | None]:
+    if not raw:
+        return None, None
+    stripped = raw.strip()
+    match = ROLE_ID_RE.match(stripped)
     if match:
         return int(match.group(1)), None
-    if raw.isdigit():
-        return int(raw), None
-    return None, raw.casefold()
+    cleaned = raw.strip("<>.,)")
+    if cleaned.startswith("@&") or cleaned.startswith("&"):
+        role_id = cleaned.lstrip("@&")
+        if role_id.isdigit():
+            return int(role_id), None
+    cleaned = cleaned.lstrip("@")
+    cleaned = cleaned.lstrip("&")
+    return None, cleaned.casefold()
+
+
+def _parse_role_mention_id(raw: str) -> int | None:
+    if not raw:
+        return None
+    raw = raw.strip("<>.,)")
+    match = ROLE_ID_RE.match(raw)
+    if match:
+        return int(match.group(1))
+    if raw.startswith("@&") or raw.startswith("&"):
+        cleaned = raw.lstrip("@&")
+        if cleaned.isdigit():
+            return int(cleaned)
+    return None
 
 
 def _parse_message_id(value: str) -> int | None:
@@ -135,7 +206,7 @@ def _parse_query(raw: str | None) -> MessageQuery:
     if not raw:
         return query
 
-    tokens = raw.split()
+    tokens = shlex.split(raw, comments=False, posix=True)
     for index, token in enumerate(tokens):
         if index == 0 and token.isdigit():
             query.limit = int(token)
@@ -147,29 +218,90 @@ def _parse_query(raw: str | None) -> MessageQuery:
 
         key, value = token.split(":", 1)
         key = key.casefold()
+        negated = False
+        if key.startswith("!"):
+            negated = True
+            key = key[1:]
         value = value.strip()
 
         if not value:
             continue
 
         if key == "from":
+            role_id = _parse_role_mention_id(value)
+            if role_id is not None:
+                if negated:
+                    query.exclude_role_ids.add(role_id)
+                else:
+                    query.role_ids.add(role_id)
+                continue
             user_id, name = _normalize_user_token(value)
             if user_id is not None:
-                query.from_ids.add(user_id)
+                if negated:
+                    query.exclude_from_ids.add(user_id)
+                else:
+                    query.from_ids.add(user_id)
             elif name:
-                query.from_names.add(name)
+                if negated:
+                    query.exclude_from_names.add(name)
+                else:
+                    query.from_names.add(name)
             continue
 
         if key == "mentions":
+            role_id = _parse_role_mention_id(value)
+            if role_id is not None:
+                if negated:
+                    query.exclude_mention_role_ids.add(role_id)
+                else:
+                    query.mention_role_ids.add(role_id)
+                continue
             user_id, name = _normalize_user_token(value)
             if user_id is not None:
-                query.mention_ids.add(user_id)
+                if negated:
+                    query.exclude_mention_ids.add(user_id)
+                else:
+                    query.mention_ids.add(user_id)
             elif name:
-                query.mention_names.add(name)
+                if negated:
+                    query.exclude_mention_names.add(name)
+                else:
+                    query.mention_names.add(name)
+            continue
+
+        if key == "role":
+            role_id, name = _normalize_role_token(value)
+            if role_id is not None:
+                if negated:
+                    query.exclude_role_ids.add(role_id)
+                else:
+                    query.role_ids.add(role_id)
+            elif name:
+                if negated:
+                    query.exclude_role_names.add(name)
+                else:
+                    query.role_names.add(name)
             continue
 
         if key == "has":
-            query.has_filters.add(value.casefold())
+            if negated:
+                query.exclude_has_filters.add(value.casefold())
+            else:
+                query.has_filters.add(value.casefold())
+            continue
+
+        if key == "bot":
+            lowered = value.casefold()
+            if lowered in {"true", "yes", "1"}:
+                if negated:
+                    query.exclude_author_is_bot = True
+                else:
+                    query.author_is_bot = True
+            elif lowered in {"false", "no", "0"}:
+                if negated:
+                    query.exclude_author_is_bot = False
+                else:
+                    query.author_is_bot = False
             continue
 
         if key == "scan" and value.isdigit():
@@ -211,15 +343,31 @@ def _parse_query(raw: str | None) -> MessageQuery:
                 query.pinned = False
             continue
 
+        if key == "keyword":
+            if negated:
+                query.exclude_keywords.append(value)
+            else:
+                query.keywords.append(value)
+            continue
+
         if key == "in":
-            query.in_provided = True
+            if negated:
+                query.exclude_in_provided = True
+            else:
+                query.in_provided = True
             parts = [p.strip() for p in value.split(",") if p.strip()]
             for part in parts:
                 channel_id = _parse_channel_id(part)
                 if channel_id is not None:
-                    query.in_channel_ids.add(channel_id)
+                    if negated:
+                        query.exclude_in_channel_ids.add(channel_id)
+                    else:
+                        query.in_channel_ids.add(channel_id)
                 else:
-                    query.in_channel_names.append(part)
+                    if negated:
+                        query.exclude_in_channel_names.append(part)
+                    else:
+                        query.in_channel_names.append(part)
             continue
 
         if key == "scope":
@@ -327,6 +475,30 @@ def _message_has_filter(message: discord.Message, has_filters: set[str]) -> bool
     return all(_match_has(name) for name in has_filters)
 
 
+def _message_has_any_filter(message: discord.Message, has_filters: set[str]) -> bool:
+    if not has_filters:
+        return False
+    return any(_message_has_filter(message, {name}) for name in has_filters)
+
+
+def _keyword_matches_single(text: str, keyword: str) -> bool:
+    if not keyword:
+        return True
+    if "*" not in keyword:
+        return keyword in text
+    pattern = re.escape(keyword).replace(r"\*", ".*")
+    return bool(re.search(pattern, text, flags=re.DOTALL))
+
+
+def _keyword_matches(text: str, keyword: str) -> bool:
+    if "|" in keyword:
+        parts = [part for part in keyword.split("|") if part]
+        if not parts:
+            return False
+        return any(_keyword_matches_single(text, part) for part in parts)
+    return _keyword_matches_single(text, keyword)
+
+
 def _message_matches_query(message: discord.Message, query: MessageQuery) -> bool:
     if query.from_ids or query.from_names:
         author = message.author
@@ -342,13 +514,29 @@ def _message_matches_query(message: discord.Message, query: MessageQuery) -> boo
             if not any(name in author_name for name in query.from_names):
                 return False
 
-    if query.mention_ids or query.mention_names:
+    if query.exclude_from_ids or query.exclude_from_names:
+        author = message.author
+        author_id = getattr(author, "id", None)
+        author_name = (
+            getattr(author, "display_name", None)
+            or getattr(author, "name", None)
+            or ""
+        ).casefold()
+        if query.exclude_from_ids and author_id in query.exclude_from_ids:
+            return False
+        if query.exclude_from_names and author_name in query.exclude_from_names:
+            return False
+        if query.exclude_from_names and any(name in author_name for name in query.exclude_from_names):
+            return False
+
+    if query.mention_ids or query.mention_names or query.mention_role_ids:
         mentions = message.mentions or []
         mention_ids = {u.id for u in mentions}
         mention_names = {
             (getattr(u, "display_name", None) or getattr(u, "name", "")).casefold()
             for u in mentions
         }
+        mention_role_ids = {r.id for r in getattr(message, "role_mentions", []) or []}
         if query.mention_ids and not (mention_ids & query.mention_ids):
             return False
         if query.mention_names and not (mention_names & query.mention_names):
@@ -358,6 +546,77 @@ def _message_matches_query(message: discord.Message, query: MessageQuery) -> boo
                 for mention in mention_names
             ):
                 return False
+        if query.mention_role_ids and not (mention_role_ids & query.mention_role_ids):
+            return False
+
+    if query.exclude_mention_ids or query.exclude_mention_names or query.exclude_mention_role_ids:
+        mentions = message.mentions or []
+        mention_ids = {u.id for u in mentions}
+        mention_names = {
+            (getattr(u, "display_name", None) or getattr(u, "name", "")).casefold()
+            for u in mentions
+        }
+        mention_role_ids = {r.id for r in getattr(message, "role_mentions", []) or []}
+        if query.exclude_mention_ids and (mention_ids & query.exclude_mention_ids):
+            return False
+        if query.exclude_mention_names and (mention_names & query.exclude_mention_names):
+            return False
+        if query.exclude_mention_names and any(
+            target in mention
+            for target in query.exclude_mention_names
+            for mention in mention_names
+            ):
+                return False
+        if query.exclude_mention_role_ids and (mention_role_ids & query.exclude_mention_role_ids):
+            return False
+
+    has_role_filters = bool(
+        query.role_ids
+        or query.role_names
+        or query.exclude_role_ids
+        or query.exclude_role_names
+    )
+    member = None
+    if has_role_filters:
+        member = message.author if isinstance(message.author, discord.Member) else None
+        if member is None:
+            guild = getattr(message, "guild", None)
+            if guild is not None:
+                member = guild.get_member(getattr(message.author, "id", 0))
+        if member is None:
+            return False
+
+    if query.role_ids or query.role_names:
+        if member is None:
+            return False
+        member_roles = getattr(member, "roles", []) or []
+        role_ids = {getattr(role, "id", None) for role in member_roles}
+        role_names = {getattr(role, "name", "").casefold() for role in member_roles}
+        if query.role_ids and not (role_ids & query.role_ids):
+            return False
+        if query.role_names and not (role_names & query.role_names):
+            if not any(name in role_name for name in query.role_names for role_name in role_names):
+                return False
+
+    if query.exclude_role_ids or query.exclude_role_names:
+        if member is not None:
+            member_roles = getattr(member, "roles", []) or []
+            role_ids = {getattr(role, "id", None) for role in member_roles}
+            role_names = {getattr(role, "name", "").casefold() for role in member_roles}
+            if query.exclude_role_ids and (role_ids & query.exclude_role_ids):
+                return False
+            if query.exclude_role_names and (role_names & query.exclude_role_names):
+                return False
+            if query.exclude_role_names and any(
+                name in role_name for name in query.exclude_role_names for role_name in role_names
+            ):
+                return False
+
+    if query.author_is_bot is not None and message.author.bot != query.author_is_bot:
+        return False
+
+    if query.exclude_author_is_bot is not None and message.author.bot == query.exclude_author_is_bot:
+        return False
 
     if query.pinned is not None and message.pinned != query.pinned:
         return False
@@ -374,8 +633,16 @@ def _message_matches_query(message: discord.Message, query: MessageQuery) -> boo
 
     if query.keywords:
         text = (message.content or "").casefold()
-        if not all(keyword.casefold() in text for keyword in query.keywords):
+        if not all(_keyword_matches(text, keyword.casefold()) for keyword in query.keywords):
             return False
+
+    if query.exclude_keywords:
+        text = (message.content or "").casefold()
+        if any(_keyword_matches(text, keyword.casefold()) for keyword in query.exclude_keywords):
+            return False
+
+    if query.exclude_has_filters and _message_has_any_filter(message, query.exclude_has_filters):
+        return False
 
     return _message_has_filter(message, query.has_filters)
 
@@ -449,22 +716,26 @@ class Messages(commands.Cog):
         help=(
             "Retrieve and filter messages in the current channel. Provide a number "
             "to change how many are shown (defaults to 50, min 1 / max 50). You can also "
-            "use search filters like from:, mentions:, has:, before:, after:, during:, "
+            "use search filters like from:, mentions:, role:, has:, keyword:, bot:, before:, after:, during:, "
             "before_id:, after_id:, in:, scope:, pinned:true/false, and scan: (max history to scan; "
-            "defaults to all history when filters are used, so scan: is optional). "
+            "defaults to all history when filters are used, so scan: is optional). Prefix filters with "
+            "! to exclude matches (e.g. !from:, !mentions:, !role:, !has:, !keyword:, !bot:, !in:). "
             "during: uses the server timezone (set via /settime) and ignores before_id:/after_id. "
             "in: accepts channel mentions/IDs/links across servers; plain channel names "
             "only resolve within the current server and may require disambiguation. "
             "scope: supports all, global, or category=<id|name> to scan across multiple "
-            "channels (use either scope: or in:, not both). Add server:<id|name> with scope:all "
+            "channels (use scope: or in:, not both; !in: may be combined with scope: to "
+            "exclude channels). Add server:<id|name> with scope:all "
             "or scope:category to target a specific server by ID or name. Multi-channel results include "
             "the channel (and server for scope:global) next to each message. "
             "Text outside filters is "
-            "treated as search keywords.\n\n"
+            "treated as search keywords (supports * wildcard, | for OR, and quoted phrases).\n\n"
             "**Usage**: `/messages [query]`\n"
             "**Examples**: `/messages`, `/messages 5`, `/messages おはよう from:1234`, "
             "`/messages has:link before:2026-01-01`, `/messages scan:1000 has:image`, "
             "`/messages before_id:1234567890 scan:2000`, `/messages in:<#1234567890>`, "
+            "`/messages !in:<#1234567890> keyword:err*`, `/messages from:<@&1234567890>`, "
+            "`/messages mentions:<@&1234567890>`, `/messages bot:true role:mods`, "
             "`/messages scope:all`\n"
             f"`{BOT_PREFIX}messages 15 from:@user`"
         ),
@@ -473,12 +744,17 @@ class Messages(commands.Cog):
             "pro": (
                 "If no count is provided the command shows 50 messages by default. "
                 "The count is clamped to a maximum of 50. Query filters like from:, "
-            "mentions:, has:, before:, after:, during:, before_id:, after_id:, in:, "
-            "scope:, pinned:true/false, and scan: are supported (in: accepts multiple values "
-            "separated by commas). When filters are used without scan:, the command "
-            "scans all available history, so scan: is optional. Use server:<id|name> with scope:all "
-            "or scope:category to target a specific server. Long outputs are trimmed to fit Discord's "
-            "embed limits."
+            "mentions:, role:, has:, keyword:, bot:, before:, after:, during:, before_id:, after_id:, "
+            "in:, scope:, pinned:true/false, and scan: are supported (in: accepts multiple values "
+            "separated by commas; from:/mentions: accept role mentions like <@&id>). Use scope: or "
+            "in:, not both (but !in: can be combined "
+            "with scope: to exclude channels). Prefix filters with ! to exclude matches "
+            "(for example !from:, !mentions:, !role:, !has:, !keyword:, !bot:, !in:). Keyword "
+            "matching supports * wildcards, | for OR, and quoted phrases; text outside filters is "
+            "treated as keyword search too. "
+            "When filters are used without scan:, the command scans all available history, so "
+            "scan: is optional. Use server:<id|name> with scope:all or scope:category to target a "
+            "specific server. Long outputs are trimmed to fit Discord's embed limits."
         ),
         },
     )
@@ -487,7 +763,31 @@ class Messages(commands.Cog):
     ) -> None:  # type: ignore[override]
         await defer_interaction(ctx)
         try:
-            parsed = _parse_query(query)
+            try:
+                parsed = _parse_query(query)
+            except ValueError:
+                error_message = tag_error_text(
+                    "Invalid query: please check for an unclosed quote."
+                )
+                if ctx.interaction and ctx.interaction.response.is_done():
+                    await ctx.interaction.followup.send(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                elif ctx.interaction:
+                    await ctx.interaction.response.send_message(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    await ctx.reply(
+                        error_message,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                return
             amount = max(1, min(50, int(parsed.limit)))
 
             tz = timezone.utc
@@ -521,9 +821,23 @@ class Messages(commands.Cog):
                 parsed.after_id = None
                 parsed.before_id = None
 
+            has_role_filters = bool(
+                parsed.role_ids
+                or parsed.role_names
+                or parsed.exclude_role_ids
+                or parsed.exclude_role_names
+            )
+            if has_role_filters and not self.bot.intents.members:
+                resolve_errors = [
+                    "Role filters may be incomplete because the bot lacks the Members intent."
+                ]
+            else:
+                resolve_errors = []
+
             if parsed.scope and (parsed.in_channel_ids or parsed.in_channel_names):
                 error_message = tag_error_text(
-                    "Use either scope: or in: filters, not both in the same query."
+                    "Use scope: or in: filters, not both in the same query (use !in: with scope: "
+                    "to exclude channels)."
                 )
                 if ctx.interaction and ctx.interaction.response.is_done():
                     await ctx.interaction.followup.send(
@@ -572,6 +886,32 @@ class Messages(commands.Cog):
             if parsed.in_provided and not (parsed.in_channel_ids or parsed.in_channel_names):
                 error_message = tag_error_text(
                     "in: requires at least one channel mention, ID, link, or name."
+                )
+                if ctx.interaction and ctx.interaction.response.is_done():
+                    await ctx.interaction.followup.send(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                elif ctx.interaction:
+                    await ctx.interaction.response.send_message(
+                        error_message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    await ctx.reply(
+                        error_message,
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                return
+
+            if parsed.exclude_in_provided and not (
+                parsed.exclude_in_channel_ids or parsed.exclude_in_channel_names
+            ):
+                error_message = tag_error_text(
+                    "!in: requires at least one channel mention, ID, link, or name."
                 )
                 if ctx.interaction and ctx.interaction.response.is_done():
                     await ctx.interaction.followup.send(
@@ -682,10 +1022,10 @@ class Messages(commands.Cog):
                     return
                 target_guild = next(iter(unique_candidates))
 
-            if parsed.in_channel_names:
+            if parsed.in_channel_names or parsed.exclude_in_channel_names:
                 if ctx.guild is None:
                     error_message = tag_error_text(
-                        "in: with a channel name only works inside a server. "
+                        "in: or !in: with a channel name only works inside a server. "
                         "Use a channel mention (<#...>), ID, or link."
                     )
                     if ctx.interaction and ctx.interaction.response.is_done():
@@ -719,23 +1059,28 @@ class Messages(commands.Cog):
                         continue
                     name_index.setdefault(channel_name.casefold(), []).append(channel)
 
-                unresolved: list[str] = []
-                ambiguous: list[tuple[str, list[discord.abc.GuildChannel]]] = []
+                def _resolve_channel_names(
+                    raw_names: list[str],
+                    *,
+                    target_ids: set[int],
+                    label: str,
+                ) -> list[str]:
+                    unresolved: list[str] = []
+                    ambiguous: list[tuple[str, list[discord.abc.GuildChannel]]] = []
 
-                for raw_name in parsed.in_channel_names:
-                    normalized = _normalize_channel_name(raw_name)
-                    if not normalized:
-                        unresolved.append(raw_name)
-                        continue
-                    matches = name_index.get(normalized, [])
-                    if len(matches) == 1:
-                        parsed.in_channel_ids.add(matches[0].id)
-                    elif len(matches) == 0:
-                        unresolved.append(raw_name)
-                    else:
-                        ambiguous.append((raw_name, matches))
+                    for raw_name in raw_names:
+                        normalized = _normalize_channel_name(raw_name)
+                        if not normalized:
+                            unresolved.append(raw_name)
+                            continue
+                        matches = name_index.get(normalized, [])
+                        if len(matches) == 1:
+                            target_ids.add(matches[0].id)
+                        elif len(matches) == 0:
+                            unresolved.append(raw_name)
+                        else:
+                            ambiguous.append((raw_name, matches))
 
-                if ambiguous or unresolved:
                     parts: list[str] = []
 
                     if ambiguous:
@@ -748,7 +1093,7 @@ class Messages(commands.Cog):
                                 candidates.append(f"{mention} ({category})" if category else mention)
                             shown.append(f"{raw_name} -> {', '.join(candidates)}")
                         parts.append(
-                            "Ambiguous in: channel name(s). Use a channel mention/ID/link to "
+                            f"Ambiguous {label}: channel name(s). Use a channel mention/ID/link to "
                             f"disambiguate. {' | '.join(shown)}"
                         )
 
@@ -774,15 +1119,30 @@ class Messages(commands.Cog):
                                 break
                         if uniq:
                             parts.append(
-                                "Unknown in: channel name(s): "
+                                f"Unknown {label}: channel name(s): "
                                 f"{', '.join(unresolved[:5])}. Did you mean: {', '.join(uniq)}"
                             )
                         else:
                             parts.append(
-                                "Unknown in: channel name(s): " f"{', '.join(unresolved[:5])}."
+                                f"Unknown {label}: channel name(s): "
+                                f"{', '.join(unresolved[:5])}."
                             )
 
-                    error_message = tag_error_text(" ".join(parts))
+                    return parts
+
+                in_parts = _resolve_channel_names(
+                    parsed.in_channel_names,
+                    target_ids=parsed.in_channel_ids,
+                    label="in",
+                )
+                exclude_parts = _resolve_channel_names(
+                    parsed.exclude_in_channel_names,
+                    target_ids=parsed.exclude_in_channel_ids,
+                    label="!in",
+                )
+
+                if in_parts or exclude_parts:
+                    error_message = tag_error_text(" ".join(in_parts + exclude_parts))
                     if ctx.interaction and ctx.interaction.response.is_done():
                         await ctx.interaction.followup.send(
                             error_message,
@@ -907,12 +1267,26 @@ class Messages(commands.Cog):
 
             use_filters = bool(
                 parsed.keywords
+                or parsed.exclude_keywords
                 or parsed.from_ids
                 or parsed.from_names
+                or parsed.exclude_from_ids
+                or parsed.exclude_from_names
                 or parsed.mention_ids
                 or parsed.mention_names
+                or parsed.exclude_mention_ids
+                or parsed.exclude_mention_names
+                or parsed.mention_role_ids
+                or parsed.exclude_mention_role_ids
+                or parsed.role_ids
+                or parsed.role_names
+                or parsed.exclude_role_ids
+                or parsed.exclude_role_names
                 or parsed.has_filters
+                or parsed.exclude_has_filters
                 or parsed.pinned is not None
+                or parsed.author_is_bot is not None
+                or parsed.exclude_author_is_bot is not None
                 or parsed.after
                 or parsed.before
                 or parsed.after_id
@@ -920,6 +1294,8 @@ class Messages(commands.Cog):
                 or parsed.scan_limit
                 or parsed.in_channel_ids
                 or parsed.in_channel_names
+                or parsed.exclude_in_channel_ids
+                or parsed.exclude_in_channel_names
                 or parsed.scope
             )
             scan_limit = amount
@@ -941,7 +1317,6 @@ class Messages(commands.Cog):
                 history_kwargs["before"] = parsed.before
 
             target_channels: list[discord.abc.Messageable] = []
-            resolve_errors: list[str] = []
             if parsed.scope:
                 def _guild_candidates(guild: discord.Guild) -> list[discord.abc.GuildChannel]:
                     candidates: list[discord.abc.GuildChannel] = []
@@ -1157,6 +1532,13 @@ class Messages(commands.Cog):
                         )
                     return
                 target_channels.append(ctx.channel)
+
+            if parsed.exclude_in_channel_ids:
+                target_channels = [
+                    channel
+                    for channel in target_channels
+                    if getattr(channel, "id", None) not in parsed.exclude_in_channel_ids
+                ]
 
             warnings = resolve_errors
             if warnings and not target_channels:
