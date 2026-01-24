@@ -224,7 +224,9 @@ class Image(commands.Cog):
             lower_hint = filename_hint.lower()
 
             # Quick detection for obvious HTML responses to improve user-facing notes.
-            if data[:6].lower().startswith(b"<html") or data[:1] == b"<":
+            stripped = data.lstrip()
+            probe = stripped[3:] if stripped.startswith(b"\xef\xbb\xbf") else stripped
+            if probe.startswith(b"<") and probe[:20].lower().startswith((b"<html", b"<!doctype")):
                 notes.append(f"Skipped {source}: URL returned HTML, not an image.")
                 return None
 
@@ -401,6 +403,7 @@ class Image(commands.Cog):
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 loop = asyncio.get_running_loop()
+                request_headers = {"Accept": "image/png,image/*;q=0.8,*/*;q=0.5"}
 
                 async def _is_blocked_host(hostname: str) -> bool:
                     try:
@@ -444,6 +447,10 @@ class Image(commands.Cog):
                     # before normalization/fetching.
                     url = raw_url
                     normalized_url = _normalize_discord_cdn_url(url)
+                    png_preferred_url = _with_discord_cdn_format(
+                        normalized_url, "png", prefer_media=True
+                    )
+                    initial_url = png_preferred_url or normalized_url
                     if normalized_url in seen_urls:
                         continue
                     seen_urls.add(normalized_url)
@@ -514,14 +521,16 @@ class Image(commands.Cog):
 
                     try:
                         redirect_statuses = {301, 302, 303, 307, 308}
-                        current_url = normalized_url
+                        current_url = initial_url
                         redirect_hops = 0
                         attempted_png_fallback = False
                         attempted_retry = False
                         attempted_alt_host = False
                         used_png_fallback = False
                         while True:
-                            resp = await session.get(current_url, allow_redirects=False)
+                            resp = await session.get(
+                                current_url, allow_redirects=False, headers=request_headers
+                            )
                             try:
                                 if resp.status in redirect_statuses:
                                     location = resp.headers.get("Location")
