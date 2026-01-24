@@ -4249,20 +4249,27 @@ class Ask(commands.Cog):
             return [entry for entry in links if isinstance(entry, dict) and entry.get("url")]
         return []
 
-    async def _reply(self, ctx: commands.Context, **kwargs: Any) -> None:
+    async def _reply(
+        self,
+        ctx: commands.Context,
+        *,
+        reference: discord.Message | discord.MessageReference | None = None,
+        **kwargs: Any,
+    ) -> discord.Message | None:
         if ctx.interaction:
             if ctx.interaction.response.is_done():
-                await ctx.interaction.followup.send(**kwargs)
+                return await ctx.interaction.followup.send(**kwargs, wait=True)
             else:
                 await ctx.interaction.response.send_message(**kwargs)
+                return await ctx.interaction.original_response()
         else:
-            reference = None
-            if ctx.message:
+            if reference is None and ctx.message:
                 reference = ctx.message.to_reference(fail_if_not_exists=False)
             try:
-                await ctx.send(**kwargs, mention_author=False, reference=reference)
+                return await ctx.send(**kwargs, mention_author=False, reference=reference)
             except discord.HTTPException:
-                await ctx.send(**kwargs, mention_author=False)
+                return await ctx.send(**kwargs, mention_author=False)
+        return None
 
     @commands.command(
         name="ask",
@@ -4942,17 +4949,25 @@ class Ask(commands.Cog):
 
             sources_text = ""
             sources_value = ""
-            sources_needs_attachment = False
+            sources_files: list[discord.File] = []
+            sources_attached = False
             if sources_lines:
                 sources_text = "\n".join(sources_lines)
-                if len(sources_text) > 1024:
-                    sources_needs_attachment = True
-                    preview_limit = max(1, 1024 - len(answer_note))
+                sources_value = sources_text
+                if len(sources_text) > 4096:
+                    sources_attached, sources_truncated = _extend_text_files(
+                        sources_files,
+                        "ask-sources.txt",
+                        sources_text,
+                        max_bytes=max_file_bytes,
+                    )
+                    if sources_attached and not sources_truncated:
+                        note = answer_note
+                    else:
+                        note = answer_truncated_note
+                    preview_limit = max(1, 4096 - (len(note) + 1))
                     sources_preview = _truncate_discord(sources_text, preview_limit)
-                    sources_value = f"{sources_preview}{answer_note}"
-                else:
-                    sources_value = sources_text
-                embed.add_field(name="\U0001F517 Sources", value=sources_value, inline=False)
+                    sources_value = f"{note}\n{sources_preview}"
 
             if not answer_attached and _embed_char_count(embed) > 6000:
                 answer_attached, answer_truncated = _extend_text_files(
@@ -4972,22 +4987,13 @@ class Ask(commands.Cog):
                     embed.description = f"{answer_note_text}{answer_preview}"
                     answer_attached = True
 
-            if sources_needs_attachment and sources_text:
-                sources_attached, sources_truncated = _extend_text_files(
-                    files,
-                    "ask-sources.txt",
-                    sources_text,
-                    max_bytes=max_file_bytes,
+            sources_embed = None
+            if sources_lines:
+                sources_embed = discord.Embed(
+                    title="\U0001F517 Sources",
+                    description=sources_value,
+                    color=0x5865F2,
                 )
-                if sources_attached and not sources_truncated:
-                    preview_limit = max(1, 1024 - len(answer_note))
-                    sources_preview = _truncate_discord(sources_text, preview_limit)
-                    sources_value = f"{sources_preview}{answer_note}"
-                else:
-                    preview_limit = max(1, 1024 - (len(answer_truncated_note) + 1))
-                    sources_preview = _truncate_discord(sources_text, preview_limit)
-                    sources_value = f"{answer_truncated_note}\n{sources_preview}"
-                embed.set_field_at(0, name="\U0001F517 Sources", value=sources_value, inline=False)
 
             trimmed = _clamp_embed_description(embed)
             if trimmed and not answer_attached:
@@ -4998,7 +5004,12 @@ class Ask(commands.Cog):
             reply_kwargs: dict[str, Any] = {"embed": embed}
             if files:
                 reply_kwargs["files"] = files
-            await self._reply(ctx, **reply_kwargs)
+            main_message = await self._reply(ctx, **reply_kwargs)
+            if sources_embed:
+                sources_kwargs: dict[str, Any] = {"embed": sources_embed}
+                if sources_files:
+                    sources_kwargs["files"] = sources_files
+                await self._reply(ctx, reference=main_message, **sources_kwargs)
             for run_id in self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), []):
                 self._start_pending_ask_auto_delete(run_id)
             if action == "ask" and acquired_lock:
