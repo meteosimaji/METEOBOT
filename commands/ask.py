@@ -212,6 +212,24 @@ class AskAttachmentRecord:
     source: str
     added_at: str
 
+
+@dataclass
+class QueuedAskRequest:
+    ctx: commands.Context
+    action: str
+    text: str | None
+    extra_images: list[discord.Attachment | None] | None
+    state_key: str
+    queued_at: datetime
+    message_id: int | None
+    channel_id: int | None
+    guild_id: int | None
+    interaction_id: int | None
+    wait_message: discord.Message | None
+    wait_message_id: int | None
+    wait_channel_id: int | None
+    wait_guild_id: int | None
+
 @dataclass
 class ShellPolicy:
     root_dir: Path
@@ -1803,6 +1821,8 @@ class Ask(commands.Cog):
         self._ask_autodelete_tasks: dict[int, asyncio.Task] = {}
         self._ask_autodelete_pending: dict[str, dict[int, discord.Message]] = {}
         self._ask_run_ids_by_ctx: dict[int, list[str]] = {}
+        self._ask_locks_by_channel: dict[str, asyncio.Lock] = {}
+        self._ask_queue_by_channel: dict[str, deque[QueuedAskRequest]] = {}
         self._http_session: aiohttp.ClientSession | None = None
         self._attachment_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ask_attach")
 
@@ -1825,6 +1845,203 @@ class Ask(commands.Cog):
         guild_id = ctx.guild.id if ctx.guild else 0
         channel_id = ctx.channel.id if ctx.channel else 0
         return f"{guild_id}:{channel_id}"
+
+    def _get_ask_lock(self, state_key: str) -> asyncio.Lock:
+        lock = self._ask_locks_by_channel.get(state_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ask_locks_by_channel[state_key] = lock
+        return lock
+
+    def _get_ask_queue(self, state_key: str) -> deque[QueuedAskRequest]:
+        queue = self._ask_queue_by_channel.get(state_key)
+        if queue is None:
+            queue = deque()
+            self._ask_queue_by_channel[state_key] = queue
+        return queue
+
+    def _build_queue_embed(self, position: int, total: int) -> discord.Embed:
+        embed = discord.Embed(
+            title="⏳ /ask queued",
+            description="I will run this once the current /ask finishes.",
+            color=0xFEE75C,
+        )
+        embed.add_field(name="Queue", value=f"{position} / {total}", inline=True)
+        embed.set_footer(text="If the original message disappears, this will be skipped.")
+        return embed
+
+    def _build_queue_start_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title="▶️ /ask starting",
+            description="Your turn is up, starting now.",
+            color=0x57F287,
+        )
+
+    def _build_queue_skipped_embed(self, reason: str) -> discord.Embed:
+        return discord.Embed(
+            title="⏭️ /ask skipped",
+            description=reason,
+            color=0xED4245,
+        )
+
+    def _build_queue_cleared_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title="🧹 /ask queue cleared",
+            description="reset ran, so the waiting /ask requests were withdrawn.",
+            color=0xED4245,
+        )
+
+    async def _send_queue_embed(
+        self,
+        ctx: commands.Context,
+        *,
+        position: int,
+        total: int,
+    ) -> discord.Message | None:
+        embed = self._build_queue_embed(position, total)
+        try:
+            if ctx.interaction:
+                if ctx.interaction.response.is_done():
+                    return await ctx.interaction.followup.send(
+                        embed=embed, ephemeral=True, wait=True
+                    )
+                await ctx.interaction.response.send_message(embed=embed, ephemeral=True)
+                return await ctx.interaction.original_response()
+
+            return await ctx.reply(embed=embed, mention_author=False)
+        except Exception:
+            return None
+
+    async def _update_queue_message(
+        self,
+        request: QueuedAskRequest,
+        *,
+        embed: discord.Embed,
+    ) -> None:
+        msg = request.wait_message
+        if msg is not None:
+            with contextlib.suppress(Exception):
+                await msg.edit(embed=embed)
+            return
+
+        if request.wait_message_id and request.wait_channel_id:
+            channel = self._get_messageable(
+                request.wait_channel_id,
+                guild_id=request.wait_guild_id,
+            )
+            fetcher = getattr(channel, "fetch_message", None) if channel else None
+            if fetcher is None:
+                return
+            try:
+                msg = await fetcher(request.wait_message_id)
+            except Exception:
+                return
+            with contextlib.suppress(Exception):
+                await msg.edit(embed=embed)
+
+    async def _validate_queued_request(self, request: QueuedAskRequest) -> bool:
+        interaction = request.ctx.interaction
+        if interaction and interaction.is_expired():
+            await self._update_queue_message(
+                request,
+                embed=self._build_queue_skipped_embed(
+                    "The interaction expired while waiting. Please run /ask again."
+                ),
+            )
+            return False
+
+        if request.message_id and request.channel_id:
+            message = await self._fetch_message_from_channel(
+                channel_id=request.channel_id,
+                message_id=request.message_id,
+                channel=self.bot.get_channel(request.channel_id),
+                guild_id=request.guild_id,
+                actor=request.ctx.author,
+            )
+            if message is None:
+                await self._update_queue_message(
+                    request,
+                    embed=self._build_queue_skipped_embed(
+                        "The original message disappeared while waiting. Please send it again."
+                    ),
+                )
+                return False
+
+        return True
+
+    async def _enqueue_ask_request(
+        self,
+        ctx: commands.Context,
+        *,
+        action: str,
+        text: str | None,
+        extra_images: list[discord.Attachment | None] | None,
+        state_key: str,
+    ) -> None:
+        queue = self._get_ask_queue(state_key)
+        position = len(queue) + 1
+        wait_message = await self._send_queue_embed(ctx, position=position, total=position)
+        wait_channel_id = getattr(wait_message, "channel", None)
+        wait_channel_id = getattr(wait_channel_id, "id", None)
+        wait_guild_id = getattr(getattr(wait_message, "guild", None), "id", None)
+        request = QueuedAskRequest(
+            ctx=ctx,
+            action=action,
+            text=text,
+            extra_images=extra_images,
+            state_key=state_key,
+            queued_at=datetime.now(timezone.utc),
+            message_id=getattr(getattr(ctx, "message", None), "id", None),
+            channel_id=getattr(getattr(ctx, "channel", None), "id", None),
+            guild_id=getattr(getattr(ctx, "guild", None), "id", None),
+            interaction_id=getattr(getattr(ctx, "interaction", None), "id", None),
+            wait_message=wait_message,
+            wait_message_id=getattr(wait_message, "id", None),
+            wait_channel_id=wait_channel_id,
+            wait_guild_id=wait_guild_id,
+        )
+        queue.append(request)
+
+    async def _drain_ask_queue(self, state_key: str, *, lock: asyncio.Lock | None = None) -> None:
+        queue = self._get_ask_queue(state_key)
+        if not queue:
+            return
+
+        lock_obj = lock or self._get_ask_lock(state_key)
+        release_after = False
+        if lock is None:
+            if lock_obj.locked():
+                return
+            await lock_obj.acquire()
+            release_after = True
+
+        try:
+            while queue:
+                request = queue.popleft()
+                if not await self._validate_queued_request(request):
+                    continue
+                await self._update_queue_message(
+                    request, embed=self._build_queue_start_embed()
+                )
+                await self._ask_impl(
+                    request.ctx,
+                    request.action,
+                    request.text,
+                    extra_images=request.extra_images,
+                    skip_queue=True,
+                )
+        finally:
+            if release_after:
+                lock_obj.release()
+
+    async def _clear_ask_queue(self, state_key: str) -> None:
+        queue = self._get_ask_queue(state_key)
+        if not queue:
+            return
+        cleared_embed = self._build_queue_cleared_embed()
+        while queue:
+            request = queue.popleft()
+            await self._update_queue_message(request, embed=cleared_embed)
 
     def _attachment_bucket(self, cache_key: tuple[int, int, int]) -> OrderedDict[str, AskAttachmentRecord]:
         bucket = self._attachment_cache.get(cache_key)
@@ -3977,9 +4194,57 @@ class Ask(commands.Cog):
         action: str,
         text: str | None,
         extra_images: list[discord.Attachment | None] | None = None,
+        *,
+        skip_queue: bool = False,
     ) -> None:
         action = (action or "ask").lower()
         text = (text or "").strip()
+
+        if action not in {"ask", "reset"}:
+            text = f"{action} {text}".strip()
+            action = "ask"
+
+        if action == "reset" and text:
+            text = f"reset {text}".strip()
+            action = "ask"
+
+        guild_id = ctx.guild.id if ctx.guild else 0
+        channel_id = ctx.channel.id if ctx.channel else 0
+        state_key = f"{guild_id}:{channel_id}"
+
+        perms = getattr(ctx.author, "guild_permissions", None) if ctx.guild else None
+        is_admin = bool(getattr(perms, "administrator", False))
+        if action == "reset" and not text and not is_admin:
+            text = "reset"
+            action = "ask"
+
+        acquired_lock = False
+        lock = self._get_ask_lock(state_key)
+        deferred = False
+        if action == "ask" and not skip_queue:
+            if lock.locked():
+                await self._enqueue_ask_request(
+                    ctx,
+                    action=action,
+                    text=text,
+                    extra_images=extra_images,
+                    state_key=state_key,
+                )
+                return
+            if ctx.interaction:
+                await defer_interaction(ctx)
+                deferred = True
+            if lock.locked():
+                await self._enqueue_ask_request(
+                    ctx,
+                    action=action,
+                    text=text,
+                    extra_images=extra_images,
+                    state_key=state_key,
+                )
+                return
+            await lock.acquire()
+            acquired_lock = True
 
         attachments: list[discord.Attachment] = []
         seen_attachment_ids: set[int] = set()
@@ -4048,27 +4313,9 @@ class Ask(commands.Cog):
         except Exception:
             pass
 
-        if action not in {"ask", "reset"}:
-            text = f"{action} {text}".strip()
-            action = "ask"
-
-        if action == "reset" and text:
-            text = f"reset {text}".strip()
-            action = "ask"
-
-        perms = getattr(ctx.author, "guild_permissions", None) if ctx.guild else None
-        is_admin = bool(getattr(perms, "administrator", False))
-
-        if action == "reset" and not text and not is_admin:
-            text = "reset"
-            action = "ask"
-
-        if action == "ask":
+        if action == "ask" and (skip_queue or not acquired_lock) and not deferred:
             await defer_interaction(ctx)
 
-        guild_id = ctx.guild.id if ctx.guild else 0
-        channel_id = ctx.channel.id if ctx.channel else 0
-        state_key = f"{guild_id}:{channel_id}"
         ctx_key = self._attachment_cache_key(ctx)
         with contextlib.suppress(Exception):
             self._cache_attachments(ctx_key=ctx_key, attachments=attachments, source="current_request")
@@ -4131,6 +4378,8 @@ class Ask(commands.Cog):
 
             with contextlib.suppress(Exception):
                 await prompt_message.edit(view=None)
+
+            await self._clear_ask_queue(state_key)
 
             try:
                 removed = self.bot.ai_last_response_id.pop(state_key, None)  # type: ignore[attr-defined]
@@ -4556,6 +4805,10 @@ class Ask(commands.Cog):
                 pass
             for run_id in self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), []):
                 self._start_pending_ask_auto_delete(run_id)
+        finally:
+            if action == "ask" and acquired_lock:
+                await self._drain_ask_queue(state_key, lock=lock)
+                lock.release()
 
 
 async def setup(bot: commands.Bot) -> None:
