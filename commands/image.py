@@ -617,7 +617,13 @@ class Image(commands.Cog):
                                 except ValueError:
                                     pass
 
-                                data = await resp.content.read(MAX_IMAGE_BYTES + 1)
+                                if content_length_val is not None:
+                                    try:
+                                        data = await resp.content.readexactly(content_length_val)
+                                    except asyncio.IncompleteReadError as exc:
+                                        data = exc.partial
+                                else:
+                                    data = await resp.content.read(MAX_IMAGE_BYTES + 1)
                                 log.info(
                                     "Downloaded image bytes len=%d content-length=%s content-type=%s url=%s",
                                     len(data),
