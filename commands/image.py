@@ -145,6 +145,22 @@ def _with_discord_cdn_format(
     return urlunparse(parsed._replace(query=urlencode(query_dict, doseq=True)))
 
 
+def _swap_discord_cdn_host(url: str) -> str | None:
+    """Swap between cdn.discordapp.com and media.discordapp.net when safe."""
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"media.discordapp.net", "cdn.discordapp.com"}:
+        return None
+
+    query_dict = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if any(key in query_dict for key in ("ex", "is", "hm")):
+        return None
+
+    new_host = "cdn.discordapp.com" if host == "media.discordapp.net" else "media.discordapp.net"
+    return urlunparse(parsed._replace(netloc=new_host))
+
+
 def _describe_header(data: bytes) -> str:
     if not data:
         return "empty"
@@ -229,6 +245,7 @@ class Image(commands.Cog):
                     content_type_hint or "unknown",
                     len(data) if data else 0,
                     _describe_header(data),
+                    exc_info=True,
                 )
                 is_heic = lower_hint.endswith((".heic", ".heif")) or content_type_hint in {
                     "image/heic",
@@ -501,6 +518,7 @@ class Image(commands.Cog):
                         redirect_hops = 0
                         attempted_png_fallback = False
                         attempted_retry = False
+                        attempted_alt_host = False
                         used_png_fallback = False
                         while True:
                             resp = await session.get(current_url, allow_redirects=False)
@@ -591,6 +609,13 @@ class Image(commands.Cog):
                                     pass
 
                                 data = await resp.content.read(MAX_IMAGE_BYTES + 1)
+                                log.info(
+                                    "Downloaded image bytes len=%d content-length=%s content-type=%s url=%s",
+                                    len(data),
+                                    content_length,
+                                    content_type or ext_type_hint or "unknown",
+                                    current_url,
+                                )
                                 if len(data) >= MAX_IMAGE_BYTES:
                                     notes.append(
                                         f"Skipped URL: file exceeded {MAX_IMAGE_BYTES // (1024 * 1024)}MB"
@@ -605,6 +630,11 @@ class Image(commands.Cog):
                                     content_type or ext_type_hint,
                                 )
                                 if not normalized:
+                                    alt_host_url = _swap_discord_cdn_host(current_url)
+                                    if alt_host_url and not attempted_alt_host:
+                                        attempted_alt_host = True
+                                        current_url = alt_host_url
+                                        continue
                                     if (
                                         png_fallback_url
                                         and not attempted_png_fallback
