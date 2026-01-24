@@ -35,6 +35,8 @@
 ### Ask tool auto-delete
 When `/ask` uses `bot_invoke`, the bot's response message will auto-delete 5 seconds after the final `/ask` reply is sent. A "stop auto-delete" button appears on replies that do not already contain interactive components; pressing it cancels deletion for that message only. Messages that already include buttons/menus are not modified to avoid breaking their UI and are excluded from auto-delete unless they are tagged as errors. By default, all commands invoked via `/ask` auto-delete unless explicitly disabled in `commands/ask.py` via `ASK_AUTO_DELETE_OVERRIDES`. The current default exclusions (no auto-delete) are:
 
+Queue status notices (`/ask queued`, `/ask starting`, `/ask skipped`, `/ask queue cleared`) auto-delete about 3 seconds after the status update posts so they do not linger in the channel.
+
 - `help`
 - `image`
 - `queue`

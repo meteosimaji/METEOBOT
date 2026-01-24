@@ -1089,6 +1089,8 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 MAX_TOOL_TURNS = _env_int("ASK_MAX_TOOL_TURNS", 50, minimum=1)
 TOOL_WARNING_TURN = min(MAX_TOOL_TURNS, _env_int("ASK_TOOL_WARNING_TURN", 40, minimum=1))
 ASK_AUTO_DELETE_DELAY_S = 5
+ASK_QUEUE_DELETE_DELAY_S = 3
+ASK_RESET_PROMPT_DELETE_DELAY_S = 3
 ASK_AUTO_DELETE_HISTORY_LIMIT = _env_int("ASK_AUTO_DELETE_HISTORY_LIMIT", 50, minimum=1)
 # Override auto-delete behavior for specific commands invoked via /ask.
 # Commands not listed here will auto-delete by default.
@@ -1860,6 +1862,43 @@ class Ask(commands.Cog):
             self._ask_queue_by_channel[state_key] = queue
         return queue
 
+    def _schedule_message_delete(self, message: discord.Message | None, *, delay: int) -> None:
+        if message is None:
+            return
+        flags = getattr(message, "flags", None)
+        if getattr(flags, "ephemeral", False):
+            return
+
+        async def _delete_later(msg: discord.Message) -> None:
+            try:
+                await asyncio.sleep(delay)
+                await msg.delete()
+            except Exception:
+                return
+
+        asyncio.create_task(_delete_later(message))
+
+    async def _fetch_queue_message(self, request: QueuedAskRequest) -> discord.Message | None:
+        if request.wait_message is not None:
+            return request.wait_message
+        if request.wait_message_id and request.wait_channel_id:
+            channel = self._get_messageable(
+                request.wait_channel_id,
+                guild_id=request.wait_guild_id,
+            )
+            fetcher = getattr(channel, "fetch_message", None) if channel else None
+            if fetcher is None:
+                return None
+            try:
+                return await fetcher(request.wait_message_id)
+            except Exception:
+                return None
+        return None
+
+    async def _schedule_queue_message_delete(self, request: QueuedAskRequest) -> None:
+        message = await self._fetch_queue_message(request)
+        self._schedule_message_delete(message, delay=ASK_QUEUE_DELETE_DELAY_S)
+
     def _build_queue_embed(self, position: int, total: int) -> discord.Embed:
         embed = discord.Embed(
             title="⏳ /ask queued",
@@ -1948,6 +1987,7 @@ class Ask(commands.Cog):
                     "The interaction expired while waiting. Please run /ask again."
                 ),
             )
+            await self._schedule_queue_message_delete(request)
             return False
 
         if request.message_id and request.channel_id:
@@ -1965,6 +2005,7 @@ class Ask(commands.Cog):
                         "The original message disappeared while waiting. Please send it again."
                     ),
                 )
+                await self._schedule_queue_message_delete(request)
                 return False
 
         return True
@@ -2023,13 +2064,16 @@ class Ask(commands.Cog):
                 await self._update_queue_message(
                     request, embed=self._build_queue_start_embed()
                 )
-                await self._ask_impl(
-                    request.ctx,
-                    request.action,
-                    request.text,
-                    extra_images=request.extra_images,
-                    skip_queue=True,
-                )
+                try:
+                    await self._ask_impl(
+                        request.ctx,
+                        request.action,
+                        request.text,
+                        extra_images=request.extra_images,
+                        skip_queue=True,
+                    )
+                finally:
+                    await self._schedule_queue_message_delete(request)
         finally:
             if release_after:
                 lock_obj.release()
@@ -2042,6 +2086,7 @@ class Ask(commands.Cog):
         while queue:
             request = queue.popleft()
             await self._update_queue_message(request, embed=cleared_embed)
+            await self._schedule_queue_message_delete(request)
 
     def _attachment_bucket(self, cache_key: tuple[int, int, int]) -> OrderedDict[str, AskAttachmentRecord]:
         bucket = self._attachment_cache.get(cache_key)
@@ -4366,6 +4411,9 @@ class Ask(commands.Cog):
                         await prompt_message.edit(
                             embed=_clone_prompt_embed().set_footer(text="Reset timed out."), view=None
                         )
+                    self._schedule_message_delete(
+                        prompt_message, delay=ASK_RESET_PROMPT_DELETE_DELAY_S
+                    )
                 return
 
             if view.result is False:
@@ -4374,10 +4422,17 @@ class Ask(commands.Cog):
                         await prompt_message.edit(
                             embed=_clone_prompt_embed().set_footer(text="Reset canceled."), view=None
                         )
+                    self._schedule_message_delete(
+                        prompt_message, delay=ASK_RESET_PROMPT_DELETE_DELAY_S
+                    )
                 return
 
             with contextlib.suppress(Exception):
                 await prompt_message.edit(view=None)
+            if prompt_message:
+                self._schedule_message_delete(
+                    prompt_message, delay=ASK_RESET_PROMPT_DELETE_DELAY_S
+                )
 
             await self._clear_ask_queue(state_key)
 
