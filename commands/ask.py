@@ -1898,9 +1898,9 @@ class Ask(commands.Cog):
         self._ask_autodelete_pending: dict[str, dict[int, discord.Message]] = {}
         self._ask_run_ids_by_ctx: dict[int, list[str]] = {}
         self._ask_run_state_by_id: dict[str, str] = {}
-        self._ask_locks_by_channel: dict[str, asyncio.Lock] = {}
         self._ask_queue_by_channel: dict[str, deque[QueuedAskRequest]] = {}
-        self._ask_queue_drain_tasks: dict[str, asyncio.Task] = {}
+        self._ask_queue_workers: dict[str, asyncio.Task] = {}
+        self._ask_queue_pause_until: dict[str, datetime] = {}
         self._http_session: aiohttp.ClientSession | None = None
         self._attachment_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ask_attach")
 
@@ -1924,26 +1924,12 @@ class Ask(commands.Cog):
         channel_id = ctx.channel.id if ctx.channel else 0
         return f"{guild_id}:{channel_id}"
 
-    def _get_ask_lock(self, state_key: str) -> asyncio.Lock:
-        lock = self._ask_locks_by_channel.get(state_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._ask_locks_by_channel[state_key] = lock
-        return lock
-
     def _get_ask_queue(self, state_key: str) -> deque[QueuedAskRequest]:
         queue = self._ask_queue_by_channel.get(state_key)
         if queue is None:
             queue = deque()
             self._ask_queue_by_channel[state_key] = queue
         return queue
-
-    async def _acquire_ask_lock(self, lock: asyncio.Lock, *, timeout_s: float = 0.25) -> bool:
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=timeout_s)
-            return True
-        except asyncio.TimeoutError:
-            return False
 
     def _schedule_message_delete(self, message: discord.Message | None, *, delay: int) -> None:
         if message is None:
@@ -1981,6 +1967,25 @@ class Ask(commands.Cog):
     async def _schedule_queue_message_delete(self, request: QueuedAskRequest) -> None:
         message = await self._fetch_queue_message(request)
         self._schedule_message_delete(message, delay=ASK_QUEUE_DELETE_DELAY_S)
+
+    def _set_queue_pause(self, state_key: str, delay_s: int) -> None:
+        until = datetime.now(timezone.utc) + timedelta(seconds=delay_s)
+        current = self._ask_queue_pause_until.get(state_key)
+        if current is None or until > current:
+            self._ask_queue_pause_until[state_key] = until
+
+    async def _wait_for_queue_pause(self, state_key: str) -> None:
+        until = self._ask_queue_pause_until.get(state_key)
+        if until is None:
+            return
+        now = datetime.now(timezone.utc)
+        if now >= until:
+            self._ask_queue_pause_until.pop(state_key, None)
+            return
+        await asyncio.sleep(max(0.0, (until - now).total_seconds()))
+        current = self._ask_queue_pause_until.get(state_key)
+        if current == until:
+            self._ask_queue_pause_until.pop(state_key, None)
 
     def _build_queue_embed(self, position: int, total: int) -> discord.Embed:
         embed = discord.Embed(
@@ -2113,8 +2118,14 @@ class Ask(commands.Cog):
         state_key: str,
     ) -> None:
         queue = self._get_ask_queue(state_key)
+        has_worker = False
+        existing_worker = self._ask_queue_workers.get(state_key)
+        if existing_worker and not existing_worker.done():
+            has_worker = True
         position = len(queue) + 1
-        wait_message = await self._send_queue_embed(ctx, position=position, total=position)
+        wait_message = None
+        if has_worker or queue:
+            wait_message = await self._send_queue_embed(ctx, position=position, total=position)
         wait_channel_id = getattr(wait_message, "channel", None)
         wait_channel_id = getattr(wait_channel_id, "id", None)
         wait_guild_id = getattr(getattr(wait_message, "guild", None), "id", None)
@@ -2136,79 +2147,67 @@ class Ask(commands.Cog):
         )
         queue.append(request)
         await self._refresh_queue_positions(state_key)
+        self._ensure_ask_queue_worker(state_key)
 
-    async def _drain_ask_queue(self, state_key: str, *, lock: asyncio.Lock | None = None) -> None:
-        queue = self._get_ask_queue(state_key)
-        if not queue:
+    def _ensure_ask_queue_worker(self, state_key: str) -> None:
+        existing = self._ask_queue_workers.get(state_key)
+        if existing and not existing.done():
             return
 
-        lock_obj = lock or self._get_ask_lock(state_key)
-        release_after = False
-        if lock is None:
-            if lock_obj.locked():
-                return
-            await lock_obj.acquire()
-            release_after = True
+        async def _worker() -> None:
+            try:
+                await self._run_ask_queue(state_key)
+            finally:
+                self._ask_queue_workers.pop(state_key, None)
 
-        try:
-            while queue:
-                request = queue.popleft()
-                await self._refresh_queue_positions(state_key)
-                if not await self._validate_queued_request(request):
-                    continue
-                await self._update_queue_message(
-                    request, embed=self._build_queue_start_embed()
+        self._ask_queue_workers[state_key] = asyncio.create_task(_worker())
+
+    async def _run_ask_queue(self, state_key: str) -> None:
+        queue = self._get_ask_queue(state_key)
+        log.info("Starting /ask queue worker (state_key=%s).", state_key)
+        while queue:
+            await self._wait_for_queue_pause(state_key)
+            request = queue.popleft()
+            await self._refresh_queue_positions(state_key)
+            if not await self._validate_queued_request(request):
+                continue
+            await self._update_queue_message(
+                request, embed=self._build_queue_start_embed()
+            )
+            try:
+                await self._ask_impl(
+                    request.ctx,
+                    request.action,
+                    request.text,
+                    extra_images=request.extra_images,
+                    skip_queue=True,
                 )
-                try:
-                    await self._ask_impl(
-                        request.ctx,
-                        request.action,
-                        request.text,
-                        extra_images=request.extra_images,
-                        skip_queue=True,
+            except Exception:
+                log.exception("Queued /ask failed (state_key=%s).", state_key)
+                with contextlib.suppress(Exception):
+                    await self._update_queue_message(
+                        request,
+                        embed=self._build_queue_skipped_embed(
+                            "Queued /ask failed due to an internal error. Please run /ask again."
+                        ),
                     )
-                except Exception:
-                    log.exception("Queued /ask failed")
-                    with contextlib.suppress(Exception):
-                        await self._update_queue_message(
-                            request,
-                            embed=self._build_queue_skipped_embed(
-                                "Queued /ask failed due to an internal error. Please run /ask again."
-                            ),
-                        )
-                finally:
-                    await self._schedule_queue_message_delete(request)
-        finally:
-            if release_after:
-                lock_obj.release()
+            finally:
+                await self._schedule_queue_message_delete(request)
+        log.info("Finished /ask queue worker (state_key=%s).", state_key)
 
     async def _clear_ask_queue(self, state_key: str) -> None:
         queue = self._get_ask_queue(state_key)
         if not queue:
+            self._ask_queue_pause_until.pop(state_key, None)
             return
+        cleared_count = len(queue)
         cleared_embed = self._build_queue_cleared_embed()
         while queue:
             request = queue.popleft()
             await self._update_queue_message(request, embed=cleared_embed)
             await self._schedule_queue_message_delete(request)
-
-    async def _maybe_drain_ask_queue(
-        self,
-        state_key: str,
-        *,
-        lock: asyncio.Lock,
-        acquired_lock: bool,
-        reason: str,
-    ) -> bool:
-        if not acquired_lock:
-            return False
-        try:
-            await self._drain_ask_queue(state_key, lock=lock)
-            log.info("Drained /ask queue (reason=%s, state_key=%s).", reason, state_key)
-            return True
-        except Exception:
-            log.exception("Failed to drain /ask queue (reason=%s, state_key=%s).", reason, state_key)
-            return False
+        self._ask_queue_pause_until.pop(state_key, None)
+        log.info("Cleared /ask queue (state_key=%s, cleared=%s).", state_key, cleared_count)
 
     def _attachment_bucket(self, cache_key: tuple[int, int, int]) -> OrderedDict[str, AskAttachmentRecord]:
         bucket = self._attachment_cache.get(cache_key)
@@ -3953,30 +3952,15 @@ class Ask(commands.Cog):
                 self._ask_autodelete_pending.pop(run_id, None)
         return bool(task or pending_found)
 
-    def _schedule_ask_queue_drain(self, state_key: str, *, reason: str) -> None:
-        existing = self._ask_queue_drain_tasks.get(state_key)
-        if existing and not existing.done():
-            return
-
-        async def _drain_after_delay() -> None:
-            try:
-                await asyncio.sleep(ASK_AUTO_DELETE_DELAY_S)
-                await self._drain_ask_queue(state_key)
-                log.info(
-                    "Drained /ask queue after auto-delete delay (reason=%s, state_key=%s).",
-                    reason,
-                    state_key,
-                )
-            except Exception:
-                log.exception(
-                    "Failed to drain /ask queue after auto-delete delay (reason=%s, state_key=%s).",
-                    reason,
-                    state_key,
-                )
-            finally:
-                self._ask_queue_drain_tasks.pop(state_key, None)
-
-        self._ask_queue_drain_tasks[state_key] = asyncio.create_task(_drain_after_delay())
+    def _schedule_ask_queue_resume(self, state_key: str, *, reason: str) -> None:
+        self._set_queue_pause(state_key, ASK_AUTO_DELETE_DELAY_S)
+        log.info(
+            "Paused /ask queue after auto-delete delay (reason=%s, state_key=%s).",
+            reason,
+            state_key,
+        )
+        if self._get_ask_queue(state_key):
+            self._ensure_ask_queue_worker(state_key)
 
     def _is_error_message(self, message: discord.Message) -> bool:
         content = message.content or ""
@@ -4139,7 +4123,7 @@ class Ask(commands.Cog):
             return
 
         if state_key:
-            self._schedule_ask_queue_drain(state_key, reason="auto_delete")
+            self._schedule_ask_queue_resume(state_key, reason="auto_delete")
 
         for message_id, message in pending.items():
             if message_id in self._ask_autodelete_tasks:
@@ -4432,23 +4416,19 @@ class Ask(commands.Cog):
             text = "reset"
             action = "ask"
 
-        acquired_lock = False
-        lock = self._get_ask_lock(state_key)
         deferred = False
         if action == "ask" and not skip_queue:
             if ctx.interaction:
                 await defer_interaction(ctx)
                 deferred = True
-            acquired_lock = await self._acquire_ask_lock(lock)
-            if not acquired_lock:
-                await self._enqueue_ask_request(
-                    ctx,
-                    action=action,
-                    text=text,
-                    extra_images=extra_images,
-                    state_key=state_key,
-                )
-                return
+            await self._enqueue_ask_request(
+                ctx,
+                action=action,
+                text=text,
+                extra_images=extra_images,
+                state_key=state_key,
+            )
+            return
 
         attachments: list[discord.Attachment] = []
         seen_attachment_ids: set[int] = set()
@@ -4517,7 +4497,7 @@ class Ask(commands.Cog):
         except Exception:
             pass
 
-        if action == "ask" and (skip_queue or not acquired_lock) and not deferred:
+        if action == "ask" and skip_queue and not deferred:
             await defer_interaction(ctx)
 
         ctx_key = self._attachment_cache_key(ctx)
@@ -4755,15 +4735,6 @@ class Ask(commands.Cog):
 
         if not text:
             await self._reply(ctx, content="Your question was empty. Try `c!ask hello`.")
-            if action == "ask" and acquired_lock:
-                try:
-                    await self._drain_ask_queue(state_key, lock=lock)
-                except Exception:
-                    log.exception("Failed to drain /ask queue")
-                finally:
-                    with contextlib.suppress(Exception):
-                        if lock.locked():
-                            lock.release()
             return
 
         prev_id = None
@@ -4896,8 +4867,6 @@ class Ask(commands.Cog):
             *self._build_bot_tools(),
         ]
 
-        drained_queue = False
-        delay_drain = False
         run_ids: list[str] = []
         try:
             content_parts: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
@@ -5074,13 +5043,8 @@ class Ask(commands.Cog):
                     sources_kwargs["files"] = sources_files
                 await self._reply(ctx, reference=main_message, **sources_kwargs)
             run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
-            delay_drain = bool(run_ids)
             for run_id in run_ids:
                 self._start_pending_ask_auto_delete(run_id)
-            if action == "ask" and acquired_lock and not delay_drain:
-                drained_queue = await self._maybe_drain_ask_queue(
-                    state_key, lock=lock, acquired_lock=acquired_lock, reason="answer_sent"
-                )
             with contextlib.suppress(Exception):
                 await status_ui.finish(ok=True)
 
@@ -5099,24 +5063,9 @@ class Ask(commands.Cog):
                 await self._reply(ctx, embed=error_embed)
             except Exception:
                 pass
-            if not delay_drain:
-                run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
-                delay_drain = bool(run_ids)
+            run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
             for run_id in run_ids:
                 self._start_pending_ask_auto_delete(run_id)
-            if action == "ask" and acquired_lock and not delay_drain and not drained_queue:
-                drained_queue = await self._maybe_drain_ask_queue(
-                    state_key, lock=lock, acquired_lock=acquired_lock, reason="error_response"
-                )
-        finally:
-            if action == "ask" and acquired_lock and not delay_drain and not drained_queue:
-                await self._maybe_drain_ask_queue(
-                    state_key, lock=lock, acquired_lock=acquired_lock, reason="finalize"
-                )
-            if action == "ask" and acquired_lock:
-                with contextlib.suppress(Exception):
-                    if lock.locked():
-                        lock.release()
 
 
 async def setup(bot: commands.Bot) -> None:
