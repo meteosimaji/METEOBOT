@@ -3235,9 +3235,9 @@ class Ask(commands.Cog):
                             "default": "launch",
                         },
                         "cdp_url": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "CDP endpoint when mode='cdp' (overridden by ASK_BROWSER_CDP_URL).",
-                            "default": "",
+                            "default": None,
                         },
                         "headless": {
                             "type": "boolean",
@@ -3245,80 +3245,182 @@ class Ask(commands.Cog):
                             "default": True,
                         },
                         "action": {
-                            "type": "object",
                             "description": (
                                 "Action payload: goto {url}, click {selector}, click_role {role,name}, "
                                 "fill {selector,text}, fill_role {role,name,text}, press {key}, "
                                 "wait_for_load {state}, content {}, download {selector|url}, "
                                 "screenshot {full_page?, selector?, filename?, format?}, observe {}, close {}."
                             ),
-                            "properties": {
-                                "type": {
-                                    "type": "string",
-                                    "enum": [
-                                        "goto",
-                                        "click",
-                                        "click_role",
-                                        "fill",
-                                        "fill_role",
-                                        "press",
-                                        "wait_for_load",
-                                        "content",
-                                        "download",
-                                        "screenshot",
-                                        "observe",
-                                        "close",
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["goto"]},
+                                        "url": {"type": "string", "description": "Target URL for goto."},
+                                    },
+                                    "required": ["type", "url"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["click"]},
+                                        "selector": {
+                                            "type": "string",
+                                            "description": "CSS selector for click.",
+                                        },
+                                    },
+                                    "required": ["type", "selector"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["click_role"]},
+                                        "role": {
+                                            "type": "string",
+                                            "description": "ARIA role for click_role.",
+                                        },
+                                        "name": {
+                                            "type": ["string", "null"],
+                                            "description": "ARIA accessible name for click_role.",
+                                        },
+                                    },
+                                    "required": ["type", "role", "name"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["fill"]},
+                                        "selector": {
+                                            "type": "string",
+                                            "description": "CSS selector for fill.",
+                                        },
+                                        "text": {"type": "string", "description": "Text for fill."},
+                                    },
+                                    "required": ["type", "selector", "text"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["fill_role"]},
+                                        "role": {
+                                            "type": "string",
+                                            "description": "ARIA role for fill_role.",
+                                        },
+                                        "name": {
+                                            "type": ["string", "null"],
+                                            "description": "ARIA accessible name for fill_role.",
+                                        },
+                                        "text": {"type": "string", "description": "Text for fill_role."},
+                                    },
+                                    "required": ["type", "role", "name", "text"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["press"]},
+                                        "key": {"type": "string", "description": "Key chord for press."},
+                                    },
+                                    "required": ["type", "key"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["wait_for_load"]},
+                                        "state": {
+                                            "type": "string",
+                                            "enum": ["load", "domcontentloaded", "networkidle"],
+                                            "description": "Load state for wait_for_load.",
+                                        },
+                                    },
+                                    "required": ["type", "state"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["content"]},
+                                    },
+                                    "required": ["type"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["observe"]},
+                                    },
+                                    "required": ["type"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["close"]},
+                                    },
+                                    "required": ["type"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["download"]},
+                                        "selector": {
+                                            "type": ["string", "null"],
+                                            "description": "CSS selector for download.",
+                                        },
+                                        "url": {
+                                            "type": ["string", "null"],
+                                            "description": "Target URL for download.",
+                                        },
+                                    },
+                                    "required": ["type", "selector", "url"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["screenshot"]},
+                                        "full_page": {
+                                            "type": "boolean",
+                                            "description": "Full-page screenshot.",
+                                        },
+                                        "selector": {
+                                            "type": ["string", "null"],
+                                            "description": "CSS selector for screenshot.",
+                                        },
+                                        "filename": {
+                                            "type": ["string", "null"],
+                                            "description": "Filename hint for screenshot upload.",
+                                        },
+                                        "format": {
+                                            "anyOf": [
+                                                {
+                                                    "type": "string",
+                                                    "enum": ["png", "jpeg", "jpg"],
+                                                },
+                                                {"type": "null"},
+                                            ],
+                                            "description": "Screenshot format.",
+                                        },
+                                    },
+                                    "required": [
+                                        "type",
+                                        "full_page",
+                                        "selector",
+                                        "filename",
+                                        "format",
                                     ],
-                                    "description": "Action type.",
+                                    "additionalProperties": False,
                                 },
-                                "url": {
-                                    "type": "string",
-                                    "description": "Target URL for goto/download.",
-                                },
-                                "selector": {
-                                    "type": "string",
-                                    "description": "CSS selector for click/fill/download/screenshot.",
-                                },
-                                "role": {
-                                    "type": "string",
-                                    "description": "ARIA role for click_role/fill_role.",
-                                },
-                                "name": {
-                                    "type": "string",
-                                    "description": "ARIA accessible name for click_role/fill_role (optional).",
-                                },
-                                "text": {
-                                    "type": "string",
-                                    "description": "Text for fill/fill_role.",
-                                },
-                                "key": {
-                                    "type": "string",
-                                    "description": "Key chord for press (e.g. Enter, Control+L).",
-                                },
-                                "state": {
-                                    "type": "string",
-                                    "enum": ["load", "domcontentloaded", "networkidle"],
-                                    "description": "Load state for wait_for_load.",
-                                },
-                                "full_page": {
-                                    "type": "boolean",
-                                    "description": "Full-page screenshot.",
-                                },
-                                "filename": {
-                                    "type": "string",
-                                    "description": "Filename hint for screenshot upload.",
-                                },
-                                "format": {
-                                    "type": "string",
-                                    "enum": ["png", "jpeg", "jpg"],
-                                    "description": "Screenshot format.",
-                                },
-                            },
-                            "required": ["type"],
-                            "additionalProperties": False,
+                            ],
                         },
                     },
-                    "required": ["action"],
+                    "required": ["mode", "cdp_url", "headless", "action"],
                     "additionalProperties": False,
                 },
             }
@@ -3818,7 +3920,12 @@ class Ask(commands.Cog):
                 action = args.get("action") or {}
                 if not isinstance(action, dict):
                     return {"ok": False, "error": "bad_action", "reason": "action must be an object."}
-                action_type = str(action.get("type") or "")
+
+                def _get_action_str(action_obj: dict[str, Any], key: str) -> str:
+                    value = action_obj.get(key)
+                    return value if isinstance(value, str) else ""
+
+                action_type = _get_action_str(action, "type")
                 mode = str(args.get("mode") or "launch")
                 if mode not in {"launch", "cdp"}:
                     return {"ok": False, "error": "bad_mode", "reason": "mode must be launch or cdp."}
@@ -3844,7 +3951,7 @@ class Ask(commands.Cog):
                         cdp_url=cdp_url,
                     )
                 if action_type == "goto":
-                    url = str(action.get("url") or "")
+                    url = _get_action_str(action, "url")
                     if not await self._is_safe_browser_url(url):
                         return {
                             "ok": False,
@@ -3852,8 +3959,8 @@ class Ask(commands.Cog):
                             "reason": "Only public http/https URLs are allowed.",
                         }
                 if action_type == "download":
-                    selector = str(action.get("selector") or "")
-                    url = str(action.get("url") or "")
+                    selector = _get_action_str(action, "selector")
+                    url = _get_action_str(action, "url")
                     if not selector and not url:
                         return {
                             "ok": False,
@@ -3946,14 +4053,14 @@ class Ask(commands.Cog):
                         "observation": (await agent.observe()).to_dict(),
                     }
                 if action_type == "screenshot":
-                    selector = str(action.get("selector") or "").strip()
+                    selector = _get_action_str(action, "selector").strip()
                     full_page = bool(action.get("full_page", False))
-                    fmt = str(action.get("format") or "png").lower()
+                    fmt = _get_action_str(action, "format").lower() or "png"
                     if fmt == "jpg":
                         fmt = "jpeg"
                     if fmt not in {"png", "jpeg"}:
                         fmt = "png"
-                    filename = str(action.get("filename") or "").strip()
+                    filename = _get_action_str(action, "filename").strip()
                     if not filename:
                         filename = (
                             "browser_screenshot.png"
@@ -4053,7 +4160,11 @@ class Ask(commands.Cog):
                         "message_url": message_url,
                         "observation": (await agent.observe()).to_dict(),
                     }
-                result = await agent.act(action)
+                sanitized_action = action.copy()
+                for key in ("url", "selector", "role", "name", "text", "key"):
+                    if key in sanitized_action and not isinstance(sanitized_action[key], str):
+                        sanitized_action[key] = ""
+                result = await agent.act(sanitized_action)
                 if isinstance(result, dict) and result.get("ok"):
                     observation = result.get("observation") or {}
                     observed_url = observation.get("url")
