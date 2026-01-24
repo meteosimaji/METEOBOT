@@ -1897,8 +1897,10 @@ class Ask(commands.Cog):
         self._ask_autodelete_tasks: dict[int, asyncio.Task] = {}
         self._ask_autodelete_pending: dict[str, dict[int, discord.Message]] = {}
         self._ask_run_ids_by_ctx: dict[int, list[str]] = {}
+        self._ask_run_state_by_id: dict[str, str] = {}
         self._ask_locks_by_channel: dict[str, asyncio.Lock] = {}
         self._ask_queue_by_channel: dict[str, deque[QueuedAskRequest]] = {}
+        self._ask_queue_drain_tasks: dict[str, asyncio.Task] = {}
         self._http_session: aiohttp.ClientSession | None = None
         self._attachment_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ask_attach")
 
@@ -2189,6 +2191,24 @@ class Ask(commands.Cog):
             request = queue.popleft()
             await self._update_queue_message(request, embed=cleared_embed)
             await self._schedule_queue_message_delete(request)
+
+    async def _maybe_drain_ask_queue(
+        self,
+        state_key: str,
+        *,
+        lock: asyncio.Lock,
+        acquired_lock: bool,
+        reason: str,
+    ) -> bool:
+        if not acquired_lock:
+            return False
+        try:
+            await self._drain_ask_queue(state_key, lock=lock)
+            log.info("Drained /ask queue (reason=%s, state_key=%s).", reason, state_key)
+            return True
+        except Exception:
+            log.exception("Failed to drain /ask queue (reason=%s, state_key=%s).", reason, state_key)
+            return False
 
     def _attachment_bucket(self, cache_key: tuple[int, int, int]) -> OrderedDict[str, AskAttachmentRecord]:
         bucket = self._attachment_cache.get(cache_key)
@@ -2832,7 +2852,17 @@ class Ask(commands.Cog):
         if not prompt:
             return
 
-        await self.ask(ctx, action="ask", text=prompt)
+        action = "ask"
+        if prompt:
+            lowered = prompt.casefold()
+            if lowered == "reset" or lowered.startswith("reset "):
+                action = "reset"
+                prompt = prompt[5:].strip()
+            elif lowered == "ask reset" or lowered.startswith("ask reset "):
+                action = "reset"
+                prompt = prompt[9:].strip()
+
+        await self.ask(ctx, action=action, text=prompt)
 
     def _is_noarg_command(self, command: commands.Command) -> bool:
         try:
@@ -3712,6 +3742,7 @@ class Ask(commands.Cog):
         ctx_key = self._ctx_key(ctx)
         run_ids = self._ask_run_ids_by_ctx.setdefault(ctx_key, [])
         history_after = self._history_after(ctx)
+        self._ask_run_state_by_id[run_id] = self._state_key(ctx)
 
         if arg:
             try:
@@ -3922,6 +3953,31 @@ class Ask(commands.Cog):
                 self._ask_autodelete_pending.pop(run_id, None)
         return bool(task or pending_found)
 
+    def _schedule_ask_queue_drain(self, state_key: str, *, reason: str) -> None:
+        existing = self._ask_queue_drain_tasks.get(state_key)
+        if existing and not existing.done():
+            return
+
+        async def _drain_after_delay() -> None:
+            try:
+                await asyncio.sleep(ASK_AUTO_DELETE_DELAY_S)
+                await self._drain_ask_queue(state_key)
+                log.info(
+                    "Drained /ask queue after auto-delete delay (reason=%s, state_key=%s).",
+                    reason,
+                    state_key,
+                )
+            except Exception:
+                log.exception(
+                    "Failed to drain /ask queue after auto-delete delay (reason=%s, state_key=%s).",
+                    reason,
+                    state_key,
+                )
+            finally:
+                self._ask_queue_drain_tasks.pop(state_key, None)
+
+        self._ask_queue_drain_tasks[state_key] = asyncio.create_task(_drain_after_delay())
+
     def _is_error_message(self, message: discord.Message) -> bool:
         content = message.content or ""
         if ASK_ERROR_TAG in content:
@@ -4078,8 +4134,12 @@ class Ask(commands.Cog):
 
     def _start_pending_ask_auto_delete(self, run_id: str) -> None:
         pending = self._ask_autodelete_pending.pop(run_id, {})
+        state_key = self._ask_run_state_by_id.pop(run_id, None)
         if not pending:
             return
+
+        if state_key:
+            self._schedule_ask_queue_drain(state_key, reason="auto_delete")
 
         for message_id, message in pending.items():
             if message_id in self._ask_autodelete_tasks:
@@ -4836,6 +4896,9 @@ class Ask(commands.Cog):
             *self._build_bot_tools(),
         ]
 
+        drained_queue = False
+        delay_drain = False
+        run_ids: list[str] = []
         try:
             content_parts: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
 
@@ -5010,13 +5073,14 @@ class Ask(commands.Cog):
                 if sources_files:
                     sources_kwargs["files"] = sources_files
                 await self._reply(ctx, reference=main_message, **sources_kwargs)
-            for run_id in self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), []):
+            run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
+            delay_drain = bool(run_ids)
+            for run_id in run_ids:
                 self._start_pending_ask_auto_delete(run_id)
-            if action == "ask" and acquired_lock:
-                try:
-                    await self._drain_ask_queue(state_key, lock=lock)
-                except Exception:
-                    log.exception("Failed to drain /ask queue")
+            if action == "ask" and acquired_lock and not delay_drain:
+                drained_queue = await self._maybe_drain_ask_queue(
+                    state_key, lock=lock, acquired_lock=acquired_lock, reason="answer_sent"
+                )
             with contextlib.suppress(Exception):
                 await status_ui.finish(ok=True)
 
@@ -5035,9 +5099,20 @@ class Ask(commands.Cog):
                 await self._reply(ctx, embed=error_embed)
             except Exception:
                 pass
-            for run_id in self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), []):
+            if not delay_drain:
+                run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
+                delay_drain = bool(run_ids)
+            for run_id in run_ids:
                 self._start_pending_ask_auto_delete(run_id)
+            if action == "ask" and acquired_lock and not delay_drain and not drained_queue:
+                drained_queue = await self._maybe_drain_ask_queue(
+                    state_key, lock=lock, acquired_lock=acquired_lock, reason="error_response"
+                )
         finally:
+            if action == "ask" and acquired_lock and not delay_drain and not drained_queue:
+                await self._maybe_drain_ask_queue(
+                    state_key, lock=lock, acquired_lock=acquired_lock, reason="finalize"
+                )
             if action == "ask" and acquired_lock:
                 with contextlib.suppress(Exception):
                     if lock.locked():
