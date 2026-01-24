@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import ipaddress
-import socket
 import contextlib
 import csv
 import difflib
@@ -39,7 +38,7 @@ from PIL.Image import Image as PILImageType
 from pptx import Presentation
 from pypdf import PdfReader
 
-from commands.browser_agent import BrowserAgent
+from commands._browser_agent import BrowserAgent
 from utils import (
     ASK_ERROR_TAG,
     BOT_PREFIX,
@@ -3253,6 +3252,70 @@ class Ask(commands.Cog):
                                 "wait_for_load {state}, content {}, download {selector|url}, "
                                 "screenshot {full_page?, selector?, filename?, format?}, observe {}, close {}."
                             ),
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "goto",
+                                        "click",
+                                        "click_role",
+                                        "fill",
+                                        "fill_role",
+                                        "press",
+                                        "wait_for_load",
+                                        "content",
+                                        "download",
+                                        "screenshot",
+                                        "observe",
+                                        "close",
+                                    ],
+                                    "description": "Action type.",
+                                },
+                                "url": {
+                                    "type": "string",
+                                    "description": "Target URL for goto/download.",
+                                },
+                                "selector": {
+                                    "type": "string",
+                                    "description": "CSS selector for click/fill/download/screenshot.",
+                                },
+                                "role": {
+                                    "type": "string",
+                                    "description": "ARIA role for click_role/fill_role.",
+                                },
+                                "name": {
+                                    "type": "string",
+                                    "description": "ARIA accessible name for click_role/fill_role (optional).",
+                                },
+                                "text": {
+                                    "type": "string",
+                                    "description": "Text for fill/fill_role.",
+                                },
+                                "key": {
+                                    "type": "string",
+                                    "description": "Key chord for press (e.g. Enter, Control+L).",
+                                },
+                                "state": {
+                                    "type": "string",
+                                    "enum": ["load", "domcontentloaded", "networkidle"],
+                                    "description": "Load state for wait_for_load.",
+                                },
+                                "full_page": {
+                                    "type": "boolean",
+                                    "description": "Full-page screenshot.",
+                                },
+                                "filename": {
+                                    "type": "string",
+                                    "description": "Filename hint for screenshot upload.",
+                                },
+                                "format": {
+                                    "type": "string",
+                                    "enum": ["png", "jpeg", "jpg"],
+                                    "description": "Screenshot format.",
+                                },
+                            },
+                            "required": ["type"],
+                            "additionalProperties": False,
                         },
                     },
                     "required": ["action"],
