@@ -2059,6 +2059,16 @@ class Ask(commands.Cog):
             with contextlib.suppress(Exception):
                 await msg.edit(embed=embed)
 
+    async def _refresh_queue_positions(self, state_key: str) -> None:
+        queue = self._get_ask_queue(state_key)
+        if not queue:
+            return
+        total = len(queue)
+        for index, request in enumerate(queue, start=1):
+            await self._update_queue_message(
+                request, embed=self._build_queue_embed(index, total)
+            )
+
     async def _validate_queued_request(self, request: QueuedAskRequest) -> bool:
         interaction = request.ctx.interaction
         if interaction and interaction.is_expired():
@@ -2123,6 +2133,7 @@ class Ask(commands.Cog):
             wait_guild_id=wait_guild_id,
         )
         queue.append(request)
+        await self._refresh_queue_positions(state_key)
 
     async def _drain_ask_queue(self, state_key: str, *, lock: asyncio.Lock | None = None) -> None:
         queue = self._get_ask_queue(state_key)
@@ -2140,6 +2151,7 @@ class Ask(commands.Cog):
         try:
             while queue:
                 request = queue.popleft()
+                await self._refresh_queue_positions(state_key)
                 if not await self._validate_queued_request(request):
                     continue
                 await self._update_queue_message(
@@ -4989,6 +5001,11 @@ class Ask(commands.Cog):
             await self._reply(ctx, **reply_kwargs)
             for run_id in self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), []):
                 self._start_pending_ask_auto_delete(run_id)
+            if action == "ask" and acquired_lock:
+                try:
+                    await self._drain_ask_queue(state_key, lock=lock)
+                except Exception:
+                    log.exception("Failed to drain /ask queue")
             with contextlib.suppress(Exception):
                 await status_ui.finish(ok=True)
 
@@ -5011,14 +5028,9 @@ class Ask(commands.Cog):
                 self._start_pending_ask_auto_delete(run_id)
         finally:
             if action == "ask" and acquired_lock:
-                try:
-                    await self._drain_ask_queue(state_key, lock=lock)
-                except Exception:
-                    log.exception("Failed to drain /ask queue")
-                finally:
-                    with contextlib.suppress(Exception):
-                        if lock.locked():
-                            lock.release()
+                with contextlib.suppress(Exception):
+                    if lock.locked():
+                        lock.release()
 
 
 async def setup(bot: commands.Bot) -> None:
