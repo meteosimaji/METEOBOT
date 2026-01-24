@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-import re
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -180,7 +180,6 @@ class Bot(commands.Bot):
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
-
 
 def main() -> None:
     """Bot startup sequence."""
