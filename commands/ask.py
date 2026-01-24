@@ -1044,6 +1044,80 @@ def _truncate_discord(text: str, limit: int = 2000) -> str:
     return text[: limit - 3] + "..."
 
 
+MAX_TEXT_ATTACHMENT_BYTES = 7_000_000
+MAX_TEXT_ATTACHMENT_FILES = 10
+
+
+def _build_text_files(
+    filename: str,
+    content: str,
+    *,
+    max_bytes: int = MAX_TEXT_ATTACHMENT_BYTES,
+) -> tuple[list[discord.File], bool]:
+    payload = content if content.endswith("\n") else f"{content}\n"
+    chunks: list[str] = []
+    current = []
+    current_bytes = 0
+    for char in payload:
+        char_bytes = len(char.encode("utf-8"))
+        if current and current_bytes + char_bytes > max_bytes:
+            chunks.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(char)
+        current_bytes += char_bytes
+    if current:
+        chunks.append("".join(current))
+
+    files: list[discord.File] = []
+    truncated = False
+    if len(chunks) > MAX_TEXT_ATTACHMENT_FILES:
+        chunks = chunks[:MAX_TEXT_ATTACHMENT_FILES]
+        truncated = True
+    if len(chunks) == 1:
+        return [discord.File(fp=BytesIO(chunks[0].encode("utf-8")), filename=filename)], truncated
+    stem, dot, suffix = filename.partition(".")
+    for index, chunk in enumerate(chunks, start=1):
+        numbered = f"{stem}-{index}.{suffix}" if dot else f"{stem}-{index}"
+        files.append(discord.File(fp=BytesIO(chunk.encode("utf-8")), filename=numbered))
+    return files, truncated
+
+
+def _embed_char_count(embed: discord.Embed) -> int:
+    return len(embed)
+
+
+def _clamp_embed_description(embed: discord.Embed, *, max_total: int = 6000) -> bool:
+    if _embed_char_count(embed) <= max_total:
+        return False
+    description = embed.description or ""
+    base = _embed_char_count(embed) - len(description)
+    budget = max(0, max_total - base)
+    if budget and len(description) > budget:
+        embed.description = _truncate_discord(description, budget)
+        return True
+    return False
+
+
+def _extend_text_files(
+    files: list[discord.File],
+    filename: str,
+    content: str,
+    *,
+    max_files: int = MAX_TEXT_ATTACHMENT_FILES,
+    max_bytes: int = MAX_TEXT_ATTACHMENT_BYTES,
+) -> tuple[bool, bool]:
+    remaining = max_files - len(files)
+    if remaining <= 0:
+        return False, False
+    new_files, truncated = _build_text_files(filename, content, max_bytes=max_bytes)
+    if len(new_files) > remaining:
+        new_files = new_files[:remaining]
+        truncated = True
+    files.extend(new_files)
+    return bool(new_files), truncated
+
+
 def _env_choice(name: str, default: str, choices: set[str]) -> str:
     value = (os.getenv(name) or default).strip().lower()
     return value if value in choices else default
@@ -1861,6 +1935,13 @@ class Ask(commands.Cog):
             queue = deque()
             self._ask_queue_by_channel[state_key] = queue
         return queue
+
+    async def _acquire_ask_lock(self, lock: asyncio.Lock, *, timeout_s: float = 0.25) -> bool:
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=timeout_s)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def _schedule_message_delete(self, message: discord.Message | None, *, delay: int) -> None:
         if message is None:
@@ -4186,8 +4267,8 @@ class Ask(commands.Cog):
             "pro": (
                 "Uses the Responses API with web_search, accepts attached images for vision "
                 "analysis, caches attachment metadata for on-demand file reading, keeps "
-                "per-channel conversation state via previous_response_id, and truncates output "
-                "to 2000 characters to fit Discord limits."
+                "per-channel conversation state via previous_response_id, and attaches full text "
+                "files when responses exceed embed limits."
             ),
             "destination": "Send a prompt (and optional attachments) to the AI or reset channel memory.",
             "plus": "Use action reset to clear the channel conversation; admins only for resets.",
@@ -4267,19 +4348,11 @@ class Ask(commands.Cog):
         lock = self._get_ask_lock(state_key)
         deferred = False
         if action == "ask" and not skip_queue:
-            if lock.locked():
-                await self._enqueue_ask_request(
-                    ctx,
-                    action=action,
-                    text=text,
-                    extra_images=extra_images,
-                    state_key=state_key,
-                )
-                return
             if ctx.interaction:
                 await defer_interaction(ctx)
                 deferred = True
-            if lock.locked():
+            acquired_lock = await self._acquire_ask_lock(lock)
+            if not acquired_lock:
                 await self._enqueue_ask_request(
                     ctx,
                     action=action,
@@ -4288,8 +4361,6 @@ class Ask(commands.Cog):
                     state_key=state_key,
                 )
                 return
-            await lock.acquire()
-            acquired_lock = True
 
         attachments: list[discord.Attachment] = []
         seen_attachment_ids: set[int] = set()
@@ -4772,7 +4843,7 @@ class Ask(commands.Cog):
                 pass
 
             answer = getattr(resp, "output_text", "") or "(no output)"
-            answer = _truncate_discord(answer.strip(), 2000)
+            answer = answer.strip() or "(no output)"
 
             seen = set()
             sources_lines: list[str] = []
@@ -4793,37 +4864,38 @@ class Ask(commands.Cog):
 
             title_text = _question_preview(text) or "Ask"
             title_text = f"\U0001F4AC {title_text}"
+            files: list[discord.File] = []
+            max_file_bytes = (
+                getattr(getattr(ctx, "guild", None), "filesize_limit", None)
+                or MAX_TEXT_ATTACHMENT_BYTES
+            )
+            answer_note = "（全文は添付のテキストをご確認ください）"
+            answer_truncated_note = "（本文が長いため一部省略されました）"
+            answer_attached = False
+            answer_note_text = ""
+            if len(answer) > 4096:
+                answer_attached, answer_truncated = _extend_text_files(
+                    files,
+                    "ask-answer.txt",
+                    answer,
+                    max_bytes=max_file_bytes,
+                )
+                note = (
+                    answer_note
+                    if answer_attached and not answer_truncated
+                    else answer_truncated_note
+                )
+                answer_note_text = f"{note}\n\n"
+                preview_limit = max(1, 4096 - len(answer_note_text))
+                answer_preview = _truncate_discord(answer, preview_limit)
+                description = f"{answer_note_text}{answer_preview}"
+            else:
+                description = answer
             embed = discord.Embed(
                 title=title_text,
-                description=answer,
+                description=description,
                 color=0x5865F2,
             )
-            if sources_lines:
-                current_block: list[str] = []
-                current_length = 0
-                truncated = 0
-
-                for line in sources_lines:
-                    line_length = len(line) + (1 if current_block else 0)
-                    if current_length + line_length > 1024:
-                        truncated += 1
-                        continue
-                    current_block.append(line)
-                    current_length += line_length
-
-                if truncated:
-                    more_note = f"...and {truncated} more source{'s' if truncated != 1 else ''}."
-                    note_length = len(more_note) + (1 if current_block else 0)
-                    if current_length + note_length > 1024 and current_block:
-                        removed = current_block.pop()
-                        current_length -= len(removed) + (1 if current_block else 0)
-                        truncated += 1
-                        note_length = len(more_note) + (1 if current_block else 0)
-                    if current_length + note_length <= 1024:
-                        current_block.append(more_note)
-
-                if current_block:
-                    embed.add_field(name="\U0001F517 Sources", value="\n".join(current_block), inline=False)
 
             footer_parts = ["Crafted with care ✨"]
             if skipped_notes:
@@ -4835,9 +4907,68 @@ class Ask(commands.Cog):
                         seen_notes.add(note)
                 footer_parts.append("; ".join(unique_notes))
 
-            embed.set_footer(text=" | ".join(footer_parts))
+            footer_text = " | ".join(footer_parts)
+            embed.set_footer(text=_truncate_discord(footer_text, 2048))
 
-            await self._reply(ctx, embed=embed)
+            sources_text = ""
+            sources_value = ""
+            sources_needs_attachment = False
+            if sources_lines:
+                sources_text = "\n".join(sources_lines)
+                if len(sources_text) > 1024:
+                    sources_needs_attachment = True
+                    preview_limit = max(1, 1024 - len(answer_note))
+                    sources_preview = _truncate_discord(sources_text, preview_limit)
+                    sources_value = f"{sources_preview}{answer_note}"
+                else:
+                    sources_value = sources_text
+                embed.add_field(name="\U0001F517 Sources", value=sources_value, inline=False)
+
+            if not answer_attached and _embed_char_count(embed) > 6000:
+                answer_attached, answer_truncated = _extend_text_files(
+                    files,
+                    "ask-answer.txt",
+                    answer,
+                    max_bytes=max_file_bytes,
+                )
+                if answer_attached:
+                    answer_note_text = (
+                        f"{answer_truncated_note}\n\n"
+                        if answer_truncated
+                        else f"{answer_note}\n\n"
+                    )
+                    preview_limit = max(1, 4096 - len(answer_note_text))
+                    answer_preview = _truncate_discord(answer, preview_limit)
+                    embed.description = f"{answer_note_text}{answer_preview}"
+                    answer_attached = True
+
+            if sources_needs_attachment and sources_text:
+                sources_attached, sources_truncated = _extend_text_files(
+                    files,
+                    "ask-sources.txt",
+                    sources_text,
+                    max_bytes=max_file_bytes,
+                )
+                if sources_attached and not sources_truncated:
+                    preview_limit = max(1, 1024 - len(answer_note))
+                    sources_preview = _truncate_discord(sources_text, preview_limit)
+                    sources_value = f"{sources_preview}{answer_note}"
+                else:
+                    preview_limit = max(1, 1024 - (len(answer_truncated_note) + 1))
+                    sources_preview = _truncate_discord(sources_text, preview_limit)
+                    sources_value = f"{answer_truncated_note}\n{sources_preview}"
+                embed.set_field_at(0, name="\U0001F517 Sources", value=sources_value, inline=False)
+
+            trimmed = _clamp_embed_description(embed)
+            if trimmed and not answer_attached:
+                note = f"{answer_truncated_note}\n\n"
+                preview_limit = max(1, 4096 - len(note))
+                embed.description = f"{note}{_truncate_discord(answer, preview_limit)}"
+                _clamp_embed_description(embed)
+            reply_kwargs: dict[str, Any] = {"embed": embed}
+            if files:
+                reply_kwargs["files"] = files
+            await self._reply(ctx, **reply_kwargs)
             for run_id in self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), []):
                 self._start_pending_ask_auto_delete(run_id)
             with contextlib.suppress(Exception):
