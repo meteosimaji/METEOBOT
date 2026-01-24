@@ -2153,6 +2153,15 @@ class Ask(commands.Cog):
                         extra_images=request.extra_images,
                         skip_queue=True,
                     )
+                except Exception:
+                    log.exception("Queued /ask failed")
+                    with contextlib.suppress(Exception):
+                        await self._update_queue_message(
+                            request,
+                            embed=self._build_queue_skipped_embed(
+                                "Queued /ask failed due to an internal error. Please run /ask again."
+                            ),
+                        )
                 finally:
                     await self._schedule_queue_message_delete(request)
         finally:
@@ -4667,6 +4676,15 @@ class Ask(commands.Cog):
 
         if not text:
             await self._reply(ctx, content="Your question was empty. Try `c!ask hello`.")
+            if action == "ask" and acquired_lock:
+                try:
+                    await self._drain_ask_queue(state_key, lock=lock)
+                except Exception:
+                    log.exception("Failed to drain /ask queue")
+                finally:
+                    with contextlib.suppress(Exception):
+                        if lock.locked():
+                            lock.release()
             return
 
         prev_id = None
@@ -4993,8 +5011,14 @@ class Ask(commands.Cog):
                 self._start_pending_ask_auto_delete(run_id)
         finally:
             if action == "ask" and acquired_lock:
-                await self._drain_ask_queue(state_key, lock=lock)
-                lock.release()
+                try:
+                    await self._drain_ask_queue(state_key, lock=lock)
+                except Exception:
+                    log.exception("Failed to drain /ask queue")
+                finally:
+                    with contextlib.suppress(Exception):
+                        if lock.locked():
+                            lock.release()
 
 
 async def setup(bot: commands.Bot) -> None:
