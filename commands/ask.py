@@ -3501,7 +3501,7 @@ class Ask(commands.Cog):
                                             "description": "Number of clicks (default 1).",
                                         },
                                     },
-                                    "required": ["type", "x", "y"],
+                                    "required": ["type", "x", "y", "button", "clicks"],
                                     "additionalProperties": False,
                                 },
                                 {
