@@ -145,7 +145,7 @@ env.bak/
 venv.bak/
 
 # Playwright browser profiles (ask persistent sessions)
-data/browser_profiles/
+/data/browser_profiles/
 
 # Spyder project settings
 .spyderproject
