@@ -6,6 +6,8 @@ import difflib
 import importlib
 import inspect
 import json
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -207,6 +209,8 @@ MAX_ATTACHMENT_CACHE_ENTRIES = 200
 MAX_ATTACHMENT_CACHE_BUCKETS = 100
 MAX_ATTACHMENT_REDIRECTS = 3
 OPERATOR_TOKEN_TTL_S = int(os.getenv("ASK_OPERATOR_TOKEN_TTL_S", "1800"))
+OPERATOR_TOKEN_MAX_FUTURE_S = int(os.getenv("ASK_OPERATOR_TOKEN_MAX_FUTURE_S", "300"))
+DEFAULT_OPERATOR_URL = "https://www.google.com"
 
 
 @dataclass
@@ -1936,12 +1940,35 @@ class Ask(commands.Cog):
         self._browser_prefer_cdp_by_channel: dict[str, bool] = {}
         self._operator_sessions: dict[str, OperatorSession] = {}
         self._operator_sessions_by_state: dict[str, set[str]] = {}
+        self._operator_revoked_before: dict[str, datetime] = {}
+        self._operator_start_warnings: dict[str, str] = {}
         self._operator_app: web.Application | None = None
         self._operator_runner: web.AppRunner | None = None
         self._operator_site: web.TCPSite | None = None
         self._operator_host = os.getenv("ASK_OPERATOR_HOST", "0.0.0.0")
         self._operator_port = int(os.getenv("ASK_OPERATOR_PORT", "8080"))
         self._operator_base_url = (os.getenv("ASK_OPERATOR_BASE_URL") or "").strip()
+        self._operator_default_url = (
+            os.getenv("ASK_OPERATOR_DEFAULT_URL") or DEFAULT_OPERATOR_URL
+        ).strip()
+        self._operator_simple_guide = (
+            (os.getenv("ASK_OPERATOR_SIMPLE_GUIDE") or "").strip().lower()
+            in {"1", "true", "yes"}
+        )
+        instance_id = (os.getenv("ASK_OPERATOR_INSTANCE_ID") or "").strip()
+        self._operator_instance_id = (
+            instance_id if instance_id else self._load_operator_instance_id()
+        )
+        self._operator_allow_shared_tokens = (
+            (os.getenv("ASK_OPERATOR_ALLOW_SHARED_TOKENS") or "").strip().lower()
+            in {"1", "true", "yes"}
+        )
+        operator_secret = (
+            os.getenv("ASK_OPERATOR_TOKEN_SECRET")
+            or os.getenv("DISCORD_BOT_TOKEN")
+            or ""
+        ).strip()
+        self._operator_token_secret = operator_secret.encode() if operator_secret else None
 
         if not hasattr(self.bot, "ai_last_response_id"):
             self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
@@ -2026,6 +2053,103 @@ class Ask(commands.Cog):
             return self._operator_base_url.rstrip("/")
         return f"http://localhost:{self._operator_port}"
 
+    @staticmethod
+    def _load_operator_instance_id() -> str:
+        default_id = uuid.uuid4().hex[:8]
+        path = Path("data") / "operator_instance_id.txt"
+        try:
+            if path.exists():
+                stored = path.read_text(encoding="utf-8").strip()
+                if stored:
+                    return stored
+        except Exception:
+            return default_id
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(default_id, encoding="utf-8")
+        except Exception:
+            pass
+        return default_id
+
+    @staticmethod
+    def _urlsafe_b64encode(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("utf-8")
+
+    @staticmethod
+    def _urlsafe_b64decode(raw: str) -> bytes:
+        padded = raw + "=" * (-len(raw) % 4)
+        return base64.urlsafe_b64decode(padded.encode("utf-8"))
+
+    def _encode_operator_token(
+        self,
+        *,
+        state_key: str,
+        owner_id: int,
+        created_at: datetime,
+    ) -> str:
+        if not self._operator_token_secret:
+            return secrets.token_urlsafe(18)
+        payload = {
+            "v": 1,
+            "state_key": state_key,
+            "owner_id": owner_id,
+            "created_at": int(created_at.timestamp()),
+            "nonce": secrets.token_urlsafe(8),
+            "instance_id": self._operator_instance_id,
+        }
+        payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        payload_b64 = self._urlsafe_b64encode(payload_json)
+        signature = hmac.new(
+            self._operator_token_secret,
+            payload_b64.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        signature_b64 = self._urlsafe_b64encode(signature)
+        return f"op1.{payload_b64}.{signature_b64}"
+
+    def _decode_operator_token(self, token: str) -> OperatorSession | None:
+        if not self._operator_token_secret:
+            return None
+        parts = token.split(".")
+        if len(parts) != 3 or parts[0] != "op1":
+            return None
+        payload_b64, signature_b64 = parts[1], parts[2]
+        expected = hmac.new(
+            self._operator_token_secret,
+            payload_b64.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        try:
+            signature = self._urlsafe_b64decode(signature_b64)
+        except Exception:
+            return None
+        if not hmac.compare_digest(signature, expected):
+            return None
+        try:
+            payload = json.loads(self._urlsafe_b64decode(payload_b64))
+        except Exception:
+            return None
+        if payload.get("v") != 1:
+            return None
+        state_key = str(payload.get("state_key") or "")
+        owner_id = payload.get("owner_id")
+        created_at = payload.get("created_at")
+        if not state_key or not isinstance(owner_id, int) or not isinstance(created_at, int):
+            return None
+        instance_id = str(payload.get("instance_id") or "")
+        if instance_id and not self._operator_allow_shared_tokens:
+            if instance_id != self._operator_instance_id:
+                return None
+        now = datetime.now(timezone.utc).timestamp()
+        if created_at > now + OPERATOR_TOKEN_MAX_FUTURE_S:
+            return None
+        return OperatorSession(
+            token=token,
+            state_key=state_key,
+            owner_id=owner_id,
+            created_at=datetime.fromtimestamp(created_at, tz=timezone.utc),
+        )
+
     def _prune_operator_sessions(self) -> None:
         if not self._operator_sessions:
             return
@@ -2046,21 +2170,31 @@ class Ask(commands.Cog):
 
     def _create_operator_session(self, ctx: commands.Context) -> OperatorSession:
         self._prune_operator_sessions()
-        token = secrets.token_urlsafe(18)
+        created_at = datetime.now(timezone.utc)
+        token = self._encode_operator_token(
+            state_key=self._state_key(ctx),
+            owner_id=ctx.author.id,
+            created_at=created_at,
+        )
         session = OperatorSession(
             token=token,
             state_key=self._state_key(ctx),
             owner_id=ctx.author.id,
-            created_at=datetime.now(timezone.utc),
+            created_at=created_at,
         )
         self._operator_sessions[token] = session
         self._operator_sessions_by_state.setdefault(session.state_key, set()).add(token)
         return session
 
     def _get_operator_session(self, token: str) -> OperatorSession | None:
+        self._prune_operator_sessions()
         session = self._operator_sessions.get(token)
         if not session:
-            return None
+            session = self._decode_operator_token(token)
+            if session is None:
+                return None
+            self._operator_sessions[token] = session
+            self._operator_sessions_by_state.setdefault(session.state_key, set()).add(token)
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=OPERATOR_TOKEN_TTL_S)
         if session.created_at < cutoff:
             self._operator_sessions.pop(token, None)
@@ -2070,12 +2204,17 @@ class Ask(commands.Cog):
                 if not tokens:
                     self._operator_sessions_by_state.pop(session.state_key, None)
             return None
+        revoked_before = self._operator_revoked_before.get(session.state_key)
+        if revoked_before and session.created_at < revoked_before:
+            return None
         return session
 
     def _clear_operator_sessions_for_state_key(self, state_key: str) -> None:
+        self._operator_revoked_before[state_key] = datetime.now(timezone.utc)
         tokens = self._operator_sessions_by_state.pop(state_key, set())
         for token in tokens:
             self._operator_sessions.pop(token, None)
+        self._operator_start_warnings.pop(state_key, None)
 
     @staticmethod
     def _is_admin(ctx: commands.Context) -> bool:
@@ -2237,20 +2376,70 @@ class Ask(commands.Cog):
         agent = self._get_browser_agent_for_state_key(state_key)
         if agent.is_started():
             return agent, None
+        warning: str | None = None
         mode: Literal["launch", "cdp"] = "cdp" if prefer_cdp else "launch"
         cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
         if mode == "cdp" and not cdp_url:
-            return None, "missing_cdp_url"
+            log.warning(
+                "CDP preferred but ASK_BROWSER_CDP_URL missing; falling back to launch."
+            )
+            mode = "launch"
+            self._browser_prefer_cdp_by_channel.pop(state_key, None)
+            warning = "cdp_fallback_missing_url"
         user_data_dir = None
         if mode == "launch":
             user_data_dir = str(self._browser_profile_dir(state_key))
-        await agent.start(
-            mode=mode,
-            headless=True,
-            cdp_url=cdp_url,
-            user_data_dir=user_data_dir,
-        )
+            cdp_url = None
+        if mode == "cdp":
+            try:
+                await agent.start(
+                    mode=mode,
+                    headless=True,
+                    cdp_url=cdp_url,
+                    user_data_dir=user_data_dir,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Failed to connect via CDP (%s); falling back to launch.",
+                    type(exc).__name__,
+                )
+                mode = "launch"
+                self._browser_prefer_cdp_by_channel.pop(state_key, None)
+                user_data_dir = str(self._browser_profile_dir(state_key))
+                cdp_url = None
+                warning = "cdp_fallback_connect_failed"
+        if mode == "launch":
+            try:
+                await agent.start(
+                    mode=mode,
+                    headless=True,
+                    cdp_url=cdp_url,
+                    user_data_dir=user_data_dir,
+                )
+            except Exception as exc:
+                log.exception("Failed to start operator browser: %s", type(exc).__name__)
+                return None, "browser_start_failed"
+        if warning:
+            self._operator_start_warnings[state_key] = warning
+        else:
+            self._operator_start_warnings.pop(state_key, None)
+        await self._maybe_navigate_operator_default(agent)
         return agent, None
+
+    async def _maybe_navigate_operator_default(self, agent: BrowserAgent) -> None:
+        default_url = self._operator_default_url
+        if not default_url:
+            return
+        current_url = ""
+        with contextlib.suppress(Exception):
+            current_url = agent.page.url
+        if current_url and not current_url.startswith(("about:", "chrome://", "edge://")):
+            return
+        if not await self._is_safe_browser_url(default_url):
+            log.warning("ASK_OPERATOR_DEFAULT_URL rejected as unsafe: %s", default_url)
+            return
+        with contextlib.suppress(Exception):
+            await agent.page.goto(default_url)
 
     async def _operator_observation(self, agent: BrowserAgent) -> dict[str, Any]:
         observation = await agent.observe()
@@ -2281,7 +2470,10 @@ class Ask(commands.Cog):
             if agent is None:
                 return web.json_response({"ok": False, "error": "browser_unavailable"}, status=409)
             observation = await self._operator_observation(agent)
-        return web.json_response({"ok": True, "observation": observation})
+        warning = self._operator_start_warnings.get(state_key)
+        return web.json_response(
+            {"ok": True, "observation": observation, "warning": warning}
+        )
 
     async def _operator_handle_screenshot(self, request: web.Request) -> web.Response:
         token = request.match_info.get("token", "")
@@ -2392,6 +2584,19 @@ class Ask(commands.Cog):
         border-radius: 12px;
         padding: 12px;
       }}
+      .status-banner {{
+        background: #2a1b1b;
+        border: 1px solid #5a2a2a;
+        color: #f9c0c0;
+        border-radius: 10px;
+        padding: 10px;
+        font-size: 13px;
+        margin-bottom: 12px;
+        white-space: pre-wrap;
+      }}
+      .status-banner.hidden {{
+        display: none;
+      }}
       .controls {{
         display: flex;
         flex-direction: column;
@@ -2426,12 +2631,32 @@ class Ask(commands.Cog):
       .row input {{
         flex: 1;
       }}
+      .screen-wrap {{
+        position: relative;
+      }}
       #screen {{
         width: 100%;
         border-radius: 10px;
         border: 1px solid #1f2533;
         cursor: crosshair;
         background: #0b0d12;
+        display: block;
+      }}
+      .screen-error {{
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 12px;
+        text-align: center;
+        font-size: 13px;
+        color: #f7d7d7;
+        background: rgba(11, 13, 18, 0.88);
+        border-radius: 10px;
+      }}
+      .screen-error.hidden {{
+        display: none;
       }}
       #status {{
         font-size: 12px;
@@ -2448,10 +2673,14 @@ class Ask(commands.Cog):
   </head>
   <body>
     <h1>Ask Operator</h1>
+    <div id="statusBanner" class="status-banner hidden"></div>
     <div class="layout">
       <div class="panel">
         <div class="meta" id="pageMeta">Loading...</div>
-        <img id="screen" alt="browser screenshot" />
+        <div class="screen-wrap">
+          <img id="screen" alt="browser screenshot" />
+          <div id="screenError" class="screen-error hidden"></div>
+        </div>
         <div id="status"></div>
       </div>
       <div class="panel controls">
@@ -2500,11 +2729,31 @@ class Ask(commands.Cog):
       const screen = document.getElementById("screen");
       const statusEl = document.getElementById("status");
       const metaEl = document.getElementById("pageMeta");
+      const bannerEl = document.getElementById("statusBanner");
+      const screenErrorEl = document.getElementById("screenError");
+      let lastScreenUrl = null;
 
       const operatorBase = (() => {{
         const path = window.location.pathname;
         return path.endsWith("/" + token) ? path.slice(0, -1 * (token.length + 1)) : path;
       }})();
+      async function parseError(response) {{
+        const contentType = response.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {{
+          try {{
+            const data = await response.json();
+            if (data && data.error) {{
+              return data.error;
+            }}
+            return JSON.stringify(data);
+          }} catch (err) {{
+            return err.message || response.statusText;
+          }}
+        }}
+        const text = await response.text();
+        return text || response.statusText;
+      }}
+
       async function api(path, body) {{
         const response = await fetch(`${{operatorBase}}/${{token}}/${{path}}`, {{
           method: body ? "POST" : "GET",
@@ -2512,8 +2761,8 @@ class Ask(commands.Cog):
           body: body ? JSON.stringify(body) : undefined,
         }});
         if (!response.ok) {{
-          const text = await response.text();
-          throw new Error(text || response.statusText);
+          const message = await parseError(response);
+          throw new Error(message);
         }}
         if (path === "screenshot") {{
           return await response.blob();
@@ -2521,14 +2770,46 @@ class Ask(commands.Cog):
         return await response.json();
       }}
 
+      function showBanner(message) {{
+        bannerEl.textContent = message;
+        bannerEl.classList.remove("hidden");
+      }}
+
+      function clearBanner() {{
+        bannerEl.textContent = "";
+        bannerEl.classList.add("hidden");
+      }}
+
+      function showScreenError(message) {{
+        screenErrorEl.textContent = message;
+        screenErrorEl.classList.remove("hidden");
+        screen.alt = message;
+        screen.title = message;
+      }}
+
+      function clearScreenError() {{
+        screenErrorEl.textContent = "";
+        screenErrorEl.classList.add("hidden");
+        screen.alt = "browser screenshot";
+        screen.title = "";
+      }}
+
       async function refreshState() {{
         try {{
           const data = await api("state");
           if (data.ok && data.observation) {{
             metaEl.textContent = `${{data.observation.title || "Untitled"}} — ${{data.observation.url || ""}}`;
+            if (data.warning === "cdp_fallback_missing_url") {{
+              showBanner("CDP URL is not set. Using a server-launched browser.");
+            }} else if (data.warning === "cdp_fallback_connect_failed") {{
+              showBanner("CDP connection failed. Using a server-launched browser.");
+            }} else {{
+              clearBanner();
+            }}
           }}
         }} catch (err) {{
           metaEl.textContent = `State error: ${{err.message}}`;
+          showBanner(`State error: ${{err.message}}`);
         }}
       }}
 
@@ -2542,10 +2823,20 @@ class Ask(commands.Cog):
         refreshInFlight = true;
         try {{
           const blob = await api("screenshot");
-          screen.src = URL.createObjectURL(blob);
+          const nextUrl = URL.createObjectURL(blob);
+          screen.src = nextUrl;
+          if (lastScreenUrl && lastScreenUrl.startsWith("blob:")) {{
+            URL.revokeObjectURL(lastScreenUrl);
+          }}
+          lastScreenUrl = nextUrl;
+          clearScreenError();
+          clearBanner();
           await refreshState();
         }} catch (err) {{
-          statusEl.textContent = `Screenshot error: ${{err.message}}`;
+          const message = `Screenshot error: ${{err.message}}`;
+          statusEl.textContent = message;
+          showScreenError(message);
+          showBanner(message);
         }} finally {{
           refreshInFlight = false;
           if (pendingRefresh) {{
@@ -2560,11 +2851,18 @@ class Ask(commands.Cog):
         try {{
           const data = await api("action", {{ action }});
           statusEl.textContent = data.ok ? "Action complete." : `Action failed: ${{data.error || "unknown"}}`;
+          if (!data.ok) {{
+            showBanner(statusEl.textContent);
+          }} else {{
+            clearBanner();
+          }}
           if (refresh) {{
             await refreshScreenshot();
           }}
         }} catch (err) {{
-          statusEl.textContent = `Action error: ${{err.message}}`;
+          const message = `Action error: ${{err.message}}`;
+          statusEl.textContent = message;
+          showBanner(message);
         }}
       }}
 
@@ -2603,8 +2901,11 @@ class Ask(commands.Cog):
       }}, {{ passive: false }});
 
       document.getElementById("gotoBtn").addEventListener("click", () => {{
-        const url = document.getElementById("urlInput").value.trim();
+        let url = document.getElementById("urlInput").value.trim();
         if (url) {{
+          if (!url.includes("://")) {{
+            url = `https://${{url}}`;
+          }}
           sendAction({{ type: "goto", url }});
         }}
       }});
@@ -5987,10 +6288,10 @@ class Ask(commands.Cog):
                     self._set_browser_prefer_cdp(ctx, prefer_cdp)
                 elif owner_id != ctx.author.id and not is_admin:
                     embed = discord.Embed(
-                        title="\U0001F512 ブラウザは操作中です",
+                        title="\U0001F512 Browser is busy",
                         description=(
-                            f"このチャンネルのブラウザは <@{owner_id}> が操作中です。\n"
-                            "管理者は `/ask reset` で解除できます。"
+                            f"The browser in this channel is controlled by <@{owner_id}>.\n"
+                            "Admins can release it with `/ask reset`."
                         ),
                         color=0xED4245,
                     )
@@ -6002,75 +6303,82 @@ class Ask(commands.Cog):
 
                 self._set_browser_prefer_cdp(ctx, prefer_cdp)
                 description_lines = [
-                    "手動操作モードは、ボット側のブラウザを操作パネルで直接動かす方式です。",
-                    "CDPを設定した場合は、あなたのPC上で起動しているChromeに接続して操作します。",
+                    "Operator mode lets you control the bot's browser from a web panel.",
+                    "If CDP is configured, it connects to your local Chrome instead of launching on the server.",
                     "",
-                    "**1) PCでChromeをCDP付きで起動**",
-                    "`chrome --remote-debugging-port=9222 --user-data-dir=<専用プロファイル>`",
+                    "**1) Start Chrome with CDP enabled**",
+                    "`chrome --remote-debugging-port=9222 --user-data-dir=<dedicated-profile>`",
                     "",
-                    "**2) サーバーからPCに到達できるようにする**",
-                    "SSHリバーストンネルやTailscaleで `9222` を通します。",
+                    "**2) Expose the port to the server**",
+                    "Use SSH reverse tunnel or Tailscale to open port `9222`.",
                     "",
-                    "**3) BotにCDP URLを設定**",
-                    "`ASK_BROWSER_CDP_URL=http://<到達可能なホスト>:9222`",
+                    "**3) Configure the CDP URL**",
+                    "`ASK_BROWSER_CDP_URL=http://<reachable-host>:9222`",
                     "",
-                    "CDP URLは `/json/version` を含めず、ベースURLを指定してください。",
+                    "Set the base URL only (do not include `/json/version`).",
                 ]
                 if env_cdp_url:
                     description_lines.extend(
                         [
                             "",
-                            f"**現在のCDP URL**: {env_cdp_url}",
-                            f"**接続確認**: {env_cdp_url}/json/version",
+                            f"**Current CDP URL**: {env_cdp_url}",
+                            f"**Connection check**: {env_cdp_url}/json/version",
                         ]
                     )
                 else:
                     description_lines.extend(
                         [
                             "",
-                            "CDP URLが未設定です。上記の手順で設定すると、",
-                            "そのチャンネルの /ask があなたのPCのChromeを操作できます。",
+                            "CDP URL is not set. Configure it to control Chrome on your PC.",
                         ]
                     )
                 description_lines.extend(
                     [
                         "",
-                        "**4) 手動操作パネルを開く**",
-                        "ボットがホストするWeb UIでスクショを見ながらクリック/スクロール/入力できます。",
-                        "外部PCから開く場合は、ASK_OPERATOR_BASE_URLを到達可能なURLにしてください。",
+                        "**4) Open the operator panel**",
+                        "Use the hosted web UI to click, scroll, and type with screenshots.",
+                        "Set ASK_OPERATOR_BASE_URL if you need to open it from another PC.",
                     ]
                 )
                 operator_ready = await self._ensure_operator_server()
                 if operator_ready:
                     session = self._create_operator_session(ctx)
                     operator_url = f"{self._operator_public_base_url()}/operator/{session.token}"
-                    description_lines.extend(
-                        [
-                            f"**操作パネルURL**: {operator_url}",
-                            f"**有効期限**: 約{OPERATOR_TOKEN_TTL_S // 60}分",
+                    if self._operator_simple_guide:
+                        description_lines = [
+                            f"**Operator panel**: {operator_url}",
+                            f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
                         ]
-                    )
+                    else:
+                        description_lines.extend(
+                            [
+                                f"**Operator panel**: {operator_url}",
+                                f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
+                            ]
+                        )
                     if not self._operator_base_url:
                         candidates = await self._operator_url_candidates()
                         if candidates:
-                            preview = "\n".join(f"- {url}/operator/{session.token}" for url in candidates[:3])
+                            preview = "\n".join(
+                                f"- {url}/operator/{session.token}" for url in candidates[:3]
+                            )
                             description_lines.extend(
                                 [
                                     "",
-                                    "**到達可能なURL候補** (未設定時の参考):",
+                                    "**Reachable URL candidates** (when base URL is unset):",
                                     preview,
-                                    "※正しい入口はネットワーク構成によって異なります。",
+                                    "The correct entry point depends on your network setup.",
                                 ]
                             )
                 else:
                     description_lines.extend(
                         [
-                            "操作パネルの起動に失敗しました。`ASK_OPERATOR_PORT` などの設定を確認してください。",
+                            "Failed to start the operator panel. Check `ASK_OPERATOR_PORT` settings.",
                         ]
                     )
 
                 embed = discord.Embed(
-                    title="\U0001F5A5\uFE0F /ask operator: 手動操作ガイド",
+                    title="\U0001F5A5\uFE0F /ask operator: Operator Guide",
                     description="\n".join(description_lines),
                     color=0x5865F2,
                 )

@@ -9,7 +9,15 @@
    - `ASK_OPERATOR_BASE_URL` — public base URL for the `/ask operator` web panel (ex: `https://bot.example.com`).
    - `ASK_OPERATOR_HOST` — bind host for the operator web server (defaults to `0.0.0.0`).
    - `ASK_OPERATOR_PORT` — bind port for the operator web server (defaults to `8080`).
+   - `ASK_OPERATOR_DEFAULT_URL` — initial URL to open in the operator browser (defaults to `https://www.google.com`).
+   - `ASK_OPERATOR_SIMPLE_GUIDE` — set to `true` to post only the operator link instead of the full guide.
+   - `ASK_OPERATOR_TOKEN_SECRET` — HMAC secret for `/ask operator` session tokens (defaults to `DISCORD_BOT_TOKEN`, set the same value across instances).
+   - `ASK_OPERATOR_INSTANCE_ID` — instance identifier embedded in operator tokens (defaults to a random value on boot).
+   - `ASK_OPERATOR_ALLOW_SHARED_TOKENS` — allow operator tokens from other instances (defaults to `false`).
+   - `ASK_OPERATOR_TOKEN_MAX_FUTURE_S` — maximum allowed clock skew for operator tokens in seconds (defaults to `300`).
    - `ASK_OPERATOR_TOKEN_TTL_S` — operator panel link TTL in seconds (defaults to `1800`).
+   - Operator instance IDs persist in `data/operator_instance_id.txt` unless overridden by `ASK_OPERATOR_INSTANCE_ID`. Set a fixed ID for restart-safe links.
+   - Shared tokens do **not** share browser state across instances. Use sticky sessions (or a single instance) for `/operator/*` traffic to avoid profile conflicts or separate browser sessions. If `ASK_OPERATOR_ALLOW_SHARED_TOKENS` is enabled, expect a separate browser per instance.
 
 2. Start the bot with `python run.py`. Use `python run.py --bootstrap` to install/update dependencies
    (`pip install -r requirements.txt`, `pip-review --auto`) and install Playwright browsers before
