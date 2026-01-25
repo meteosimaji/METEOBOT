@@ -2846,7 +2846,7 @@ class Ask(commands.Cog):
         }}
       }}
 
-      async function sendAction(action, {{ refresh = true }}) {{
+      async function sendAction(action, {{ refresh = true }} = {{}}) {{
         statusEl.textContent = "Sending action...";
         try {{
           const data = await api("action", {{ action }});
