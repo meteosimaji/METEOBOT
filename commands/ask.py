@@ -3493,7 +3493,7 @@ class Ask(commands.Cog):
                                         },
                                         "button": {
                                             "type": ["string", "null"],
-                                            "enum": ["left", "middle", "right", null],
+                                            "enum": ["left", "middle", "right", None],
                                             "description": "Mouse button (default left).",
                                         },
                                         "clicks": {
