@@ -1896,6 +1896,13 @@ class Ask(commands.Cog):
             self._async_client = False
 
         repo_root = Path(__file__).resolve().parent.parent
+        self._repo_root = repo_root
+        self._browser_profile_root = Path(
+            os.getenv(
+                "ASK_BROWSER_PROFILE_DIR",
+                str(repo_root / "data" / "browser_profiles"),
+            )
+        )
         self.shell_executor = ReadOnlyShellExecutor(ShellPolicy(root_dir=repo_root))
         self._attachment_cache: OrderedDict[tuple[int, int, int], OrderedDict[str, AskAttachmentRecord]] = (
             OrderedDict()
@@ -1909,8 +1916,8 @@ class Ask(commands.Cog):
         self._ask_queue_pause_until: dict[str, datetime] = {}
         self._http_session: aiohttp.ClientSession | None = None
         self._attachment_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ask_attach")
-        self._browser_by_ctx: dict[int, BrowserAgent] = {}
-        self._browser_lock_by_ctx: dict[int, asyncio.Lock] = {}
+        self._browser_by_channel: dict[str, BrowserAgent] = {}
+        self._browser_lock_by_channel: dict[str, asyncio.Lock] = {}
 
         if not hasattr(self.bot, "ai_last_response_id"):
             self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
@@ -1932,34 +1939,42 @@ class Ask(commands.Cog):
         channel_id = ctx.channel.id if ctx.channel else 0
         return f"{guild_id}:{channel_id}"
 
+    def _browser_profile_dir(self, state_key: str) -> Path:
+        safe_key = re.sub(r"[^a-zA-Z0-9._-]", "_", state_key)
+        profile_dir = self._browser_profile_root / safe_key
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        return profile_dir
+
     def _get_ctx_lock(self, ctx: commands.Context) -> asyncio.Lock:
-        key = self._ctx_key(ctx)
-        lock = self._browser_lock_by_ctx.get(key)
+        key = self._state_key(ctx)
+        lock = self._browser_lock_by_channel.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            self._browser_lock_by_ctx[key] = lock
+            self._browser_lock_by_channel[key] = lock
         return lock
 
     def _get_browser_agent_for_ctx(self, ctx: commands.Context) -> BrowserAgent:
-        key = self._ctx_key(ctx)
-        agent = self._browser_by_ctx.get(key)
+        key = self._state_key(ctx)
+        agent = self._browser_by_channel.get(key)
         if agent is None:
             agent = BrowserAgent()
-            self._browser_by_ctx[key] = agent
+            self._browser_by_channel[key] = agent
         return agent
 
     async def _close_browser_for_ctx(self, ctx: commands.Context) -> None:
-        key = self._ctx_key(ctx)
+        key = self._state_key(ctx)
         await self._close_browser_for_ctx_key(key)
 
-    async def _close_browser_for_ctx_key(self, key: int) -> None:
-        agent = self._browser_by_ctx.pop(key, None)
-        self._browser_lock_by_ctx.pop(key, None)
+    async def _close_browser_for_ctx_key(self, key: str) -> None:
+        agent = self._browser_by_channel.pop(key, None)
+        self._browser_lock_by_channel.pop(key, None)
         if agent is not None:
             await agent.close()
 
     async def _is_safe_browser_url(self, url: str) -> bool:
         parsed = urlparse(url)
+        if parsed.scheme == "about" and parsed.path == "blank":
+            return True
         if (parsed.scheme or "").lower() not in {"http", "https"}:
             return False
         host = (parsed.hostname or "").lower()
@@ -2877,7 +2892,7 @@ class Ask(commands.Cog):
             self._http_session = None
         with contextlib.suppress(Exception):
             self._attachment_executor.shutdown(wait=False, cancel_futures=True)
-        for key in list(self._browser_by_ctx.keys()):
+        for key in list(self._browser_by_channel.keys()):
             with contextlib.suppress(Exception):
                 await self._close_browser_for_ctx_key(key)
 
@@ -3246,10 +3261,13 @@ class Ask(commands.Cog):
                         },
                         "action": {
                             "description": (
-                                "Action payload: goto {url}, click {selector}, click_role {role,name}, "
-                                "fill {selector,text}, fill_role {role,name,text}, press {key}, "
+                                "Action payload: goto {url}, click {selector}, scroll {delta_x,delta_y,after_ms}, "
+                                "click_role {role,name}, click_xy {x,y,button?,clicks?}, fill {selector,text}, "
+                                "fill_role {role,name,text}, press {key}, "
                                 "wait_for_load {state}, content {}, download {selector|url}, "
-                                "screenshot {full_page?, selector?, filename?, format?}, observe {}, close {}."
+                                "screenshot {full_page?, selector?, filename?, format?}, observe {}, "
+                                "list_tabs {}, new_tab {url?, focus?}, switch_tab {tab_id}, close_tab {tab_id}, "
+                                "observe_tabs {max_tabs?, include_aria?}, close {}."
                             ),
                             "anyOf": [
                                 {
@@ -3276,6 +3294,26 @@ class Ask(commands.Cog):
                                 {
                                     "type": "object",
                                     "properties": {
+                                        "type": {"type": "string", "enum": ["scroll"]},
+                                        "delta_x": {
+                                            "type": "number",
+                                            "description": "Horizontal wheel delta (default 0).",
+                                        },
+                                        "delta_y": {
+                                            "type": "number",
+                                            "description": "Vertical wheel delta (default 800).",
+                                        },
+                                        "after_ms": {
+                                            "type": "integer",
+                                            "description": "Optional wait after scrolling (default 150ms).",
+                                        },
+                                    },
+                                    "required": ["type", "delta_x", "delta_y", "after_ms"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
                                         "type": {"type": "string", "enum": ["click_role"]},
                                         "role": {
                                             "type": "string",
@@ -3287,6 +3325,95 @@ class Ask(commands.Cog):
                                         },
                                     },
                                     "required": ["type", "role", "name"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["click_xy"]},
+                                        "x": {
+                                            "type": "number",
+                                            "description": "Viewport x coordinate to click.",
+                                        },
+                                        "y": {
+                                            "type": "number",
+                                            "description": "Viewport y coordinate to click.",
+                                        },
+                                        "button": {
+                                            "type": ["string", "null"],
+                                            "enum": ["left", "middle", "right", null],
+                                            "description": "Mouse button (default left).",
+                                        },
+                                        "clicks": {
+                                            "type": ["integer", "null"],
+                                            "description": "Number of clicks (default 1).",
+                                        },
+                                    },
+                                    "required": ["type", "x", "y"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["list_tabs"]},
+                                    },
+                                    "required": ["type"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["new_tab"]},
+                                        "url": {
+                                            "type": ["string", "null"],
+                                            "description": "Optional URL to open in the new tab.",
+                                        },
+                                        "focus": {
+                                            "type": ["boolean", "null"],
+                                            "description": "Whether to focus the new tab (default true).",
+                                        },
+                                    },
+                                    "required": ["type", "url", "focus"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["switch_tab"]},
+                                        "tab_id": {
+                                            "type": "string",
+                                            "description": "Tab id returned from list_tabs/new_tab.",
+                                        },
+                                    },
+                                    "required": ["type", "tab_id"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["close_tab"]},
+                                        "tab_id": {
+                                            "type": "string",
+                                            "description": "Tab id returned from list_tabs/new_tab.",
+                                        },
+                                    },
+                                    "required": ["type", "tab_id"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["observe_tabs"]},
+                                        "max_tabs": {
+                                            "type": ["integer", "null"],
+                                            "description": "Maximum tabs to include.",
+                                        },
+                                        "include_aria": {
+                                            "type": ["boolean", "null"],
+                                            "description": "Whether to include ARIA snapshots.",
+                                        },
+                                    },
+                                    "required": ["type", "max_tabs", "include_aria"],
                                     "additionalProperties": False,
                                 },
                                 {
@@ -3939,6 +4066,10 @@ class Ask(commands.Cog):
 
                 agent = self._get_browser_agent_for_ctx(ctx)
                 if not agent.is_started():
+                    user_data_dir = None
+                    if mode == "launch":
+                        state_key = self._state_key(ctx)
+                        user_data_dir = str(self._browser_profile_dir(state_key))
                     if mode == "cdp" and not cdp_url:
                         return {
                             "ok": False,
@@ -3949,10 +4080,19 @@ class Ask(commands.Cog):
                         mode=mode,
                         headless=headless,
                         cdp_url=cdp_url,
+                        user_data_dir=user_data_dir,
                     )
                 if action_type == "goto":
                     url = _get_action_str(action, "url")
                     if not await self._is_safe_browser_url(url):
+                        return {
+                            "ok": False,
+                            "error": "unsafe_url",
+                            "reason": "Only public http/https URLs are allowed.",
+                        }
+                if action_type == "new_tab":
+                    url = _get_action_str(action, "url")
+                    if url and not await self._is_safe_browser_url(url):
                         return {
                             "ok": False,
                             "error": "unsafe_url",
@@ -5126,6 +5266,7 @@ class Ask(commands.Cog):
                 )
 
             await self._clear_ask_queue(state_key)
+            await self._close_browser_for_ctx_key(state_key)
 
             try:
                 removed = self.bot.ai_last_response_id.pop(state_key, None)  # type: ignore[attr-defined]
