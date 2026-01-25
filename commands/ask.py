@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import ipaddress
 import contextlib
 import csv
 import difflib
@@ -11,11 +10,13 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import tempfile
 import zipfile
 import types
 import uuid
 import unicodedata
+import ipaddress
 from io import BytesIO
 from collections import OrderedDict, deque
 import functools
@@ -1920,6 +1921,7 @@ class Ask(commands.Cog):
         self._browser_by_channel: dict[str, BrowserAgent] = {}
         self._browser_lock_by_channel: dict[str, asyncio.Lock] = {}
         self._browser_owner_by_channel: dict[str, int] = {}
+        self._browser_prefer_cdp_by_channel: dict[str, bool] = {}
 
         if not hasattr(self.bot, "ai_last_response_id"):
             self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
@@ -1941,9 +1943,12 @@ class Ask(commands.Cog):
         channel_id = ctx.channel.id if ctx.channel else 0
         return f"{guild_id}:{channel_id}"
 
-    def _browser_profile_dir(self, state_key: str) -> Path:
+    def _browser_profile_path(self, state_key: str) -> Path:
         safe_key = re.sub(r"[^a-zA-Z0-9._-]", "_", state_key)
-        profile_dir = self._browser_profile_root / safe_key
+        return self._browser_profile_root / safe_key
+
+    def _browser_profile_dir(self, state_key: str) -> Path:
+        profile_dir = self._browser_profile_path(state_key)
         profile_dir.mkdir(parents=True, exist_ok=True)
         return profile_dir
 
@@ -1971,6 +1976,16 @@ class Ask(commands.Cog):
 
     def _clear_browser_owner(self, ctx: commands.Context) -> None:
         self._browser_owner_by_channel.pop(self._state_key(ctx), None)
+
+    def _set_browser_prefer_cdp(self, ctx: commands.Context, prefer: bool) -> None:
+        key = self._state_key(ctx)
+        if prefer:
+            self._browser_prefer_cdp_by_channel[key] = True
+        else:
+            self._browser_prefer_cdp_by_channel.pop(key, None)
+
+    def _prefers_cdp(self, ctx: commands.Context) -> bool:
+        return bool(self._browser_prefer_cdp_by_channel.get(self._state_key(ctx)))
 
     @staticmethod
     def _is_admin(ctx: commands.Context) -> bool:
@@ -4224,14 +4239,16 @@ class Ask(commands.Cog):
                     value = action_obj.get(key)
                     return value if isinstance(value, str) else ""
 
-                action_type = _get_action_str(action, "type")
-                mode = str(args.get("mode") or "launch")
-                if mode not in {"launch", "cdp"}:
-                    return {"ok": False, "error": "bad_mode", "reason": "mode must be launch or cdp."}
-                headless = bool(args.get("headless", True))
                 arg_cdp_url = str(args.get("cdp_url") or "").strip() or None
                 env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
                 cdp_url = env_cdp_url or arg_cdp_url
+                action_type = _get_action_str(action, "type")
+                mode = str(args.get("mode") or "launch")
+                if mode == "launch" and cdp_url and self._prefers_cdp(ctx):
+                    mode = "cdp"
+                if mode not in {"launch", "cdp"}:
+                    return {"ok": False, "error": "bad_mode", "reason": "mode must be launch or cdp."}
+                headless = bool(args.get("headless", True))
                 owner_id = self._get_browser_owner(ctx)
                 is_admin = self._is_admin(ctx)
                 privileged_actions = {
@@ -4270,8 +4287,10 @@ class Ask(commands.Cog):
                         }
                     if action_type == "close":
                         await self._close_browser_for_ctx(ctx)
+                        self._set_browser_prefer_cdp(ctx, False)
                         return {"ok": True, "closed": True}
                     self._clear_browser_owner(ctx)
+                    self._set_browser_prefer_cdp(ctx, False)
                     return {"ok": True, "released": True}
 
                 agent = self._get_browser_agent_for_ctx(ctx)
@@ -5215,8 +5234,8 @@ class Ask(commands.Cog):
 
     @commands.command(
         name="ask",
-        description="Ask the AI anything with optional attachments and a reset action.",
-        usage="[ask|reset] <question (optional when attaching images)>",
+        description="Ask the AI anything with optional attachments, reset, or operator actions.",
+        usage="[ask|operator|reset] <question (optional when attaching images)>",
         rest_is_raw=True,
         help=(
             "Ask a question and get a concise AI answer. You can attach up to three images and"
@@ -5225,7 +5244,8 @@ class Ask(commands.Cog):
             " text extraction. If the original Discord message is deleted, you may need to"
             " re-upload the file. Large images are automatically resized or recompressed toward"
             " ~3MB to keep requests light. Web search may be used when needed. Admins can clear"
-            " the channel conversation history by choosing the reset action.\n\n"
+            " the channel conversation history by choosing the reset action, and operator sends"
+            " manual browser control instructions.\n\n"
             f"**Prefix**: `{BOT_PREFIX}ask <question>` (attach files to your message; replies pick up the referenced images).\n"
             "**Slash**: `/ask action: ask text:<question> image1:<attachment> image2:<attachment> image3:<attachment>`\n"
             "**Examples**: `/ask action: ask text:What's a positive news story today?`\n"
@@ -5236,11 +5256,13 @@ class Ask(commands.Cog):
             "category": "AI",
             "pro": (
                 "Uses the Responses API with web_search, accepts attached images for vision "
-                "analysis, caches attachment metadata for on-demand file reading, keeps "
-                "per-channel conversation state via previous_response_id, and attaches full text "
-                "files when responses exceed embed limits."
+            "analysis, caches attachment metadata for on-demand file reading, keeps "
+            "per-channel conversation state via previous_response_id, and attaches full text "
+            "files when responses exceed embed limits."
             ),
-            "destination": "Send a prompt (and optional attachments) to the AI or reset channel memory.",
+            "destination": (
+                "Send a prompt (and optional attachments), request operator instructions, or reset channel memory."
+            ),
             "plus": "Use action reset to clear the channel conversation; admins only for resets.",
         },
     )
@@ -5252,7 +5274,7 @@ class Ask(commands.Cog):
         description="Ask the AI anything. Send text and optionally attach files for analysis.",
     )
     @app_commands.describe(
-        action="Choose whether to ask a question or reset the channel's ask memory (admins only).",
+        action="Choose whether to ask a question, show operator instructions, or reset memory (admins only).",
         text="Your prompt for the AI. Leave blank if you're only attaching images.",
         image1="Optional first image for the AI to analyze.",
         image2="Optional second image for the AI to analyze.",
@@ -5261,6 +5283,7 @@ class Ask(commands.Cog):
     @app_commands.choices(
         action=[
             app_commands.Choice(name="ask", value="ask"),
+            app_commands.Choice(name="operator", value="operator"),
             app_commands.Choice(name="reset", value="reset"),
         ]
     )
@@ -5296,7 +5319,7 @@ class Ask(commands.Cog):
         action = (action or "ask").lower()
         text = (text or "").strip()
 
-        if action not in {"ask", "reset"}:
+        if action not in {"ask", "reset", "operator"}:
             text = f"{action} {text}".strip()
             action = "ask"
 
@@ -5327,6 +5350,73 @@ class Ask(commands.Cog):
                 state_key=state_key,
             )
             return
+
+        if action == "operator":
+            async with self._get_ctx_lock(ctx):
+                owner_id = self._get_browser_owner(ctx)
+                is_admin = self._is_admin(ctx)
+                if owner_id is None:
+                    owner_id = ctx.author.id
+                    self._set_browser_owner(ctx, owner_id)
+                    self._set_browser_prefer_cdp(ctx, True)
+                elif owner_id != ctx.author.id and not is_admin:
+                    embed = discord.Embed(
+                        title="\U0001F512 ブラウザは操作中です",
+                        description=(
+                            f"このチャンネルのブラウザは <@{owner_id}> が操作中です。\n"
+                            "管理者は `/ask reset` で解除できます。"
+                        ),
+                        color=0xED4245,
+                    )
+                    reply_kwargs: dict[str, Any] = {"embed": embed}
+                    if ctx.interaction:
+                        reply_kwargs["ephemeral"] = True
+                    await self._reply(ctx, **reply_kwargs)
+                    return
+
+                self._set_browser_prefer_cdp(ctx, True)
+                env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip()
+                description_lines = [
+                    "手動操作モードは、あなたのPC上で起動しているChromeにボットが接続して操作する方式です。",
+                    "",
+                    "**1) PCでChromeをCDP付きで起動**",
+                    "`chrome --remote-debugging-port=9222 --user-data-dir=<専用プロファイル>`",
+                    "",
+                    "**2) サーバーからPCに到達できるようにする**",
+                    "SSHリバーストンネルやTailscaleで `9222` を通します。",
+                    "",
+                    "**3) BotにCDP URLを設定**",
+                    "`ASK_BROWSER_CDP_URL=http://<到達可能なホスト>:9222`",
+                    "",
+                    "CDP URLは `/json/version` を含めず、ベースURLを指定してください。",
+                ]
+                if env_cdp_url:
+                    description_lines.extend(
+                        [
+                            "",
+                            f"**現在のCDP URL**: {env_cdp_url}",
+                            f"**接続確認**: {env_cdp_url}/json/version",
+                        ]
+                    )
+                else:
+                    description_lines.extend(
+                        [
+                            "",
+                            "CDP URLが未設定です。上記の手順で設定すると、",
+                            "そのチャンネルの /ask があなたのPCのChromeを操作できます。",
+                        ]
+                    )
+
+                embed = discord.Embed(
+                    title="\U0001F5A5\uFE0F /ask operator: 手動操作ガイド",
+                    description="\n".join(description_lines),
+                    color=0x5865F2,
+                )
+                reply_kwargs = {"embed": embed}
+                if ctx.interaction:
+                    reply_kwargs["ephemeral"] = True
+                await self._reply(ctx, **reply_kwargs)
+                return
 
         attachments: list[discord.Attachment] = []
         seen_attachment_ids: set[int] = set()
@@ -5471,8 +5561,22 @@ class Ask(commands.Cog):
                     prompt_message, delay=ASK_RESET_PROMPT_DELETE_DELAY_S
                 )
 
-            await self._clear_ask_queue(state_key)
-            await self._close_browser_for_ctx_key(state_key)
+            async with self._get_ctx_lock(ctx):
+                await self._clear_ask_queue(state_key)
+                await self._close_browser_for_ctx_key(state_key)
+                self._set_browser_prefer_cdp(ctx, False)
+                profile_dir = self._browser_profile_path(state_key)
+                profile_removed = False
+                profile_error = None
+                if profile_dir.exists():
+                    try:
+                        shutil.rmtree(profile_dir)
+                        profile_removed = True
+                    except Exception as exc:
+                        profile_error = (
+                            "Failed to delete browser profile directory. Login data may still remain."
+                        )
+                        log.warning("%s (%s): %s", profile_error, profile_dir, exc)
 
             try:
                 removed = self.bot.ai_last_response_id.pop(state_key, None)  # type: ignore[attr-defined]
@@ -5488,6 +5592,11 @@ class Ask(commands.Cog):
                 desc = "There wasn't any saved ask memory here. Need me to reset somewhere else?"
                 color = 0xFEE75C
                 title = "\u2139\ufe0f No ask memory found"
+
+            if profile_removed:
+                desc = f"{desc}\nBrowser login profile deleted for this channel."
+            elif profile_error:
+                desc = f"{desc}\n{profile_error}"
 
             result_embed = discord.Embed(title=title, description=desc, color=color)
             result_embed.set_footer(text="Run /ask with action: reset in another channel if needed.")
