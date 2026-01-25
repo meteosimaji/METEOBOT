@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 import contextlib
 from typing import Any, Literal
 import uuid
@@ -35,9 +36,11 @@ class BrowserAgent:
         *,
         default_timeout_ms: int = 15_000,
         max_aria_chars: int = 10_000,
+        max_action_history: int = 20,
     ) -> None:
         self.default_timeout_ms = default_timeout_ms
         self.max_aria_chars = max_aria_chars
+        self.max_action_history = max_action_history
 
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
@@ -47,6 +50,7 @@ class BrowserAgent:
         self._active_tab_id: str | None = None
         self._owns_browser = False
         self._owns_context = False
+        self._tab_actions: dict[str, deque[dict[str, Any]]] = {}
 
     @property
     def page(self) -> Page:
@@ -60,9 +64,11 @@ class BrowserAgent:
     def _register_page(self, page: Page, *, set_active: bool = True) -> str:
         tab_id = uuid.uuid4().hex[:8]
         self._pages[tab_id] = page
+        self._tab_actions[tab_id] = deque(maxlen=self.max_action_history)
 
         def _on_close() -> None:
             self._pages.pop(tab_id, None)
+            self._tab_actions.pop(tab_id, None)
             if self._active_tab_id == tab_id:
                 fallback = next(iter(self._pages.keys()), None)
                 self._active_tab_id = fallback
@@ -159,6 +165,7 @@ class BrowserAgent:
         self._page = None
         self._pages = {}
         self._active_tab_id = None
+        self._tab_actions = {}
         self._owns_browser = False
         self._owns_context = False
 
@@ -203,13 +210,35 @@ class BrowserAgent:
             )
         return tabs
 
+    def _record_action(self, tab_id: str | None, action_type: str, details: dict[str, Any]) -> None:
+        if not tab_id:
+            return
+        history = self._tab_actions.get(tab_id)
+        if history is None:
+            return
+        history.append({"type": action_type, "details": details})
+
+    @staticmethod
+    def _truncate_detail(value: Any, limit: int = 120) -> str:
+        text = str(value or "")
+        text = " ".join(text.split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)] + "…"
+
     async def act(self, action: dict[str, Any]) -> dict[str, Any]:
         page = self.page
         action_type = str(action.get("type") or "")
+        active_tab_id = self._active_tab_id
 
         try:
             if action_type == "goto":
                 await page.goto(str(action["url"]))
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"url": self._truncate_detail(action.get("url"))},
+                )
             elif action_type == "click":
                 locator = page.locator(str(action["selector"]))
                 with contextlib.suppress(Exception):
@@ -218,6 +247,11 @@ class BrowserAgent:
                     await locator.click(timeout=self.default_timeout_ms)
                 except Exception:
                     await locator.click(timeout=self.default_timeout_ms, force=True)
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"selector": self._truncate_detail(action.get("selector"))},
+                )
             elif action_type == "scroll":
                 delta_x_raw = action.get("delta_x", 0)
                 delta_y_raw = action.get("delta_y", 800)
@@ -228,6 +262,11 @@ class BrowserAgent:
                 await page.mouse.wheel(delta_x, delta_y)
                 if after_ms > 0:
                     await page.wait_for_timeout(after_ms)
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"delta_x": delta_x, "delta_y": delta_y, "after_ms": after_ms},
+                )
             elif action_type == "click_role":
                 role = str(action["role"])
                 name = action.get("name")
@@ -238,6 +277,11 @@ class BrowserAgent:
                     await locator.click(timeout=self.default_timeout_ms)
                 except Exception:
                     await locator.click(timeout=self.default_timeout_ms, force=True)
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"role": role, "name": self._truncate_detail(name)},
+                )
             elif action_type == "click_xy":
                 x = float(action.get("x", 0))
                 y = float(action.get("y", 0))
@@ -245,6 +289,11 @@ class BrowserAgent:
                 clicks_raw = action.get("clicks", 1)
                 clicks = int(1 if clicks_raw is None else clicks_raw)
                 await page.mouse.click(x=x, y=y, button=button, click_count=clicks)
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"x": x, "y": y, "button": button, "clicks": clicks},
+                )
             elif action_type == "new_tab":
                 url = action.get("url")
                 focus = action.get("focus", True)
@@ -252,6 +301,11 @@ class BrowserAgent:
                 tab_id = self._register_page(new_page, set_active=bool(focus))
                 if isinstance(url, str) and url:
                     await new_page.goto(url)
+                    self._record_action(
+                        tab_id,
+                        action_type,
+                        {"url": self._truncate_detail(url)},
+                    )
                 return {
                     "ok": True,
                     "tab_id": tab_id,
@@ -268,6 +322,7 @@ class BrowserAgent:
                     }
                 self._active_tab_id = tab_id
                 self._page = target
+                self._record_action(tab_id, action_type, {"tab_id": tab_id})
             elif action_type == "close_tab":
                 tab_id = str(action.get("tab_id") or "")
                 target = self._pages.get(tab_id)
@@ -278,6 +333,7 @@ class BrowserAgent:
                         "observation": (await self.observe()).to_dict(),
                     }
                 await target.close()
+                self._record_action(active_tab_id, action_type, {"tab_id": tab_id})
             elif action_type == "list_tabs":
                 return {
                     "ok": True,
@@ -306,6 +362,7 @@ class BrowserAgent:
                             "title": title,
                             "active": tab_id == self._active_tab_id,
                             "aria": aria,
+                            "last_actions": list(self._tab_actions.get(tab_id, [])),
                         }
                     )
                 return {
@@ -315,16 +372,43 @@ class BrowserAgent:
                 }
             elif action_type == "fill":
                 await page.locator(str(action["selector"])).fill(str(action.get("text", "")))
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {
+                        "selector": self._truncate_detail(action.get("selector")),
+                        "text": self._truncate_detail(action.get("text")),
+                    },
+                )
             elif action_type == "fill_role":
                 role = str(action["role"])
                 name = action.get("name")
                 await page.get_by_role(role, name=str(name) if name else None).fill(
                     str(action.get("text", ""))
                 )
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {
+                        "role": role,
+                        "name": self._truncate_detail(name),
+                        "text": self._truncate_detail(action.get("text")),
+                    },
+                )
             elif action_type == "press":
                 await page.keyboard.press(str(action["key"]))
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"key": self._truncate_detail(action.get("key"))},
+                )
             elif action_type == "wait_for_load":
                 await page.wait_for_load_state(str(action.get("state", "load")))
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"state": self._truncate_detail(action.get("state", "load"))},
+                )
             elif action_type == "observe":
                 pass
             else:
