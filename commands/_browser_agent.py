@@ -395,6 +395,14 @@ class BrowserAgent:
                         "text": self._truncate_detail(action.get("text")),
                     },
                 )
+            elif action_type == "type":
+                text = str(action.get("text", ""))
+                await page.keyboard.type(text)
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"text": self._truncate_detail(text)},
+                )
             elif action_type == "press":
                 await page.keyboard.press(str(action["key"]))
                 self._record_action(

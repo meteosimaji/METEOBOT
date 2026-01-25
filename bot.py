@@ -83,6 +83,12 @@ class Bot(commands.Bot):
         log.info("Extensions loaded: %d success, %d failed", len(successes), len(failures))
         if failures:
             log.info("Failed extensions: %s", ", ".join(failures))
+        ask_cog = self.get_cog("Ask")
+        if ask_cog and hasattr(ask_cog, "start_operator_server"):
+            try:
+                await ask_cog.start_operator_server()
+            except Exception:
+                log.exception("Failed to start operator server")
         synced = await self.tree.sync()
         names = ", ".join(cmd.name for cmd in synced)
         log.info("Synced %d application command(s): %s", len(synced), names)
