@@ -9,8 +9,10 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
+import socket
 import tempfile
 import zipfile
 import types
@@ -24,10 +26,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Union, get_args, get_origin
+from typing import Any, Literal, Union, get_args, get_origin
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+from aiohttp import web
 import discord
 from discord import AppCommandType, app_commands
 from discord.app_commands.errors import CommandAlreadyRegistered
@@ -203,6 +206,7 @@ ATTACHMENT_EXTRACT_TIMEOUT_S = int(
 MAX_ATTACHMENT_CACHE_ENTRIES = 200
 MAX_ATTACHMENT_CACHE_BUCKETS = 100
 MAX_ATTACHMENT_REDIRECTS = 3
+OPERATOR_TOKEN_TTL_S = int(os.getenv("ASK_OPERATOR_TOKEN_TTL_S", "1800"))
 
 
 @dataclass
@@ -236,6 +240,14 @@ class QueuedAskRequest:
     wait_message_id: int | None
     wait_channel_id: int | None
     wait_guild_id: int | None
+
+
+@dataclass
+class OperatorSession:
+    token: str
+    state_key: str
+    owner_id: int
+    created_at: datetime
 
 @dataclass
 class ShellPolicy:
@@ -1922,6 +1934,14 @@ class Ask(commands.Cog):
         self._browser_lock_by_channel: dict[str, asyncio.Lock] = {}
         self._browser_owner_by_channel: dict[str, int] = {}
         self._browser_prefer_cdp_by_channel: dict[str, bool] = {}
+        self._operator_sessions: dict[str, OperatorSession] = {}
+        self._operator_sessions_by_state: dict[str, set[str]] = {}
+        self._operator_app: web.Application | None = None
+        self._operator_runner: web.AppRunner | None = None
+        self._operator_site: web.TCPSite | None = None
+        self._operator_host = os.getenv("ASK_OPERATOR_HOST", "0.0.0.0")
+        self._operator_port = int(os.getenv("ASK_OPERATOR_PORT", "8080"))
+        self._operator_base_url = (os.getenv("ASK_OPERATOR_BASE_URL") or "").strip()
 
         if not hasattr(self.bot, "ai_last_response_id"):
             self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
@@ -1968,6 +1988,20 @@ class Ask(commands.Cog):
             self._browser_by_channel[key] = agent
         return agent
 
+    def _get_browser_agent_for_state_key(self, state_key: str) -> BrowserAgent:
+        agent = self._browser_by_channel.get(state_key)
+        if agent is None:
+            agent = BrowserAgent()
+            self._browser_by_channel[state_key] = agent
+        return agent
+
+    def _get_browser_lock_for_state_key(self, state_key: str) -> asyncio.Lock:
+        lock = self._browser_lock_by_channel.get(state_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._browser_lock_by_channel[state_key] = lock
+        return lock
+
     def _get_browser_owner(self, ctx: commands.Context) -> int | None:
         return self._browser_owner_by_channel.get(self._state_key(ctx))
 
@@ -1987,6 +2021,62 @@ class Ask(commands.Cog):
     def _prefers_cdp(self, ctx: commands.Context) -> bool:
         return bool(self._browser_prefer_cdp_by_channel.get(self._state_key(ctx)))
 
+    def _operator_public_base_url(self) -> str:
+        if self._operator_base_url:
+            return self._operator_base_url.rstrip("/")
+        return f"http://localhost:{self._operator_port}"
+
+    def _prune_operator_sessions(self) -> None:
+        if not self._operator_sessions:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=OPERATOR_TOKEN_TTL_S)
+        stale_tokens = [
+            token
+            for token, session in self._operator_sessions.items()
+            if session.created_at < cutoff
+        ]
+        for token in stale_tokens:
+            session = self._operator_sessions.pop(token, None)
+            if session:
+                tokens = self._operator_sessions_by_state.get(session.state_key)
+                if tokens:
+                    tokens.discard(token)
+                    if not tokens:
+                        self._operator_sessions_by_state.pop(session.state_key, None)
+
+    def _create_operator_session(self, ctx: commands.Context) -> OperatorSession:
+        self._prune_operator_sessions()
+        token = secrets.token_urlsafe(18)
+        session = OperatorSession(
+            token=token,
+            state_key=self._state_key(ctx),
+            owner_id=ctx.author.id,
+            created_at=datetime.now(timezone.utc),
+        )
+        self._operator_sessions[token] = session
+        self._operator_sessions_by_state.setdefault(session.state_key, set()).add(token)
+        return session
+
+    def _get_operator_session(self, token: str) -> OperatorSession | None:
+        session = self._operator_sessions.get(token)
+        if not session:
+            return None
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=OPERATOR_TOKEN_TTL_S)
+        if session.created_at < cutoff:
+            self._operator_sessions.pop(token, None)
+            tokens = self._operator_sessions_by_state.get(session.state_key)
+            if tokens:
+                tokens.discard(token)
+                if not tokens:
+                    self._operator_sessions_by_state.pop(session.state_key, None)
+            return None
+        return session
+
+    def _clear_operator_sessions_for_state_key(self, state_key: str) -> None:
+        tokens = self._operator_sessions_by_state.pop(state_key, set())
+        for token in tokens:
+            self._operator_sessions.pop(token, None)
+
     @staticmethod
     def _is_admin(ctx: commands.Context) -> bool:
         perms = getattr(getattr(ctx, "author", None), "guild_permissions", None)
@@ -2000,6 +2090,10 @@ class Ask(commands.Cog):
         agent = self._browser_by_channel.pop(key, None)
         self._browser_lock_by_channel.pop(key, None)
         self._browser_owner_by_channel.pop(key, None)
+        self._operator_sessions_by_state.pop(key, None)
+        for token, session in list(self._operator_sessions.items()):
+            if session.state_key == key:
+                self._operator_sessions.pop(token, None)
         if agent is not None:
             await agent.close()
 
@@ -2046,12 +2140,532 @@ class Ask(commands.Cog):
 
         return _is_public_ip(ip)
 
+    async def _operator_url_candidates(self) -> list[str]:
+        urls: list[str] = []
+        port = self._operator_port
+
+        def _add_url(host: str) -> None:
+            if not host:
+                return
+            candidate = f"http://{host}:{port}"
+            if candidate not in urls:
+                urls.append(candidate)
+
+        async with contextlib.AsyncExitStack() as stack:
+            session = self._http_session
+            if session is None:
+                session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+                stack.push_async_callback(session.close)
+            try:
+                async with session.get("https://api.ipify.org?format=text") as resp:
+                    if resp.status == 200:
+                        text = (await resp.text()).strip()
+                        _add_url(text)
+            except Exception:
+                pass
+
+        with contextlib.suppress(Exception):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(("1.1.1.1", 80))
+            local_ip = sock.getsockname()[0]
+            sock.close()
+            _add_url(local_ip)
+
+        _add_url("localhost")
+        return urls
+
     @staticmethod
     def _shorten_browser_label(text: str, *, limit: int = 80) -> str:
         cleaned = " ".join(text.split())
         if len(cleaned) <= limit:
             return cleaned
         return cleaned[: max(0, limit - 1)] + "…"
+
+    async def _ensure_operator_server(self) -> bool:
+        if self._operator_runner is not None:
+            return True
+        app = web.Application()
+        app.router.add_get("/operator/{token}", self._operator_handle_index)
+        app.router.add_get("/operator/{token}/state", self._operator_handle_state)
+        app.router.add_get("/operator/{token}/screenshot", self._operator_handle_screenshot)
+        app.router.add_post("/operator/{token}/action", self._operator_handle_action)
+        runner = web.AppRunner(app)
+        try:
+            await runner.setup()
+            site = web.TCPSite(runner, host=self._operator_host, port=self._operator_port)
+            await site.start()
+        except Exception:
+            log.exception("Failed to start operator web server")
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+            return False
+        self._operator_app = app
+        self._operator_runner = runner
+        self._operator_site = site
+        log.info(
+            "Operator UI server listening on %s:%s",
+            self._operator_host,
+            self._operator_port,
+        )
+        return True
+
+    async def start_operator_server(self) -> bool:
+        autostart = os.getenv("ASK_OPERATOR_AUTOSTART", "").strip().lower()
+        if autostart not in {"1", "true", "yes"}:
+            return False
+        return await self._ensure_operator_server()
+
+    async def _shutdown_operator_server(self) -> None:
+        runner = self._operator_runner
+        self._operator_runner = None
+        self._operator_site = None
+        self._operator_app = None
+        if runner is not None:
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+
+    def cog_unload(self) -> None:
+        if self._operator_runner is not None:
+            asyncio.create_task(self._shutdown_operator_server())
+
+    async def _ensure_operator_browser_started(
+        self,
+        *,
+        state_key: str,
+        prefer_cdp: bool,
+    ) -> tuple[BrowserAgent | None, str | None]:
+        agent = self._get_browser_agent_for_state_key(state_key)
+        if agent.is_started():
+            return agent, None
+        mode: Literal["launch", "cdp"] = "cdp" if prefer_cdp else "launch"
+        cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
+        if mode == "cdp" and not cdp_url:
+            return None, "missing_cdp_url"
+        user_data_dir = None
+        if mode == "launch":
+            user_data_dir = str(self._browser_profile_dir(state_key))
+        await agent.start(
+            mode=mode,
+            headless=True,
+            cdp_url=cdp_url,
+            user_data_dir=user_data_dir,
+        )
+        return agent, None
+
+    async def _operator_observation(self, agent: BrowserAgent) -> dict[str, Any]:
+        observation = await agent.observe()
+        return {"url": observation.url, "title": observation.title}
+
+    async def _operator_handle_index(self, request: web.Request) -> web.Response:
+        token = request.match_info.get("token", "")
+        session = self._get_operator_session(token)
+        if session is None:
+            raise web.HTTPNotFound(text="Operator session expired or invalid.")
+        html = self._operator_page_html(token)
+        return web.Response(text=html, content_type="text/html")
+
+    async def _operator_handle_state(self, request: web.Request) -> web.Response:
+        token = request.match_info.get("token", "")
+        session = self._get_operator_session(token)
+        if session is None:
+            raise web.HTTPNotFound(text="Operator session expired or invalid.")
+        state_key = session.state_key
+        lock = self._get_browser_lock_for_state_key(state_key)
+        async with lock:
+            agent, error = await self._ensure_operator_browser_started(
+                state_key=state_key,
+                prefer_cdp=bool(self._browser_prefer_cdp_by_channel.get(state_key)),
+            )
+            if error:
+                return web.json_response({"ok": False, "error": error}, status=409)
+            if agent is None:
+                return web.json_response({"ok": False, "error": "browser_unavailable"}, status=409)
+            observation = await self._operator_observation(agent)
+        return web.json_response({"ok": True, "observation": observation})
+
+    async def _operator_handle_screenshot(self, request: web.Request) -> web.Response:
+        token = request.match_info.get("token", "")
+        session = self._get_operator_session(token)
+        if session is None:
+            raise web.HTTPNotFound(text="Operator session expired or invalid.")
+        state_key = session.state_key
+        lock = self._get_browser_lock_for_state_key(state_key)
+        async with lock:
+            agent, error = await self._ensure_operator_browser_started(
+                state_key=state_key,
+                prefer_cdp=bool(self._browser_prefer_cdp_by_channel.get(state_key)),
+            )
+            if error:
+                return web.json_response({"ok": False, "error": error}, status=409)
+            if agent is None:
+                return web.json_response({"ok": False, "error": "browser_unavailable"}, status=409)
+            try:
+                image_bytes = await agent.page.screenshot(type="png", scale="css")
+            except TypeError:
+                image_bytes = await agent.page.screenshot(type="png")
+            except Exception as exc:
+                return web.json_response(
+                    {"ok": False, "error": f"screenshot_failed: {type(exc).__name__}"},
+                    status=500,
+                )
+        return web.Response(body=image_bytes, content_type="image/png")
+
+    async def _operator_handle_action(self, request: web.Request) -> web.Response:
+        token = request.match_info.get("token", "")
+        session = self._get_operator_session(token)
+        if session is None:
+            raise web.HTTPNotFound(text="Operator session expired or invalid.")
+        state_key = session.state_key
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+        action = payload.get("action")
+        if not isinstance(action, dict):
+            return web.json_response({"ok": False, "error": "missing_action"}, status=400)
+        action_type = str(action.get("type") or "")
+        allowed_actions = {
+            "goto",
+            "click_xy",
+            "scroll",
+            "type",
+            "press",
+            "wait_for_load",
+            "new_tab",
+            "switch_tab",
+            "close_tab",
+            "list_tabs",
+        }
+        if action_type not in allowed_actions:
+            return web.json_response({"ok": False, "error": "unsupported_action"}, status=400)
+        if action_type == "goto":
+            url = str(action.get("url") or "")
+            if not url or not await self._is_safe_browser_url(url):
+                return web.json_response({"ok": False, "error": "unsafe_url"}, status=400)
+        lock = self._get_browser_lock_for_state_key(state_key)
+        async with lock:
+            owner_id = self._browser_owner_by_channel.get(state_key)
+            if owner_id is None:
+                self._browser_owner_by_channel[state_key] = session.owner_id
+            elif owner_id != session.owner_id:
+                return web.json_response({"ok": False, "error": "browser_locked"}, status=403)
+            agent, error = await self._ensure_operator_browser_started(
+                state_key=state_key,
+                prefer_cdp=bool(self._browser_prefer_cdp_by_channel.get(state_key)),
+            )
+            if error:
+                return web.json_response({"ok": False, "error": error}, status=409)
+            if agent is None:
+                return web.json_response({"ok": False, "error": "browser_unavailable"}, status=409)
+            result = await agent.act(action)
+            observation = await self._operator_observation(agent)
+        return web.json_response({"ok": bool(result.get("ok")), "result": result, "observation": observation})
+
+    @staticmethod
+    def _operator_page_html(token: str) -> str:
+        return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ask Operator</title>
+    <style>
+      body {{
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: #0b0d12;
+        color: #f2f4f8;
+        margin: 0;
+        padding: 16px;
+      }}
+      h1 {{
+        font-size: 20px;
+        margin-bottom: 12px;
+      }}
+      .layout {{
+        display: grid;
+        grid-template-columns: minmax(320px, 1fr) 320px;
+        gap: 16px;
+      }}
+      .panel {{
+        background: #151a24;
+        border: 1px solid #1f2533;
+        border-radius: 12px;
+        padding: 12px;
+      }}
+      .controls {{
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }}
+      label {{
+        font-size: 12px;
+        color: #a5b0c4;
+        margin-bottom: 4px;
+      }}
+      input, button {{
+        border-radius: 8px;
+        border: 1px solid #263042;
+        background: #0f141d;
+        color: #f2f4f8;
+        padding: 8px;
+        font-size: 14px;
+      }}
+      button {{
+        cursor: pointer;
+        background: #5865f2;
+        border: none;
+      }}
+      button.secondary {{
+        background: #1f2736;
+      }}
+      .row {{
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }}
+      .row input {{
+        flex: 1;
+      }}
+      #screen {{
+        width: 100%;
+        border-radius: 10px;
+        border: 1px solid #1f2533;
+        cursor: crosshair;
+        background: #0b0d12;
+      }}
+      #status {{
+        font-size: 12px;
+        color: #9aa6bd;
+        margin-top: 8px;
+        white-space: pre-wrap;
+      }}
+      .meta {{
+        font-size: 12px;
+        color: #a5b0c4;
+        margin-bottom: 6px;
+      }}
+    </style>
+  </head>
+  <body>
+    <h1>Ask Operator</h1>
+    <div class="layout">
+      <div class="panel">
+        <div class="meta" id="pageMeta">Loading...</div>
+        <img id="screen" alt="browser screenshot" />
+        <div id="status"></div>
+      </div>
+      <div class="panel controls">
+        <div>
+          <label for="urlInput">Go to URL</label>
+          <div class="row">
+            <input id="urlInput" placeholder="https://example.com" />
+            <button id="gotoBtn">Go</button>
+          </div>
+        </div>
+        <div>
+          <label>Scroll</label>
+          <div class="row">
+            <button class="secondary" data-scroll="-800">Up</button>
+            <button class="secondary" data-scroll="800">Down</button>
+          </div>
+        </div>
+        <div>
+          <label for="typeInput">Type text</label>
+          <div class="row">
+            <input id="typeInput" placeholder="Type into the focused field" />
+            <button id="typeBtn">Send</button>
+          </div>
+          <div class="row" style="margin-top: 6px;">
+            <button class="secondary" id="pasteBtn">Paste clipboard</button>
+            <span class="meta">Requires HTTPS for clipboard access.</span>
+          </div>
+        </div>
+        <div>
+          <label>Keys</label>
+          <div class="row">
+            <button class="secondary" data-key="Enter">Enter</button>
+            <button class="secondary" data-key="Tab">Tab</button>
+            <button class="secondary" data-key="Escape">Esc</button>
+            <button class="secondary" data-key="Backspace">⌫</button>
+          </div>
+        </div>
+        <div class="row">
+          <button id="refreshBtn">Refresh screenshot</button>
+          <button class="secondary" id="autoRefreshBtn">Auto refresh: Off</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      const token = "{token}";
+      const screen = document.getElementById("screen");
+      const statusEl = document.getElementById("status");
+      const metaEl = document.getElementById("pageMeta");
+
+      const operatorBase = (() => {{
+        const path = window.location.pathname;
+        return path.endsWith("/" + token) ? path.slice(0, -1 * (token.length + 1)) : path;
+      }})();
+      async function api(path, body) {{
+        const response = await fetch(`${{operatorBase}}/${{token}}/${{path}}`, {{
+          method: body ? "POST" : "GET",
+          headers: body ? {{ "Content-Type": "application/json" }} : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+        }});
+        if (!response.ok) {{
+          const text = await response.text();
+          throw new Error(text || response.statusText);
+        }}
+        if (path === "screenshot") {{
+          return await response.blob();
+        }}
+        return await response.json();
+      }}
+
+      async function refreshState() {{
+        try {{
+          const data = await api("state");
+          if (data.ok && data.observation) {{
+            metaEl.textContent = `${{data.observation.title || "Untitled"}} — ${{data.observation.url || ""}}`;
+          }}
+        }} catch (err) {{
+          metaEl.textContent = `State error: ${{err.message}}`;
+        }}
+      }}
+
+      let refreshInFlight = false;
+      let pendingRefresh = false;
+      async function refreshScreenshot() {{
+        if (refreshInFlight) {{
+          pendingRefresh = true;
+          return;
+        }}
+        refreshInFlight = true;
+        try {{
+          const blob = await api("screenshot");
+          screen.src = URL.createObjectURL(blob);
+          await refreshState();
+        }} catch (err) {{
+          statusEl.textContent = `Screenshot error: ${{err.message}}`;
+        }} finally {{
+          refreshInFlight = false;
+          if (pendingRefresh) {{
+            pendingRefresh = false;
+            refreshScreenshot();
+          }}
+        }}
+      }}
+
+      async function sendAction(action, {{ refresh = true }}) {{
+        statusEl.textContent = "Sending action...";
+        try {{
+          const data = await api("action", {{ action }});
+          statusEl.textContent = data.ok ? "Action complete." : `Action failed: ${{data.error || "unknown"}}`;
+          if (refresh) {{
+            await refreshScreenshot();
+          }}
+        }} catch (err) {{
+          statusEl.textContent = `Action error: ${{err.message}}`;
+        }}
+      }}
+
+      screen.addEventListener("click", (event) => {{
+        if (!screen.naturalWidth) return;
+        const rect = screen.getBoundingClientRect();
+        const scaleX = screen.naturalWidth / rect.width;
+        const scaleY = screen.naturalHeight / rect.height;
+        const x = (event.clientX - rect.left) * scaleX;
+        const y = (event.clientY - rect.top) * scaleY;
+        sendAction({{ type: "click_xy", x, y }});
+      }});
+      let scrollDeltaX = 0;
+      let scrollDeltaY = 0;
+      let scrollTimer = null;
+      screen.addEventListener("wheel", (event) => {{
+        event.preventDefault();
+        const mode = event.deltaMode || 0;
+        const multiplier = mode === 1 ? 16 : mode === 2 ? 800 : 1;
+        scrollDeltaX += (event.deltaX || 0) * multiplier;
+        scrollDeltaY += (event.deltaY || 0) * multiplier;
+        if (scrollTimer) return;
+        scrollTimer = setTimeout(() => {{
+          const deltaX = scrollDeltaX;
+          const deltaY = scrollDeltaY;
+          scrollDeltaX = 0;
+          scrollDeltaY = 0;
+          scrollTimer = null;
+          if (deltaX || deltaY) {{
+            sendAction(
+              {{ type: "scroll", delta_x: deltaX, delta_y: deltaY, after_ms: 120 }},
+              {{ refresh: false }}
+            );
+          }}
+        }}, 120);
+      }}, {{ passive: false }});
+
+      document.getElementById("gotoBtn").addEventListener("click", () => {{
+        const url = document.getElementById("urlInput").value.trim();
+        if (url) {{
+          sendAction({{ type: "goto", url }});
+        }}
+      }});
+
+      document.querySelectorAll("[data-scroll]").forEach((button) => {{
+        button.addEventListener("click", () => {{
+          const deltaY = parseFloat(button.dataset.scroll || "0");
+          sendAction({{ type: "scroll", delta_x: 0, delta_y: deltaY, after_ms: 150 }});
+        }});
+      }});
+
+      document.getElementById("typeBtn").addEventListener("click", () => {{
+        const text = document.getElementById("typeInput").value;
+        if (text) {{
+          sendAction({{ type: "type", text }});
+        }}
+      }});
+      document.getElementById("pasteBtn").addEventListener("click", async () => {{
+        try {{
+          const text = await navigator.clipboard.readText();
+          if (text) {{
+            sendAction({{ type: "type", text }});
+          }} else {{
+            statusEl.textContent = "Clipboard is empty.";
+          }}
+        }} catch (err) {{
+          statusEl.textContent = `Clipboard error: ${{err.message}}`;
+        }}
+      }});
+
+      document.querySelectorAll("[data-key]").forEach((button) => {{
+        button.addEventListener("click", () => {{
+          const key = button.dataset.key;
+          sendAction({{ type: "press", key }});
+        }});
+      }});
+
+      document.getElementById("refreshBtn").addEventListener("click", () => {{
+        refreshScreenshot();
+      }});
+      let autoRefresh = false;
+      let autoRefreshTimer = null;
+      document.getElementById("autoRefreshBtn").addEventListener("click", () => {{
+        autoRefresh = !autoRefresh;
+        const label = autoRefresh ? "Auto refresh: On" : "Auto refresh: Off";
+        document.getElementById("autoRefreshBtn").textContent = label;
+        if (autoRefresh) {{
+          autoRefreshTimer = setInterval(() => {{
+            refreshScreenshot();
+          }}, 2000);
+        }} else if (autoRefreshTimer) {{
+          clearInterval(autoRefreshTimer);
+          autoRefreshTimer = null;
+        }}
+      }});
+
+      refreshScreenshot();
+    </script>
+  </body>
+</html>
+"""
 
     async def _collect_clickable_targets(
         self,
@@ -3429,7 +4043,7 @@ class Ask(commands.Cog):
                             "description": (
                                 "Action payload: goto {url}, click {selector}, scroll {delta_x,delta_y,after_ms}, "
                                 "click_role {role,name}, click_xy {x,y,button?,clicks?}, fill {selector,text}, "
-                                "fill_role {role,name,text}, press {key}, "
+                                "fill_role {role,name,text}, type {text}, press {key}, "
                                 "wait_for_load {state}, content {}, download {selector|url}, "
                                 "screenshot {full_page?, selector?, filename?, format?}, "
                                 "screenshot_marked {max_items?}, observe {}, "
@@ -3611,6 +4225,15 @@ class Ask(commands.Cog):
                                         "text": {"type": "string", "description": "Text for fill_role."},
                                     },
                                     "required": ["type", "role", "name", "text"],
+                                    "additionalProperties": False,
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"type": "string", "enum": ["type"]},
+                                        "text": {"type": "string", "description": "Text to type."},
+                                    },
+                                    "required": ["type", "text"],
                                     "additionalProperties": False,
                                 },
                                 {
@@ -4259,6 +4882,7 @@ class Ask(commands.Cog):
                     "scroll",
                     "fill",
                     "fill_role",
+                    "type",
                     "press",
                     "wait_for_load",
                     "download",
@@ -5355,10 +5979,12 @@ class Ask(commands.Cog):
             async with self._get_ctx_lock(ctx):
                 owner_id = self._get_browser_owner(ctx)
                 is_admin = self._is_admin(ctx)
+                env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip()
+                prefer_cdp = bool(env_cdp_url)
                 if owner_id is None:
                     owner_id = ctx.author.id
                     self._set_browser_owner(ctx, owner_id)
-                    self._set_browser_prefer_cdp(ctx, True)
+                    self._set_browser_prefer_cdp(ctx, prefer_cdp)
                 elif owner_id != ctx.author.id and not is_admin:
                     embed = discord.Embed(
                         title="\U0001F512 ブラウザは操作中です",
@@ -5374,10 +6000,10 @@ class Ask(commands.Cog):
                     await self._reply(ctx, **reply_kwargs)
                     return
 
-                self._set_browser_prefer_cdp(ctx, True)
-                env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip()
+                self._set_browser_prefer_cdp(ctx, prefer_cdp)
                 description_lines = [
-                    "手動操作モードは、あなたのPC上で起動しているChromeにボットが接続して操作する方式です。",
+                    "手動操作モードは、ボット側のブラウザを操作パネルで直接動かす方式です。",
+                    "CDPを設定した場合は、あなたのPC上で起動しているChromeに接続して操作します。",
                     "",
                     "**1) PCでChromeをCDP付きで起動**",
                     "`chrome --remote-debugging-port=9222 --user-data-dir=<専用プロファイル>`",
@@ -5404,6 +6030,42 @@ class Ask(commands.Cog):
                             "",
                             "CDP URLが未設定です。上記の手順で設定すると、",
                             "そのチャンネルの /ask があなたのPCのChromeを操作できます。",
+                        ]
+                    )
+                description_lines.extend(
+                    [
+                        "",
+                        "**4) 手動操作パネルを開く**",
+                        "ボットがホストするWeb UIでスクショを見ながらクリック/スクロール/入力できます。",
+                        "外部PCから開く場合は、ASK_OPERATOR_BASE_URLを到達可能なURLにしてください。",
+                    ]
+                )
+                operator_ready = await self._ensure_operator_server()
+                if operator_ready:
+                    session = self._create_operator_session(ctx)
+                    operator_url = f"{self._operator_public_base_url()}/operator/{session.token}"
+                    description_lines.extend(
+                        [
+                            f"**操作パネルURL**: {operator_url}",
+                            f"**有効期限**: 約{OPERATOR_TOKEN_TTL_S // 60}分",
+                        ]
+                    )
+                    if not self._operator_base_url:
+                        candidates = await self._operator_url_candidates()
+                        if candidates:
+                            preview = "\n".join(f"- {url}/operator/{session.token}" for url in candidates[:3])
+                            description_lines.extend(
+                                [
+                                    "",
+                                    "**到達可能なURL候補** (未設定時の参考):",
+                                    preview,
+                                    "※正しい入口はネットワーク構成によって異なります。",
+                                ]
+                            )
+                else:
+                    description_lines.extend(
+                        [
+                            "操作パネルの起動に失敗しました。`ASK_OPERATOR_PORT` などの設定を確認してください。",
                         ]
                     )
 
