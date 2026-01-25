@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import contextlib
 from typing import Any, Literal
+import uuid
 
 from playwright.async_api import (
     Browser,
@@ -41,6 +43,8 @@ class BrowserAgent:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._pages: dict[str, Page] = {}
+        self._active_tab_id: str | None = None
         self._owns_browser = False
         self._owns_context = False
 
@@ -53,6 +57,24 @@ class BrowserAgent:
     def is_started(self) -> bool:
         return self._playwright is not None and self._page is not None
 
+    def _register_page(self, page: Page, *, set_active: bool = True) -> str:
+        tab_id = uuid.uuid4().hex[:8]
+        self._pages[tab_id] = page
+
+        def _on_close() -> None:
+            self._pages.pop(tab_id, None)
+            if self._active_tab_id == tab_id:
+                fallback = next(iter(self._pages.keys()), None)
+                self._active_tab_id = fallback
+                self._page = self._pages.get(fallback) if fallback else None
+
+        page.on("close", _on_close)
+
+        if set_active or self._active_tab_id is None:
+            self._active_tab_id = tab_id
+            self._page = page
+        return tab_id
+
     async def start(
         self,
         *,
@@ -61,6 +83,7 @@ class BrowserAgent:
         cdp_url: str | None = None,
         viewport: dict[str, int] | None = None,
         user_agent: str | None = None,
+        user_data_dir: str | None = None,
     ) -> None:
         if self._playwright is not None:
             return
@@ -68,25 +91,49 @@ class BrowserAgent:
         self._playwright = await async_playwright().start()
 
         if mode == "launch":
-            self._browser = await self._playwright.chromium.launch(headless=headless)
-            self._context = await self._browser.new_context(
-                viewport=viewport,
-                user_agent=user_agent,
-            )
-            self._owns_browser = True
-            self._owns_context = True
+            if user_data_dir:
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=headless,
+                    viewport=viewport,
+                    user_agent=user_agent,
+                )
+                self._browser = self._context.browser
+                self._owns_browser = True
+                self._owns_context = True
+            else:
+                self._browser = await self._playwright.chromium.launch(headless=headless)
+                self._context = await self._browser.new_context(
+                    viewport=viewport,
+                    user_agent=user_agent,
+                )
+                self._owns_browser = True
+                self._owns_context = True
         else:
             if not cdp_url:
                 raise ValueError("cdp_url is required for mode='cdp'.")
             self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
-            self._context = await self._browser.new_context(
-                viewport=viewport,
-                user_agent=user_agent,
-            )
-            self._owns_context = True
+            if self._browser.contexts:
+                self._context = self._browser.contexts[0]
+                self._owns_context = False
+            else:
+                self._context = await self._browser.new_context(
+                    viewport=viewport,
+                    user_agent=user_agent,
+                )
+                self._owns_context = True
 
         self._context.set_default_timeout(self.default_timeout_ms)
-        self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+        self._context.on("page", lambda page: self._register_page(page, set_active=True))
+        if self._context.pages:
+            for page in self._context.pages:
+                self._register_page(page, set_active=False)
+            self._active_tab_id = next(reversed(self._pages.keys()), None)
+            if self._active_tab_id:
+                self._page = self._pages[self._active_tab_id]
+        else:
+            page = await self._context.new_page()
+            self._register_page(page, set_active=True)
 
     async def close(self) -> None:
         if self._context is not None and self._owns_context:
@@ -110,11 +157,15 @@ class BrowserAgent:
         self._browser = None
         self._context = None
         self._page = None
+        self._pages = {}
+        self._active_tab_id = None
         self._owns_browser = False
         self._owns_context = False
 
     async def observe(self) -> BrowserObservation:
-        page = self.page
+        return await self._observe_page(self.page)
+
+    async def _observe_page(self, page: Page) -> BrowserObservation:
         title = await page.title()
 
         aria = ""
@@ -136,6 +187,22 @@ class BrowserAgent:
 
         return BrowserObservation(url=page.url, title=title, aria=aria)
 
+    async def _list_tabs(self) -> list[dict[str, Any]]:
+        tabs = []
+        for tab_id, page in self._pages.items():
+            title = ""
+            with contextlib.suppress(Exception):
+                title = await page.title()
+            tabs.append(
+                {
+                    "tab_id": tab_id,
+                    "url": page.url,
+                    "title": title,
+                    "active": tab_id == self._active_tab_id,
+                }
+            )
+        return tabs
+
     async def act(self, action: dict[str, Any]) -> dict[str, Any]:
         page = self.page
         action_type = str(action.get("type") or "")
@@ -144,11 +211,108 @@ class BrowserAgent:
             if action_type == "goto":
                 await page.goto(str(action["url"]))
             elif action_type == "click":
-                await page.locator(str(action["selector"])).click()
+                locator = page.locator(str(action["selector"]))
+                with contextlib.suppress(Exception):
+                    await locator.scroll_into_view_if_needed(timeout=5_000)
+                try:
+                    await locator.click(timeout=self.default_timeout_ms)
+                except Exception:
+                    await locator.click(timeout=self.default_timeout_ms, force=True)
+            elif action_type == "scroll":
+                delta_x_raw = action.get("delta_x", 0)
+                delta_y_raw = action.get("delta_y", 800)
+                after_ms_raw = action.get("after_ms", 150)
+                delta_x = float(0 if delta_x_raw is None else delta_x_raw)
+                delta_y = float(800 if delta_y_raw is None else delta_y_raw)
+                after_ms = int(150 if after_ms_raw is None else after_ms_raw)
+                await page.mouse.wheel(delta_x, delta_y)
+                if after_ms > 0:
+                    await page.wait_for_timeout(after_ms)
             elif action_type == "click_role":
                 role = str(action["role"])
                 name = action.get("name")
-                await page.get_by_role(role, name=str(name) if name else None).click()
+                locator = page.get_by_role(role, name=str(name) if name else None)
+                with contextlib.suppress(Exception):
+                    await locator.scroll_into_view_if_needed(timeout=5_000)
+                try:
+                    await locator.click(timeout=self.default_timeout_ms)
+                except Exception:
+                    await locator.click(timeout=self.default_timeout_ms, force=True)
+            elif action_type == "click_xy":
+                x = float(action.get("x", 0))
+                y = float(action.get("y", 0))
+                button = str(action.get("button") or "left")
+                clicks_raw = action.get("clicks", 1)
+                clicks = int(1 if clicks_raw is None else clicks_raw)
+                await page.mouse.click(x=x, y=y, button=button, click_count=clicks)
+            elif action_type == "new_tab":
+                url = action.get("url")
+                focus = action.get("focus", True)
+                new_page = await self._context.new_page()
+                tab_id = self._register_page(new_page, set_active=bool(focus))
+                if isinstance(url, str) and url:
+                    await new_page.goto(url)
+                return {
+                    "ok": True,
+                    "tab_id": tab_id,
+                    "observation": (await self.observe()).to_dict(),
+                }
+            elif action_type == "switch_tab":
+                tab_id = str(action.get("tab_id") or "")
+                target = self._pages.get(tab_id)
+                if target is None:
+                    return {
+                        "ok": False,
+                        "error": "unknown_tab",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                self._active_tab_id = tab_id
+                self._page = target
+            elif action_type == "close_tab":
+                tab_id = str(action.get("tab_id") or "")
+                target = self._pages.get(tab_id)
+                if target is None:
+                    return {
+                        "ok": False,
+                        "error": "unknown_tab",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                await target.close()
+            elif action_type == "list_tabs":
+                return {
+                    "ok": True,
+                    "tabs": await self._list_tabs(),
+                    "observation": (await self.observe()).to_dict(),
+                }
+            elif action_type == "observe_tabs":
+                include_aria = bool(action.get("include_aria", False))
+                max_tabs_raw = action.get("max_tabs")
+                max_tabs = int(max_tabs_raw) if max_tabs_raw is not None else None
+                tabs = []
+                for tab_id, tab_page in list(self._pages.items()):
+                    if max_tabs is not None and len(tabs) >= max_tabs:
+                        break
+                    title = ""
+                    with contextlib.suppress(Exception):
+                        title = await tab_page.title()
+                    aria = ""
+                    if include_aria:
+                        with contextlib.suppress(Exception):
+                            aria = (await self._observe_page(tab_page)).aria
+                    tabs.append(
+                        {
+                            "tab_id": tab_id,
+                            "url": tab_page.url,
+                            "title": title,
+                            "active": tab_id == self._active_tab_id,
+                            "aria": aria,
+                        }
+                    )
+                return {
+                    "ok": True,
+                    "tabs": tabs,
+                    "observation": (await self.observe()).to_dict(),
+                }
             elif action_type == "fill":
                 await page.locator(str(action["selector"])).fill(str(action.get("text", "")))
             elif action_type == "fill_role":
