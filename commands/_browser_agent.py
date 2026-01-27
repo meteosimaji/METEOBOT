@@ -47,6 +47,7 @@ class BrowserAgent:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._pages: dict[str, Page] = {}
+        self._page_ids: dict[Page, str] = {}
         self._active_tab_id: str | None = None
         self._owns_browser = False
         self._owns_context = False
@@ -62,12 +63,20 @@ class BrowserAgent:
         return self._playwright is not None and self._page is not None
 
     def _register_page(self, page: Page, *, set_active: bool = True) -> str:
+        existing = self._page_ids.get(page)
+        if existing:
+            if set_active:
+                self._active_tab_id = existing
+                self._page = page
+            return existing
         tab_id = uuid.uuid4().hex[:8]
         self._pages[tab_id] = page
+        self._page_ids[page] = tab_id
         self._tab_actions[tab_id] = deque(maxlen=self.max_action_history)
 
         def _on_close() -> None:
             self._pages.pop(tab_id, None)
+            self._page_ids.pop(page, None)
             self._tab_actions.pop(tab_id, None)
             if self._active_tab_id == tab_id:
                 fallback = next(iter(self._pages.keys()), None)
@@ -130,7 +139,7 @@ class BrowserAgent:
                 self._owns_context = True
 
         self._context.set_default_timeout(self.default_timeout_ms)
-        self._context.on("page", lambda page: self._register_page(page, set_active=True))
+        self._context.on("page", lambda page: self._register_page(page, set_active=False))
         if self._context.pages:
             for page in self._context.pages:
                 self._register_page(page, set_active=False)
@@ -164,6 +173,7 @@ class BrowserAgent:
         self._context = None
         self._page = None
         self._pages = {}
+        self._page_ids = {}
         self._active_tab_id = None
         self._tab_actions = {}
         self._owns_browser = False
