@@ -1955,10 +1955,6 @@ class Ask(commands.Cog):
         self._operator_default_url = (
             os.getenv("ASK_OPERATOR_DEFAULT_URL") or DEFAULT_OPERATOR_URL
         ).strip()
-        self._operator_simple_guide = (
-            (os.getenv("ASK_OPERATOR_SIMPLE_GUIDE") or "").strip().lower()
-            in {"1", "true", "yes"}
-        )
         instance_id = (os.getenv("ASK_OPERATOR_INSTANCE_ID") or "").strip()
         self._operator_instance_id = (
             instance_id if instance_id else self._load_operator_instance_id()
