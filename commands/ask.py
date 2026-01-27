@@ -6312,7 +6312,7 @@ class Ask(commands.Cog):
                     ]
                 else:
                     description_lines = [
-                        "Failed to start the operator panel. Check `ASK_OPERATOR_PORT` settings.",
+                        "Failed to start the operator panel. Check the operator host/port settings in `commands/ask.py`.",
                     ]
 
                 embed = discord.Embed(
