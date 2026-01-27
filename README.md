@@ -7,8 +7,7 @@
    - `OPENAI_TOKEN` — API key for `/ask`, `/image`, and flag reaction translation.
    - `ASK_BROWSER_PROFILE_DIR` — directory for `/ask` Playwright persistent profiles (defaults to `data/browser_profiles`).
    - `ASK_OPERATOR_BASE_URL` — public base URL for the `/ask operator` web panel (defaults to `https://simajilord.com`).
-   - `ASK_OPERATOR_AUTOSTART` — start the operator web server during bot startup (defaults to `true`; set to `false` to disable).
-   - `ASK_OPERATOR_HOST` — bind host for the operator web server (defaults to `0.0.0.0`).
+   - `ASK_OPERATOR_HOST` — bind host for the operator web server (defaults to `127.0.0.1`).
    - `ASK_OPERATOR_PORT` — bind port for the operator web server (defaults to `8080`).
    - `ASK_OPERATOR_DEFAULT_URL` — initial URL to open in the operator browser (defaults to `https://www.google.com`).
    - `ASK_OPERATOR_SIMPLE_GUIDE` — set to `true` to post only the operator link instead of the full guide (link-only is now the default).

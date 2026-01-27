@@ -211,6 +211,10 @@ MAX_ATTACHMENT_REDIRECTS = 3
 OPERATOR_TOKEN_TTL_S = int(os.getenv("ASK_OPERATOR_TOKEN_TTL_S", "1800"))
 OPERATOR_TOKEN_MAX_FUTURE_S = int(os.getenv("ASK_OPERATOR_TOKEN_MAX_FUTURE_S", "300"))
 DEFAULT_OPERATOR_URL = "https://www.google.com"
+DEFAULT_OPERATOR_BASE_URL = "https://simajilord.com"
+DEFAULT_OPERATOR_HOST = "127.0.0.1"
+DEFAULT_OPERATOR_PORT = 8080
+DEFAULT_OPERATOR_AUTOSTART = True
 
 
 @dataclass
@@ -1945,9 +1949,9 @@ class Ask(commands.Cog):
         self._operator_app: web.Application | None = None
         self._operator_runner: web.AppRunner | None = None
         self._operator_site: web.TCPSite | None = None
-        self._operator_host = os.getenv("ASK_OPERATOR_HOST", "0.0.0.0")
-        self._operator_port = int(os.getenv("ASK_OPERATOR_PORT", "8080"))
-        self._operator_base_url = (os.getenv("ASK_OPERATOR_BASE_URL") or "https://simajilord.com").strip()
+        self._operator_host = DEFAULT_OPERATOR_HOST
+        self._operator_port = DEFAULT_OPERATOR_PORT
+        self._operator_base_url = DEFAULT_OPERATOR_BASE_URL
         self._operator_default_url = (
             os.getenv("ASK_OPERATOR_DEFAULT_URL") or DEFAULT_OPERATOR_URL
         ).strip()
@@ -2349,8 +2353,7 @@ class Ask(commands.Cog):
         return True
 
     async def start_operator_server(self) -> bool:
-        autostart = os.getenv("ASK_OPERATOR_AUTOSTART", "").strip().lower()
-        if autostart in {"0", "false", "no"}:
+        if not DEFAULT_OPERATOR_AUTOSTART:
             return False
         return await self._ensure_operator_server()
 
