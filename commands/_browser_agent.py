@@ -62,6 +62,13 @@ class BrowserAgent:
     def is_started(self) -> bool:
         return self._playwright is not None and self._page is not None
 
+    def needs_restart(self) -> bool:
+        return self._playwright is not None and self._page is None
+
+    @staticmethod
+    def _empty_observation() -> BrowserObservation:
+        return BrowserObservation(url="", title="", aria="")
+
     def _register_page(self, page: Page, *, set_active: bool = True) -> str:
         existing = self._page_ids.get(page)
         if existing:
@@ -101,8 +108,33 @@ class BrowserAgent:
         user_data_dir: str | None = None,
     ) -> None:
         if self._playwright is not None:
-            return
+            if self._page is not None:
+                return
+            await self.close()
 
+        try:
+            await self._start_browser(
+                mode=mode,
+                headless=headless,
+                cdp_url=cdp_url,
+                viewport=viewport,
+                user_agent=user_agent,
+                user_data_dir=user_data_dir,
+            )
+        except Exception:
+            await self.close()
+            raise
+
+    async def _start_browser(
+        self,
+        *,
+        mode: BrowserMode,
+        headless: bool,
+        cdp_url: str | None,
+        viewport: dict[str, int] | None,
+        user_agent: str | None,
+        user_data_dir: str | None,
+    ) -> None:
         self._playwright = await async_playwright().start()
 
         if mode == "launch":
@@ -180,7 +212,10 @@ class BrowserAgent:
         self._owns_context = False
 
     async def observe(self) -> BrowserObservation:
-        return await self._observe_page(self.page)
+        page = self._page
+        if page is None:
+            return self._empty_observation()
+        return await self._observe_page(page)
 
     async def _observe_page(self, page: Page) -> BrowserObservation:
         title = await page.title()
@@ -237,7 +272,13 @@ class BrowserAgent:
         return text[: max(0, limit - 1)] + "…"
 
     async def act(self, action: dict[str, Any]) -> dict[str, Any]:
-        page = self.page
+        page = self._page
+        if page is None:
+            return {
+                "ok": False,
+                "error": "browser_not_started",
+                "observation": self._empty_observation().to_dict(),
+            }
         action_type = str(action.get("type") or "")
         active_tab_id = self._active_tab_id
 
