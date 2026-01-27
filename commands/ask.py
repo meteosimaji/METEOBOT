@@ -2386,6 +2386,8 @@ class Ask(commands.Cog):
         prefer_cdp: bool,
     ) -> tuple[BrowserAgent | None, str | None]:
         agent = self._get_browser_agent_for_state_key(state_key)
+        if agent.needs_restart():
+            await agent.close()
         if agent.is_started():
             return agent, None
         warning: str | None = None
@@ -2481,6 +2483,8 @@ class Ask(commands.Cog):
                 return web.json_response({"ok": False, "error": error}, status=409)
             if agent is None:
                 return web.json_response({"ok": False, "error": "browser_unavailable"}, status=409)
+            if not agent.is_started():
+                return web.json_response({"ok": False, "error": "browser_not_started"}, status=409)
             observation = await self._operator_observation(agent)
         warning = self._operator_start_warnings.get(state_key)
         return web.json_response(
@@ -2507,6 +2511,8 @@ class Ask(commands.Cog):
                 return web.json_response({"ok": False, "error": error}, status=409)
             if agent is None:
                 return web.json_response({"ok": False, "error": "browser_unavailable"}, status=409)
+            if not agent.is_started():
+                return web.json_response({"ok": False, "error": "browser_not_started"}, status=409)
             try:
                 image_bytes = await agent.page.screenshot(type="png", scale="css")
             except TypeError:
@@ -2569,6 +2575,8 @@ class Ask(commands.Cog):
                 return web.json_response({"ok": False, "error": error}, status=409)
             if agent is None:
                 return web.json_response({"ok": False, "error": "browser_unavailable"}, status=409)
+            if not agent.is_started():
+                return web.json_response({"ok": False, "error": "browser_not_started"}, status=409)
             result = await agent.act(action)
             observation = await self._operator_observation(agent)
             if action_type != "list_tabs":
@@ -5393,6 +5401,8 @@ class Ask(commands.Cog):
                     return {"ok": True, "released": True}
 
                 agent = self._get_browser_agent_for_ctx(ctx)
+                if agent.needs_restart():
+                    await agent.close()
                 if not agent.is_started():
                     user_data_dir = None
                     if mode == "launch":
