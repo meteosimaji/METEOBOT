@@ -2350,7 +2350,7 @@ class Ask(commands.Cog):
 
     async def start_operator_server(self) -> bool:
         autostart = os.getenv("ASK_OPERATOR_AUTOSTART", "").strip().lower()
-        if autostart not in {"1", "true", "yes"}:
+        if autostart in {"0", "false", "no"}:
             return False
         return await self._ensure_operator_server()
 
