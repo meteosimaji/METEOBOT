@@ -211,6 +211,10 @@ MAX_ATTACHMENT_REDIRECTS = 3
 OPERATOR_TOKEN_TTL_S = int(os.getenv("ASK_OPERATOR_TOKEN_TTL_S", "1800"))
 OPERATOR_TOKEN_MAX_FUTURE_S = int(os.getenv("ASK_OPERATOR_TOKEN_MAX_FUTURE_S", "300"))
 DEFAULT_OPERATOR_URL = "https://www.google.com"
+DEFAULT_OPERATOR_BASE_URL = "https://simajilord.com"
+DEFAULT_OPERATOR_HOST = "127.0.0.1"
+DEFAULT_OPERATOR_PORT = 8080
+DEFAULT_OPERATOR_AUTOSTART = True
 
 
 @dataclass
@@ -1945,16 +1949,12 @@ class Ask(commands.Cog):
         self._operator_app: web.Application | None = None
         self._operator_runner: web.AppRunner | None = None
         self._operator_site: web.TCPSite | None = None
-        self._operator_host = os.getenv("ASK_OPERATOR_HOST", "0.0.0.0")
-        self._operator_port = int(os.getenv("ASK_OPERATOR_PORT", "8080"))
-        self._operator_base_url = (os.getenv("ASK_OPERATOR_BASE_URL") or "").strip()
+        self._operator_host = DEFAULT_OPERATOR_HOST
+        self._operator_port = DEFAULT_OPERATOR_PORT
+        self._operator_base_url = DEFAULT_OPERATOR_BASE_URL
         self._operator_default_url = (
             os.getenv("ASK_OPERATOR_DEFAULT_URL") or DEFAULT_OPERATOR_URL
         ).strip()
-        self._operator_simple_guide = (
-            (os.getenv("ASK_OPERATOR_SIMPLE_GUIDE") or "").strip().lower()
-            in {"1", "true", "yes"}
-        )
         instance_id = (os.getenv("ASK_OPERATOR_INSTANCE_ID") or "").strip()
         self._operator_instance_id = (
             instance_id if instance_id else self._load_operator_instance_id()
@@ -2349,8 +2349,7 @@ class Ask(commands.Cog):
         return True
 
     async def start_operator_server(self) -> bool:
-        autostart = os.getenv("ASK_OPERATOR_AUTOSTART", "").strip().lower()
-        if autostart not in {"1", "true", "yes"}:
+        if not DEFAULT_OPERATOR_AUTOSTART:
             return False
         return await self._ensure_operator_server()
 
@@ -6302,83 +6301,22 @@ class Ask(commands.Cog):
                     return
 
                 self._set_browser_prefer_cdp(ctx, prefer_cdp)
-                description_lines = [
-                    "Operator mode lets you control the bot's browser from a web panel.",
-                    "If CDP is configured, it connects to your local Chrome instead of launching on the server.",
-                    "",
-                    "**1) Start Chrome with CDP enabled**",
-                    "`chrome --remote-debugging-port=9222 --user-data-dir=<dedicated-profile>`",
-                    "",
-                    "**2) Expose the port to the server**",
-                    "Use SSH reverse tunnel or Tailscale to open port `9222`.",
-                    "",
-                    "**3) Configure the CDP URL**",
-                    "`ASK_BROWSER_CDP_URL=http://<reachable-host>:9222`",
-                    "",
-                    "Set the base URL only (do not include `/json/version`).",
-                ]
-                if env_cdp_url:
-                    description_lines.extend(
-                        [
-                            "",
-                            f"**Current CDP URL**: {env_cdp_url}",
-                            f"**Connection check**: {env_cdp_url}/json/version",
-                        ]
-                    )
-                else:
-                    description_lines.extend(
-                        [
-                            "",
-                            "CDP URL is not set. Configure it to control Chrome on your PC.",
-                        ]
-                    )
-                description_lines.extend(
-                    [
-                        "",
-                        "**4) Open the operator panel**",
-                        "Use the hosted web UI to click, scroll, and type with screenshots.",
-                        "Set ASK_OPERATOR_BASE_URL if you need to open it from another PC.",
-                    ]
-                )
                 operator_ready = await self._ensure_operator_server()
+                description_lines: list[str]
                 if operator_ready:
                     session = self._create_operator_session(ctx)
                     operator_url = f"{self._operator_public_base_url()}/operator/{session.token}"
-                    if self._operator_simple_guide:
-                        description_lines = [
-                            f"**Operator panel**: {operator_url}",
-                            f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
-                        ]
-                    else:
-                        description_lines.extend(
-                            [
-                                f"**Operator panel**: {operator_url}",
-                                f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
-                            ]
-                        )
-                    if not self._operator_base_url:
-                        candidates = await self._operator_url_candidates()
-                        if candidates:
-                            preview = "\n".join(
-                                f"- {url}/operator/{session.token}" for url in candidates[:3]
-                            )
-                            description_lines.extend(
-                                [
-                                    "",
-                                    "**Reachable URL candidates** (when base URL is unset):",
-                                    preview,
-                                    "The correct entry point depends on your network setup.",
-                                ]
-                            )
+                    description_lines = [
+                        f"**Operator panel**: {operator_url}",
+                        f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
+                    ]
                 else:
-                    description_lines.extend(
-                        [
-                            "Failed to start the operator panel. Check `ASK_OPERATOR_PORT` settings.",
-                        ]
-                    )
+                    description_lines = [
+                        "Failed to start the operator panel. Check the operator host/port settings in `commands/ask.py`.",
+                    ]
 
                 embed = discord.Embed(
-                    title="\U0001F5A5\uFE0F /ask operator: Operator Guide",
+                    title="\U0001F5A5\uFE0F /ask operator",
                     description="\n".join(description_lines),
                     color=0x5865F2,
                 )
