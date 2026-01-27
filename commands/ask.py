@@ -1947,7 +1947,7 @@ class Ask(commands.Cog):
         self._operator_site: web.TCPSite | None = None
         self._operator_host = os.getenv("ASK_OPERATOR_HOST", "0.0.0.0")
         self._operator_port = int(os.getenv("ASK_OPERATOR_PORT", "8080"))
-        self._operator_base_url = (os.getenv("ASK_OPERATOR_BASE_URL") or "").strip()
+        self._operator_base_url = (os.getenv("ASK_OPERATOR_BASE_URL") or "https://simajilord.com").strip()
         self._operator_default_url = (
             os.getenv("ASK_OPERATOR_DEFAULT_URL") or DEFAULT_OPERATOR_URL
         ).strip()
@@ -6302,90 +6302,41 @@ class Ask(commands.Cog):
                     return
 
                 self._set_browser_prefer_cdp(ctx, prefer_cdp)
-                description_lines = [
-                    "Operator mode lets you control the bot's browser from a web panel.",
-                    "If CDP is configured, it connects to your local Chrome instead of launching on the server.",
-                    "",
-                    "**1) Start Chrome with CDP enabled**",
-                    "`chrome --remote-debugging-port=9222 --user-data-dir=<dedicated-profile>`",
-                    "",
-                    "**2) Expose the port to the server**",
-                    "Use SSH reverse tunnel or Tailscale to open port `9222`.",
-                    "",
-                    "**3) Configure the CDP URL**",
-                    "`ASK_BROWSER_CDP_URL=http://<reachable-host>:9222`",
-                    "",
-                    "Set the base URL only (do not include `/json/version`).",
-                ]
-                if env_cdp_url:
-                    description_lines.extend(
-                        [
-                            "",
-                            f"**Current CDP URL**: {env_cdp_url}",
-                            f"**Connection check**: {env_cdp_url}/json/version",
-                        ]
-                    )
-                else:
-                    description_lines.extend(
-                        [
-                            "",
-                            "CDP URL is not set. Configure it to control Chrome on your PC.",
-                        ]
-                    )
-                description_lines.extend(
-                    [
-                        "",
-                        "**4) Open the operator panel**",
-                        "Use the hosted web UI to click, scroll, and type with screenshots.",
-                        "Set ASK_OPERATOR_BASE_URL if you need to open it from another PC.",
-                    ]
-                )
                 operator_ready = await self._ensure_operator_server()
+                description_lines: list[str]
                 if operator_ready:
                     session = self._create_operator_session(ctx)
                     operator_url = f"{self._operator_public_base_url()}/operator/{session.token}"
-                    if self._operator_simple_guide:
-                        description_lines = [
-                            f"**Operator panel**: {operator_url}",
-                            f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
-                        ]
-                    else:
-                        description_lines.extend(
-                            [
-                                f"**Operator panel**: {operator_url}",
-                                f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
-                            ]
-                        )
-                    if not self._operator_base_url:
-                        candidates = await self._operator_url_candidates()
-                        if candidates:
-                            preview = "\n".join(
-                                f"- {url}/operator/{session.token}" for url in candidates[:3]
-                            )
-                            description_lines.extend(
-                                [
-                                    "",
-                                    "**Reachable URL candidates** (when base URL is unset):",
-                                    preview,
-                                    "The correct entry point depends on your network setup.",
-                                ]
-                            )
+                    description_lines = [
+                        f"**Operator panel**: {operator_url}",
+                        f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
+                    ]
                 else:
-                    description_lines.extend(
-                        [
-                            "Failed to start the operator panel. Check `ASK_OPERATOR_PORT` settings.",
-                        ]
-                    )
+                    description_lines = [
+                        "Failed to start the operator panel. Check `ASK_OPERATOR_PORT` settings.",
+                    ]
 
                 embed = discord.Embed(
-                    title="\U0001F5A5\uFE0F /ask operator: Operator Guide",
+                    title="\U0001F5A5\uFE0F /ask operator",
                     description="\n".join(description_lines),
                     color=0x5865F2,
                 )
-                reply_kwargs = {"embed": embed}
-                if ctx.interaction:
-                    reply_kwargs["ephemeral"] = True
-                await self._reply(ctx, **reply_kwargs)
+                dm_sent = False
+                try:
+                    await ctx.author.send(embed=embed)
+                    dm_sent = True
+                except Exception:
+                    dm_sent = False
+                if dm_sent:
+                    reply_kwargs = {"content": "I've sent the operator panel details to your DMs."}
+                    if ctx.interaction:
+                        reply_kwargs["ephemeral"] = True
+                    await self._reply(ctx, **reply_kwargs)
+                else:
+                    reply_kwargs = {"embed": embed}
+                    if ctx.interaction:
+                        reply_kwargs["ephemeral"] = True
+                    await self._reply(ctx, **reply_kwargs)
                 return
 
         attachments: list[discord.Attachment] = []
