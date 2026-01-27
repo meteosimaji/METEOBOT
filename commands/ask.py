@@ -6321,22 +6321,10 @@ class Ask(commands.Cog):
                     description="\n".join(description_lines),
                     color=0x5865F2,
                 )
-                dm_sent = False
-                try:
-                    await ctx.author.send(embed=embed)
-                    dm_sent = True
-                except Exception:
-                    dm_sent = False
-                if dm_sent:
-                    reply_kwargs = {"content": "I've sent the operator panel details to your DMs."}
-                    if ctx.interaction:
-                        reply_kwargs["ephemeral"] = True
-                    await self._reply(ctx, **reply_kwargs)
-                else:
-                    reply_kwargs = {"embed": embed}
-                    if ctx.interaction:
-                        reply_kwargs["ephemeral"] = True
-                    await self._reply(ctx, **reply_kwargs)
+                reply_kwargs = {"embed": embed}
+                if ctx.interaction:
+                    reply_kwargs["ephemeral"] = True
+                await self._reply(ctx, **reply_kwargs)
                 return
 
         attachments: list[discord.Attachment] = []
