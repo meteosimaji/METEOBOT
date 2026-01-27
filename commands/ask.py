@@ -1,4 +1,5 @@
 import asyncio
+import time
 import base64
 import contextlib
 import csv
@@ -215,6 +216,9 @@ DEFAULT_OPERATOR_BASE_URL = "https://simajilord.com"
 DEFAULT_OPERATOR_HOST = "127.0.0.1"
 DEFAULT_OPERATOR_PORT = 8080
 DEFAULT_OPERATOR_AUTOSTART = True
+OPERATOR_SCREENSHOT_MIN_INTERVAL_S = float(
+    os.getenv("ASK_OPERATOR_SCREENSHOT_MIN_INTERVAL_S", "0.3")
+)
 
 
 @dataclass
@@ -256,6 +260,12 @@ class OperatorSession:
     state_key: str
     owner_id: int
     created_at: datetime
+
+
+@dataclass
+class OperatorScreenshotCache:
+    image_bytes: bytes
+    captured_at: float
 
 @dataclass
 class ShellPolicy:
@@ -1198,6 +1208,7 @@ ASK_AUTO_DELETE_HISTORY_LIMIT = _env_int("ASK_AUTO_DELETE_HISTORY_LIMIT", 50, mi
 ASK_AUTO_DELETE_OVERRIDES: dict[str, bool] = {
     "help": False,
     "image": False,
+    "operator": False,
     "queue": False,
     "settime": False,
     "tex": False,
@@ -1946,6 +1957,7 @@ class Ask(commands.Cog):
         self._operator_sessions_by_state: dict[str, set[str]] = {}
         self._operator_revoked_before: dict[str, datetime] = {}
         self._operator_start_warnings: dict[str, str] = {}
+        self._operator_screenshot_cache: dict[str, OperatorScreenshotCache] = {}
         self._operator_app: web.Application | None = None
         self._operator_runner: web.AppRunner | None = None
         self._operator_site: web.TCPSite | None = None
@@ -2215,6 +2227,7 @@ class Ask(commands.Cog):
         for token in tokens:
             self._operator_sessions.pop(token, None)
         self._operator_start_warnings.pop(state_key, None)
+        self._operator_screenshot_cache.pop(state_key, None)
 
     @staticmethod
     def _is_admin(ctx: commands.Context) -> bool:
@@ -2482,6 +2495,10 @@ class Ask(commands.Cog):
         state_key = session.state_key
         lock = self._get_browser_lock_for_state_key(state_key)
         async with lock:
+            now = time.monotonic()
+            cached = self._operator_screenshot_cache.get(state_key)
+            if cached and now - cached.captured_at < OPERATOR_SCREENSHOT_MIN_INTERVAL_S:
+                return web.Response(body=cached.image_bytes, content_type="image/png")
             agent, error = await self._ensure_operator_browser_started(
                 state_key=state_key,
                 prefer_cdp=bool(self._browser_prefer_cdp_by_channel.get(state_key)),
@@ -2499,6 +2516,10 @@ class Ask(commands.Cog):
                     {"ok": False, "error": f"screenshot_failed: {type(exc).__name__}"},
                     status=500,
                 )
+            self._operator_screenshot_cache[state_key] = OperatorScreenshotCache(
+                image_bytes=image_bytes,
+                captured_at=time.monotonic(),
+            )
         return web.Response(body=image_bytes, content_type="image/png")
 
     async def _operator_handle_action(self, request: web.Request) -> web.Response:
@@ -2550,6 +2571,8 @@ class Ask(commands.Cog):
                 return web.json_response({"ok": False, "error": "browser_unavailable"}, status=409)
             result = await agent.act(action)
             observation = await self._operator_observation(agent)
+            if action_type != "list_tabs":
+                self._operator_screenshot_cache.pop(state_key, None)
         return web.json_response({"ok": bool(result.get("ok")), "result": result, "observation": observation})
 
     @staticmethod
@@ -2559,7 +2582,7 @@ class Ask(commands.Cog):
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Ask Operator</title>
+    <title>Operator Panel</title>
     <style>
       body {{
         font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -2574,7 +2597,7 @@ class Ask(commands.Cog):
       }}
       .layout {{
         display: grid;
-        grid-template-columns: minmax(320px, 1fr) 320px;
+        grid-template-columns: minmax(0, 1fr) 320px;
         gap: 16px;
       }}
       .panel {{
@@ -2582,6 +2605,7 @@ class Ask(commands.Cog):
         border: 1px solid #1f2533;
         border-radius: 12px;
         padding: 12px;
+        min-width: 0;
       }}
       .status-banner {{
         background: #2a1b1b;
@@ -2606,13 +2630,16 @@ class Ask(commands.Cog):
         color: #a5b0c4;
         margin-bottom: 4px;
       }}
-      input, button {{
+      input, select, button {{
         border-radius: 8px;
         border: 1px solid #263042;
         background: #0f141d;
         color: #f2f4f8;
         padding: 8px;
         font-size: 14px;
+      }}
+      select {{
+        width: 100%;
       }}
       button {{
         cursor: pointer;
@@ -2667,22 +2694,40 @@ class Ask(commands.Cog):
         font-size: 12px;
         color: #a5b0c4;
         margin-bottom: 6px;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+      }}
+      .meta-scroll {{
+        max-height: 4.5em;
+        overflow-y: auto;
+      }}
+      .row .meta {{
+        margin-bottom: 0;
       }}
     </style>
   </head>
   <body>
-    <h1>Ask Operator</h1>
+    <h1>Operator Panel</h1>
     <div id="statusBanner" class="status-banner hidden"></div>
     <div class="layout">
       <div class="panel">
-        <div class="meta" id="pageMeta">Loading...</div>
+        <div class="meta meta-scroll" id="pageMeta">Loading...</div>
         <div class="screen-wrap">
           <img id="screen" alt="browser screenshot" />
           <div id="screenError" class="screen-error hidden"></div>
         </div>
         <div id="status"></div>
       </div>
-      <div class="panel controls">
+        <div class="panel controls">
+        <div>
+          <label for="tabSelect">Tabs</label>
+          <select id="tabSelect"></select>
+          <div class="row" style="margin-top: 6px;">
+            <button class="secondary" id="tabRefreshBtn">Refresh</button>
+            <button class="secondary" id="tabSwitchBtn">Switch</button>
+            <button class="secondary" id="tabCloseBtn">Close</button>
+          </div>
+        </div>
         <div>
           <label for="urlInput">Go to URL</label>
           <div class="row">
@@ -2721,6 +2766,16 @@ class Ask(commands.Cog):
           <button id="refreshBtn">Refresh screenshot</button>
           <button class="secondary" id="autoRefreshBtn">Auto refresh: Off</button>
         </div>
+        <div>
+          <label for="refreshRange">Auto refresh interval</label>
+          <div class="row">
+            <input id="refreshRange" type="range" min="300" max="3000" step="50" value="300" />
+            <span class="meta" id="refreshLabel">300 ms</span>
+          </div>
+          <div class="row" style="margin-top: 6px;">
+            <span class="meta" id="fpsLabel">FPS: --</span>
+          </div>
+        </div>
       </div>
     </div>
     <script>
@@ -2730,7 +2785,22 @@ class Ask(commands.Cog):
       const metaEl = document.getElementById("pageMeta");
       const bannerEl = document.getElementById("statusBanner");
       const screenErrorEl = document.getElementById("screenError");
+      const tabSelect = document.getElementById("tabSelect");
+      const tabRefreshBtn = document.getElementById("tabRefreshBtn");
+      const tabSwitchBtn = document.getElementById("tabSwitchBtn");
+      const tabCloseBtn = document.getElementById("tabCloseBtn");
+      const refreshRange = document.getElementById("refreshRange");
+      const refreshLabel = document.getElementById("refreshLabel");
+      const fpsLabel = document.getElementById("fpsLabel");
       let lastScreenUrl = null;
+      let autoRefresh = false;
+      let autoRefreshTimer = null;
+      let refreshInFlight = false;
+      let pendingRefresh = false;
+      let baseIntervalMs = Number.parseFloat(refreshRange?.value || "300");
+      let adaptiveIntervalMs = baseIntervalMs;
+      let lastFrameAt = null;
+      let smoothFps = null;
 
       const operatorBase = (() => {{
         const path = window.location.pathname;
@@ -2767,6 +2837,39 @@ class Ask(commands.Cog):
           return await response.blob();
         }}
         return await response.json();
+      }}
+
+      function clamp(value, min, max) {{
+        return Math.min(max, Math.max(min, value));
+      }}
+
+      function updateRefreshLabel() {{
+        if (refreshLabel) {{
+          refreshLabel.textContent = `${{Math.round(baseIntervalMs)}} ms`;
+        }}
+      }}
+
+      function updateFps(now) {{
+        if (lastFrameAt) {{
+          const delta = Math.max(1, now - lastFrameAt);
+          const instant = 1000 / delta;
+          smoothFps = smoothFps === null ? instant : smoothFps * 0.8 + instant * 0.2;
+          if (fpsLabel) {{
+            fpsLabel.textContent = `FPS: ${{smoothFps.toFixed(1)}}`;
+          }}
+        }}
+        lastFrameAt = now;
+      }}
+
+      function scheduleAutoRefresh() {{
+        if (!autoRefresh) return;
+        if (autoRefreshTimer) {{
+          clearTimeout(autoRefreshTimer);
+        }}
+        const delay = clamp(adaptiveIntervalMs, 300, 5000);
+        autoRefreshTimer = setTimeout(() => {{
+          refreshScreenshot();
+        }}, delay);
       }}
 
       function showBanner(message) {{
@@ -2812,14 +2915,49 @@ class Ask(commands.Cog):
         }}
       }}
 
-      let refreshInFlight = false;
-      let pendingRefresh = false;
+      async function refreshTabs({{ preserveSelection = true }} = {{}}) {{
+        if (!tabSelect) return;
+        const previous = tabSelect.value;
+        try {{
+          const data = await api("action", {{ action: {{ type: "list_tabs" }} }});
+          const tabs = data?.result?.tabs || [];
+          tabSelect.innerHTML = "";
+          if (!tabs.length) {{
+            const option = document.createElement("option");
+            option.value = "";
+            option.textContent = "No tabs";
+            tabSelect.appendChild(option);
+            return;
+          }}
+          let activeId = "";
+          tabs.forEach((tab) => {{
+            const option = document.createElement("option");
+            option.value = tab.tab_id;
+            option.textContent = `${{tab.active ? "● " : ""}}${{tab.title || tab.url || "Untitled"}}`;
+            option.title = tab.url || "";
+            if (tab.active) {{
+              activeId = tab.tab_id;
+            }}
+            tabSelect.appendChild(option);
+          }});
+          if (preserveSelection && previous) {{
+            tabSelect.value = previous;
+          }}
+          if (!tabSelect.value && activeId) {{
+            tabSelect.value = activeId;
+          }}
+        }} catch (err) {{
+          statusEl.textContent = `Tab list error: ${{err.message}}`;
+        }}
+      }}
+
       async function refreshScreenshot() {{
         if (refreshInFlight) {{
           pendingRefresh = true;
           return;
         }}
         refreshInFlight = true;
+        const startedAt = performance.now();
         try {{
           const blob = await api("screenshot");
           const nextUrl = URL.createObjectURL(blob);
@@ -2831,13 +2969,21 @@ class Ask(commands.Cog):
           clearScreenError();
           clearBanner();
           await refreshState();
+          await refreshTabs({{ preserveSelection: true }});
+          updateFps(performance.now());
+          const elapsed = performance.now() - startedAt;
+          const target = clamp(Math.max(baseIntervalMs, elapsed * 1.4 + 80), 300, 5000);
+          adaptiveIntervalMs = adaptiveIntervalMs * 0.7 + target * 0.3;
         }} catch (err) {{
           const message = `Screenshot error: ${{err.message}}`;
           statusEl.textContent = message;
           showScreenError(message);
           showBanner(message);
+          const target = clamp(Math.max(baseIntervalMs * 1.6, adaptiveIntervalMs * 1.4), 300, 5000);
+          adaptiveIntervalMs = adaptiveIntervalMs * 0.5 + target * 0.5;
         }} finally {{
           refreshInFlight = false;
+          scheduleAutoRefresh();
           if (pendingRefresh) {{
             pendingRefresh = false;
             refreshScreenshot();
@@ -2849,7 +2995,8 @@ class Ask(commands.Cog):
         statusEl.textContent = "Sending action...";
         try {{
           const data = await api("action", {{ action }});
-          statusEl.textContent = data.ok ? "Action complete." : `Action failed: ${{data.error || "unknown"}}`;
+          const errorDetail = data.error || data?.result?.error || data?.result?.reason;
+          statusEl.textContent = data.ok ? "Action complete." : `Action failed: ${{errorDetail || "unknown"}}`;
           if (!data.ok) {{
             showBanner(statusEl.textContent);
           }} else {{
@@ -2945,22 +3092,50 @@ class Ask(commands.Cog):
       document.getElementById("refreshBtn").addEventListener("click", () => {{
         refreshScreenshot();
       }});
-      let autoRefresh = false;
-      let autoRefreshTimer = null;
       document.getElementById("autoRefreshBtn").addEventListener("click", () => {{
         autoRefresh = !autoRefresh;
         const label = autoRefresh ? "Auto refresh: On" : "Auto refresh: Off";
         document.getElementById("autoRefreshBtn").textContent = label;
         if (autoRefresh) {{
-          autoRefreshTimer = setInterval(() => {{
-            refreshScreenshot();
-          }}, 2000);
+          scheduleAutoRefresh();
         }} else if (autoRefreshTimer) {{
-          clearInterval(autoRefreshTimer);
+          clearTimeout(autoRefreshTimer);
           autoRefreshTimer = null;
         }}
       }});
 
+      if (refreshRange) {{
+        refreshRange.addEventListener("input", () => {{
+          baseIntervalMs = Number.parseFloat(refreshRange.value || "300");
+          adaptiveIntervalMs = clamp(adaptiveIntervalMs, baseIntervalMs, 5000);
+          updateRefreshLabel();
+          if (autoRefresh) {{
+            scheduleAutoRefresh();
+          }}
+        }});
+        updateRefreshLabel();
+      }}
+
+      if (tabRefreshBtn) {{
+        tabRefreshBtn.addEventListener("click", () => {{
+          refreshTabs({{ preserveSelection: true }});
+        }});
+      }}
+      if (tabSwitchBtn) {{
+        tabSwitchBtn.addEventListener("click", () => {{
+          if (!tabSelect || !tabSelect.value) return;
+          sendAction({{ type: "switch_tab", tab_id: tabSelect.value }});
+        }});
+      }}
+      if (tabCloseBtn) {{
+        tabCloseBtn.addEventListener("click", () => {{
+          if (!tabSelect || !tabSelect.value) return;
+          sendAction({{ type: "close_tab", tab_id: tabSelect.value }});
+          refreshTabs({{ preserveSelection: false }});
+        }});
+      }}
+
+      refreshTabs({{ preserveSelection: true }});
       refreshScreenshot();
     </script>
   </body>
@@ -6158,8 +6333,8 @@ class Ask(commands.Cog):
 
     @commands.command(
         name="ask",
-        description="Ask the AI anything with optional attachments, reset, or operator actions.",
-        usage="[ask|operator|reset] <question (optional when attaching images)>",
+        description="Ask the AI anything with optional attachments or reset actions.",
+        usage="[ask|reset] <question (optional when attaching images)>",
         rest_is_raw=True,
         help=(
             "Ask a question and get a concise AI answer. You can attach up to three images and"
@@ -6168,8 +6343,8 @@ class Ask(commands.Cog):
             " text extraction. If the original Discord message is deleted, you may need to"
             " re-upload the file. Large images are automatically resized or recompressed toward"
             " ~3MB to keep requests light. Web search may be used when needed. Admins can clear"
-            " the channel conversation history by choosing the reset action, and operator sends"
-            " manual browser control instructions.\n\n"
+            " the channel conversation history by choosing the reset action. Use /operator for"
+            " manual browser control when a site needs a login or blocks automation.\n\n"
             f"**Prefix**: `{BOT_PREFIX}ask <question>` (attach files to your message; replies pick up the referenced images).\n"
             "**Slash**: `/ask action: ask text:<question> image1:<attachment> image2:<attachment> image3:<attachment>`\n"
             "**Examples**: `/ask action: ask text:What's a positive news story today?`\n"
@@ -6179,13 +6354,13 @@ class Ask(commands.Cog):
         extras={
             "category": "AI",
             "pro": (
-                "Uses the Responses API with web_search, accepts attached images for vision "
+            "Uses the Responses API with web_search, accepts attached images for vision "
             "analysis, caches attachment metadata for on-demand file reading, keeps "
             "per-channel conversation state via previous_response_id, and attaches full text "
             "files when responses exceed embed limits."
             ),
             "destination": (
-                "Send a prompt (and optional attachments), request operator instructions, or reset channel memory."
+                "Send a prompt (and optional attachments) or reset channel memory."
             ),
             "plus": "Use action reset to clear the channel conversation; admins only for resets.",
         },
@@ -6198,7 +6373,7 @@ class Ask(commands.Cog):
         description="Ask the AI anything. Send text and optionally attach files for analysis.",
     )
     @app_commands.describe(
-        action="Choose whether to ask a question, show operator instructions, or reset memory (admins only).",
+        action="Choose whether to ask a question or reset memory (admins only).",
         text="Your prompt for the AI. Leave blank if you're only attaching images.",
         image1="Optional first image for the AI to analyze.",
         image2="Optional second image for the AI to analyze.",
@@ -6207,7 +6382,6 @@ class Ask(commands.Cog):
     @app_commands.choices(
         action=[
             app_commands.Choice(name="ask", value="ask"),
-            app_commands.Choice(name="operator", value="operator"),
             app_commands.Choice(name="reset", value="reset"),
         ]
     )
@@ -6231,6 +6405,56 @@ class Ask(commands.Cog):
         ctx = await ctx_candidate if inspect.isawaitable(ctx_candidate) else ctx_candidate
         await self._ask_impl(ctx, action, text, extra_images=[image1, image2, image3])
 
+    async def handle_operator_command(self, ctx: commands.Context) -> None:
+        async with self._get_ctx_lock(ctx):
+            owner_id = self._get_browser_owner(ctx)
+            is_admin = self._is_admin(ctx)
+            env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip()
+            prefer_cdp = bool(env_cdp_url)
+            if owner_id is None:
+                owner_id = ctx.author.id
+                self._set_browser_owner(ctx, owner_id)
+                self._set_browser_prefer_cdp(ctx, prefer_cdp)
+            elif owner_id != ctx.author.id and not is_admin:
+                embed = discord.Embed(
+                    title="\U0001F512 Browser is busy",
+                    description=(
+                        f"The browser in this channel is controlled by <@{owner_id}>.\n"
+                        "Admins can release it with `/ask reset`."
+                    ),
+                    color=0xED4245,
+                )
+                reply_kwargs: dict[str, Any] = {"embed": embed}
+                if ctx.interaction:
+                    reply_kwargs["ephemeral"] = True
+                await self._reply(ctx, **reply_kwargs)
+                return
+
+            self._set_browser_prefer_cdp(ctx, prefer_cdp)
+            operator_ready = await self._ensure_operator_server()
+            description_lines: list[str]
+            if operator_ready:
+                session = self._create_operator_session(ctx)
+                operator_url = f"{self._operator_public_base_url()}/operator/{session.token}"
+                description_lines = [
+                    f"**Operator panel**: {operator_url}",
+                    f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
+                ]
+            else:
+                description_lines = [
+                    "Failed to start the operator panel. Check the operator host/port settings in `commands/ask.py`.",
+                ]
+
+            embed = discord.Embed(
+                title="\U0001F5A5\uFE0F /operator",
+                description="\n".join(description_lines),
+                color=0x5865F2,
+            )
+            reply_kwargs = {"embed": embed}
+            if ctx.interaction:
+                reply_kwargs["ephemeral"] = True
+            await self._reply(ctx, **reply_kwargs)
+
     async def _ask_impl(
         self,
         ctx: commands.Context,
@@ -6243,7 +6467,22 @@ class Ask(commands.Cog):
         action = (action or "ask").lower()
         text = (text or "").strip()
 
-        if action not in {"ask", "reset", "operator"}:
+        if action == "operator":
+            embed = discord.Embed(
+                title="\U0001F5A5\uFE0F Operator moved",
+                description=(
+                    "The operator panel is now its own command. "
+                    f"Use `/operator` (or `{BOT_PREFIX}operator`) to open the manual browser panel."
+                ),
+                color=0x5865F2,
+            )
+            reply_kwargs: dict[str, Any] = {"embed": embed}
+            if ctx.interaction:
+                reply_kwargs["ephemeral"] = True
+            await self._reply(ctx, **reply_kwargs)
+            return
+
+        if action not in {"ask", "reset"}:
             text = f"{action} {text}".strip()
             action = "ask"
 
@@ -6274,57 +6513,6 @@ class Ask(commands.Cog):
                 state_key=state_key,
             )
             return
-
-        if action == "operator":
-            async with self._get_ctx_lock(ctx):
-                owner_id = self._get_browser_owner(ctx)
-                is_admin = self._is_admin(ctx)
-                env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip()
-                prefer_cdp = bool(env_cdp_url)
-                if owner_id is None:
-                    owner_id = ctx.author.id
-                    self._set_browser_owner(ctx, owner_id)
-                    self._set_browser_prefer_cdp(ctx, prefer_cdp)
-                elif owner_id != ctx.author.id and not is_admin:
-                    embed = discord.Embed(
-                        title="\U0001F512 Browser is busy",
-                        description=(
-                            f"The browser in this channel is controlled by <@{owner_id}>.\n"
-                            "Admins can release it with `/ask reset`."
-                        ),
-                        color=0xED4245,
-                    )
-                    reply_kwargs: dict[str, Any] = {"embed": embed}
-                    if ctx.interaction:
-                        reply_kwargs["ephemeral"] = True
-                    await self._reply(ctx, **reply_kwargs)
-                    return
-
-                self._set_browser_prefer_cdp(ctx, prefer_cdp)
-                operator_ready = await self._ensure_operator_server()
-                description_lines: list[str]
-                if operator_ready:
-                    session = self._create_operator_session(ctx)
-                    operator_url = f"{self._operator_public_base_url()}/operator/{session.token}"
-                    description_lines = [
-                        f"**Operator panel**: {operator_url}",
-                        f"**Expires in**: ~{OPERATOR_TOKEN_TTL_S // 60} minutes",
-                    ]
-                else:
-                    description_lines = [
-                        "Failed to start the operator panel. Check the operator host/port settings in `commands/ask.py`.",
-                    ]
-
-                embed = discord.Embed(
-                    title="\U0001F5A5\uFE0F /ask operator",
-                    description="\n".join(description_lines),
-                    color=0x5865F2,
-                )
-                reply_kwargs = {"embed": embed}
-                if ctx.interaction:
-                    reply_kwargs["ephemeral"] = True
-                await self._reply(ctx, **reply_kwargs)
-                return
 
         attachments: list[discord.Attachment] = []
         seen_attachment_ids: set[int] = set()
@@ -6691,6 +6879,8 @@ class Ask(commands.Cog):
             "Avoid shaky overconfident claims; verify with web_search when needed. "
             "Use the browser tool to navigate web pages when search snippets are not enough; prefer role-based actions "
             "and read the ARIA snapshot from observe before clicking or filling forms. "
+            "If you hit a login wall, CAPTCHA, or any other situation where you need the user's manual input, ask them "
+            "to run /operator and tell them the exact URL to open in the operator panel before continuing. "
             "When the user explicitly asks for a screenshot or to see the screen, call the browser screenshot action "
             "and tell them a screenshot was posted. "
             "For manual navigation, you can call browser screenshot_marked to return a numbered screenshot with targets, "

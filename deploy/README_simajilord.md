@@ -1,6 +1,6 @@
 # simajilord.com デプロイ（1行コマンド向け）
 
-このリポジトリは、Bot本体（Discord）＋ /ask operator のWebパネル（aiohttp）を持っています。
+このリポジトリは、Bot本体（Discord）＋ /operator のWebパネル（aiohttp）を持っています。
 公開は Nginx リバースプロキシで `simajilord.com -> 127.0.0.1:8080` に転送する想定です。
 
 前提:
