@@ -3,12 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import deque
 import contextlib
+import logging
 from typing import Any, Literal
 import uuid
+import re
+
+import playwright
 
 from playwright.async_api import (
     Browser,
     BrowserContext,
+    Frame,
     Page,
     Playwright,
     TimeoutError as PlaywrightTimeoutError,
@@ -16,6 +21,97 @@ from playwright.async_api import (
 )
 
 BrowserMode = Literal["launch", "cdp"]
+RefMode = Literal["aria", "role", "css"]
+
+log = logging.getLogger(__name__)
+
+INTERACTIVE_ROLES: set[str] = {
+    "button",
+    "checkbox",
+    "combobox",
+    "link",
+    "listbox",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "radio",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "tab",
+    "textbox",
+}
+
+ARIA_REF_LINE_RE = re.compile(
+    r'^\s*-\s*(?P<role>[\w-]+)(?:\s+"(?P<name>[^"]*)")?.*?\[ref=(?P<ref>e\d+)\]',
+    re.IGNORECASE,
+)
+
+MAX_REF_ENTRIES = 200
+MIN_BBOX_ENTRIES = 5
+MAX_SELECTOR_CHARS = 200
+
+CSS_PATH_SCRIPT = """
+el => {
+  const escape =
+    window.CSS && window.CSS.escape
+      ? window.CSS.escape
+      : (value) => value.replace(/([\\s#.:>+~\\[\\](),=])/g, "\\\\$1");
+  if (!(el instanceof Element)) return "";
+  const path = [];
+  let element = el;
+  while (element && element.nodeType === Node.ELEMENT_NODE) {
+    let selector = element.nodeName.toLowerCase();
+    if (element.id) {
+      selector += "#" + escape(element.id);
+      path.unshift(selector);
+      break;
+    }
+    let sibling = element;
+    let nth = 1;
+    while ((sibling = sibling.previousElementSibling)) {
+      if (sibling.nodeName.toLowerCase() === selector) nth += 1;
+    }
+    if (nth > 1) {
+      selector += `:nth-of-type(${nth})`;
+    }
+    path.unshift(selector);
+    element = element.parentElement;
+  }
+  return path.join(" > ");
+}
+"""
+
+
+@dataclass
+class RefEntry:
+    ref: str
+    role: str | None
+    name: str | None
+    nth: int | None
+    mode: RefMode
+    selector: str | None
+    bbox: dict[str, float] | None
+    frame_name: str | None
+    frame_url: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        selector = self.selector
+        if selector:
+            selector = selector[:MAX_SELECTOR_CHARS]
+        return {
+            "ref": self.ref,
+            "role": self.role,
+            "name": self.name,
+            "nth": self.nth,
+            "mode": self.mode,
+            "selector": selector,
+            "bbox": self.bbox,
+            "frame_name": self.frame_name,
+            "frame_url": self.frame_url,
+        }
 
 
 @dataclass
@@ -23,9 +119,19 @@ class BrowserObservation:
     url: str
     title: str
     aria: str
+    ref_generation: int
+    ref_snapshot: str
+    refs: list[dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
-        return {"url": self.url, "title": self.title, "aria": self.aria}
+        return {
+            "url": self.url,
+            "title": self.title,
+            "aria": self.aria,
+            "ref_generation": self.ref_generation,
+            "ref_snapshot": self.ref_snapshot,
+            "refs": self.refs,
+        }
 
 
 class BrowserAgent:
@@ -52,6 +158,9 @@ class BrowserAgent:
         self._owns_browser = False
         self._owns_context = False
         self._tab_actions: dict[str, deque[dict[str, Any]]] = {}
+        self._refs_by_tab: dict[str, dict[str, RefEntry]] = {}
+        self._ref_generation_by_tab: dict[str, int] = {}
+        self._aria_snapshot_ref_supported: bool | None = None
 
     @property
     def page(self) -> Page:
@@ -67,7 +176,14 @@ class BrowserAgent:
 
     @staticmethod
     def _empty_observation() -> BrowserObservation:
-        return BrowserObservation(url="", title="", aria="")
+        return BrowserObservation(
+            url="",
+            title="",
+            aria="",
+            ref_generation=0,
+            ref_snapshot="",
+            refs=[],
+        )
 
     def _register_page(self, page: Page, *, set_active: bool = True) -> str:
         existing = self._page_ids.get(page)
@@ -80,11 +196,15 @@ class BrowserAgent:
         self._pages[tab_id] = page
         self._page_ids[page] = tab_id
         self._tab_actions[tab_id] = deque(maxlen=self.max_action_history)
+        self._refs_by_tab[tab_id] = {}
+        self._ref_generation_by_tab[tab_id] = 0
 
         def _on_close() -> None:
             self._pages.pop(tab_id, None)
             self._page_ids.pop(page, None)
             self._tab_actions.pop(tab_id, None)
+            self._refs_by_tab.pop(tab_id, None)
+            self._ref_generation_by_tab.pop(tab_id, None)
             if self._active_tab_id == tab_id:
                 fallback = next(iter(self._pages.keys()), None)
                 self._active_tab_id = fallback
@@ -136,6 +256,7 @@ class BrowserAgent:
         user_data_dir: str | None,
     ) -> None:
         self._playwright = await async_playwright().start()
+        log.info("Playwright version: %s", getattr(playwright, "__version__", "unknown"))
 
         if mode == "launch":
             if user_data_dir:
@@ -208,6 +329,9 @@ class BrowserAgent:
         self._page_ids = {}
         self._active_tab_id = None
         self._tab_actions = {}
+        self._refs_by_tab = {}
+        self._ref_generation_by_tab = {}
+        self._aria_snapshot_ref_supported = None
         self._owns_browser = False
         self._owns_context = False
 
@@ -221,10 +345,25 @@ class BrowserAgent:
         title = await page.title()
 
         aria = ""
+        aria_ref_snapshot: str | None = None
         try:
             locator = page.locator("body")
             if hasattr(locator, "aria_snapshot"):
-                aria = await locator.aria_snapshot()
+                if self._aria_snapshot_ref_supported is not False:
+                    try:
+                        aria_ref_snapshot = await locator.aria_snapshot(ref=True)
+                        self._aria_snapshot_ref_supported = True
+                    except TypeError:
+                        if self._aria_snapshot_ref_supported is None:
+                            log.debug(
+                                "aria_snapshot(ref=True) unsupported; using non-ref snapshot fallback."
+                            )
+                        self._aria_snapshot_ref_supported = False
+                        aria_ref_snapshot = None
+                if aria_ref_snapshot:
+                    aria = aria_ref_snapshot
+                else:
+                    aria = await locator.aria_snapshot()
             else:
                 raise AttributeError("aria_snapshot not available")
         except Exception:
@@ -237,7 +376,324 @@ class BrowserAgent:
         if len(aria) > self.max_aria_chars:
             aria = aria[: self.max_aria_chars] + "\n...[truncated]"
 
-        return BrowserObservation(url=page.url, title=title, aria=aria)
+        tab_id = self._page_ids.get(page)
+        ref_generation = 0
+        ref_snapshot = ""
+        refs: list[dict[str, Any]] = []
+        if tab_id:
+            ref_generation = self._ref_generation_by_tab.get(tab_id, 0) + 1
+            entries = await self._build_ref_entries(page, aria_ref_snapshot)
+            self._refs_by_tab[tab_id] = {entry.ref: entry for entry in entries}
+            self._ref_generation_by_tab[tab_id] = ref_generation
+            ref_snapshot = self._format_ref_snapshot(entries)
+            refs = [entry.to_dict() for entry in entries]
+
+        return BrowserObservation(
+            url=page.url,
+            title=title,
+            aria=aria,
+            ref_generation=ref_generation,
+            ref_snapshot=ref_snapshot,
+            refs=refs,
+        )
+
+    async def _build_ref_entries(
+        self,
+        page: Page,
+        aria_ref_snapshot: str | None,
+    ) -> list[RefEntry]:
+        entries: list[RefEntry] = []
+        if aria_ref_snapshot:
+            entries = await self._refs_from_aria_snapshot(page, aria_ref_snapshot)
+        bbox_count = sum(1 for entry in entries if entry.bbox)
+        if not entries or bbox_count < MIN_BBOX_ENTRIES:
+            fallback_entries = await self._refs_from_clickable_targets(
+                page,
+                ref_prefix="c",
+                max_items=MAX_REF_ENTRIES,
+            )
+            entries = self._merge_ref_entries(entries, fallback_entries)
+        return self._apply_nth_to_duplicates(entries[:MAX_REF_ENTRIES])
+
+    async def _refs_from_aria_snapshot(
+        self,
+        page: Page,
+        aria_ref_snapshot: str,
+    ) -> list[RefEntry]:
+        entries: list[RefEntry] = []
+        for line in aria_ref_snapshot.splitlines():
+            match = ARIA_REF_LINE_RE.search(line)
+            if not match:
+                continue
+            role = match.group("role").lower()
+            name = match.group("name") or None
+            ref = match.group("ref")
+            if role.lower() not in INTERACTIVE_ROLES:
+                continue
+            locator = page.locator(f"aria-ref={ref}")
+            selector = None
+            bbox = None
+            try:
+                handle = await locator.element_handle()
+            except Exception:
+                handle = None
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    selector = await handle.evaluate(CSS_PATH_SCRIPT)
+                with contextlib.suppress(Exception):
+                    bbox = await handle.bounding_box()
+            entries.append(
+                RefEntry(
+                    ref=ref,
+                    role=role,
+                    name=name,
+                    nth=None,
+                    mode="aria",
+                    selector=selector or None,
+                    bbox=bbox,
+                    frame_name=None,
+                    frame_url=page.url or None,
+                )
+            )
+        return entries
+
+    async def _refs_from_clickable_targets(
+        self,
+        page: Page,
+        *,
+        ref_prefix: str,
+        max_items: int,
+    ) -> list[RefEntry]:
+        selector = (
+            "a, button, input, textarea, select, [role=button], [role=link], "
+            "[role=tab], [role=menuitem], [role=checkbox], [role=radio], "
+            "[role=combobox], [role=listbox], [role=menuitemcheckbox], [role=menuitemradio], "
+            "[role=option], [role=searchbox], [role=slider], [role=spinbutton], [role=switch]"
+        )
+        entries: list[RefEntry] = []
+        ref_index = 1
+        max_scan = max_items * 2
+        viewport = page.viewport_size or {}
+        viewport_w = viewport.get("width")
+        viewport_h = viewport.get("height")
+        for frame in page.frames:
+            try:
+                handles = await frame.query_selector_all(selector)
+            except Exception:
+                continue
+            for handle in handles:
+                if len(entries) >= max_scan:
+                    break
+                try:
+                    box = await handle.bounding_box()
+                except Exception:
+                    continue
+                if not box:
+                    continue
+                if box.get("width", 0) < 2 or box.get("height", 0) < 2:
+                    continue
+                if viewport_w and viewport_h:
+                    if (
+                        box.get("x", 0) > viewport_w
+                        or box.get("y", 0) > viewport_h
+                        or (box.get("x", 0) + box.get("width", 0)) < 0
+                        or (box.get("y", 0) + box.get("height", 0)) < 0
+                    ):
+                        continue
+                role_attr = None
+                try:
+                    role_attr = await handle.get_attribute("role")
+                except Exception:
+                    role_attr = None
+                try:
+                    tag_name = await handle.evaluate("el => el.tagName.toLowerCase()")
+                except Exception:
+                    tag_name = ""
+                try:
+                    input_type = await handle.get_attribute("type")
+                except Exception:
+                    input_type = None
+                role = self._infer_role(role_attr, tag_name, input_type)
+                name = await self._infer_accessible_name(handle, tag_name)
+                selector_path = None
+                with contextlib.suppress(Exception):
+                    selector_path = await handle.evaluate(CSS_PATH_SCRIPT)
+                ref = f"{ref_prefix}{ref_index}"
+                ref_index += 1
+                mode: RefMode = "css"
+                if role and name:
+                    mode = "role"
+                entries.append(
+                    RefEntry(
+                        ref=ref,
+                        role=role,
+                        name=name,
+                        nth=None,
+                        mode=mode,
+                        selector=selector_path,
+                        bbox={
+                            "x": float(box.get("x", 0)),
+                            "y": float(box.get("y", 0)),
+                            "width": float(box.get("width", 0)),
+                            "height": float(box.get("height", 0)),
+                        },
+                        frame_name=frame.name or None,
+                        frame_url=frame.url or None,
+                    )
+                )
+            if len(entries) >= max_scan:
+                break
+        entries.sort(
+            key=lambda entry: (
+                (entry.bbox or {}).get("width", 0) * (entry.bbox or {}).get("height", 0)
+            ),
+            reverse=True,
+        )
+        return entries[:max_items]
+
+    @staticmethod
+    def _merge_ref_entries(
+        base_entries: list[RefEntry],
+        fallback_entries: list[RefEntry],
+    ) -> list[RefEntry]:
+        merged = list(base_entries)
+        selector_to_index: dict[str, int] = {}
+        for idx, entry in enumerate(merged):
+            if entry.selector:
+                selector_to_index[entry.selector] = idx
+        for entry in fallback_entries:
+            if entry.selector and entry.selector in selector_to_index:
+                existing = merged[selector_to_index[entry.selector]]
+                if existing.bbox is None and entry.bbox is not None:
+                    existing.bbox = entry.bbox
+                if existing.frame_name is None and entry.frame_name:
+                    existing.frame_name = entry.frame_name
+                if existing.frame_url is None and entry.frame_url:
+                    existing.frame_url = entry.frame_url
+                continue
+            merged.append(entry)
+        return merged
+
+    @staticmethod
+    def _infer_role(role_attr: str | None, tag_name: str, input_type: str | None) -> str | None:
+        if role_attr:
+            return role_attr.lower()
+        if tag_name == "a":
+            return "link"
+        if tag_name == "button":
+            return "button"
+        if tag_name == "textarea":
+            return "textbox"
+        if tag_name == "select":
+            return "combobox"
+        if tag_name == "input":
+            input_kind = (input_type or "").lower()
+            if input_kind in {"checkbox"}:
+                return "checkbox"
+            if input_kind in {"radio"}:
+                return "radio"
+            if input_kind in {"range"}:
+                return "slider"
+            if input_kind in {"search"}:
+                return "searchbox"
+            return "textbox"
+        return None
+
+    @staticmethod
+    async def _infer_accessible_name(handle: Any, tag_name: str) -> str | None:
+        for attr in ("aria-label", "alt", "title", "placeholder", "value", "name"):
+            try:
+                value = await handle.get_attribute(attr)
+            except Exception:
+                value = None
+            if value:
+                return value
+        if tag_name in {"a", "button", "option"}:
+            with contextlib.suppress(Exception):
+                text = await handle.inner_text()
+                if text:
+                    return text
+        return None
+
+    @staticmethod
+    def _apply_nth_to_duplicates(entries: list[RefEntry]) -> list[RefEntry]:
+        counts: dict[tuple[str | None, str | None], int] = {}
+        for entry in entries:
+            if not entry.role or not entry.name:
+                continue
+            key = (entry.role, entry.name)
+            counts[key] = counts.get(key, 0) + 1
+        nth_tracker: dict[tuple[str | None, str | None], int] = {}
+        for entry in entries:
+            if not entry.role or not entry.name:
+                continue
+            key = (entry.role, entry.name)
+            if counts.get(key, 0) > 1:
+                entry.nth = nth_tracker.get(key, 0)
+                nth_tracker[key] = entry.nth + 1
+        return entries
+
+    @staticmethod
+    def _format_ref_snapshot(entries: list[RefEntry]) -> str:
+        lines = []
+        for entry in entries:
+            role = entry.role or "element"
+            name = f' "{entry.name}"' if entry.name else ""
+            nth = f" (nth={entry.nth})" if entry.nth is not None else ""
+            lines.append(f"- {role}{name} [ref={entry.ref}]{nth}")
+        return "\n".join(lines)
+
+    def _get_ref_entry(self, tab_id: str | None, ref: str) -> RefEntry | None:
+        if not tab_id:
+            return None
+        refs = self._refs_by_tab.get(tab_id)
+        if refs is None:
+            return None
+        return refs.get(ref)
+
+    def _ref_generation_matches(self, tab_id: str | None, ref_generation: int) -> bool:
+        if not tab_id:
+            return False
+        return self._ref_generation_by_tab.get(tab_id, 0) == ref_generation
+
+    def _resolve_ref_frame(self, page: Page, entry: RefEntry) -> Page | Frame:
+        if entry.frame_url and entry.frame_url == page.url:
+            return page
+        if entry.frame_name:
+            frame = page.frame(name=entry.frame_name)
+            if frame:
+                return frame
+        if entry.frame_url:
+            frame = page.frame(url=entry.frame_url)
+            if frame:
+                return frame
+        return page
+
+    async def _resolve_ref_locator(self, page: Page, entry: RefEntry) -> Any:
+        target = self._resolve_ref_frame(page, entry)
+        candidates = []
+        if entry.mode == "aria":
+            candidates.append(target.locator(f"aria-ref={entry.ref}"))
+        if entry.mode == "role" and entry.role and entry.name:
+            candidates.append(target.get_by_role(entry.role, name=entry.name))
+        if entry.mode == "css" and entry.selector:
+            candidates.append(target.locator(entry.selector))
+        if entry.mode == "aria" and entry.role and entry.name:
+            candidates.append(target.get_by_role(entry.role, name=entry.name))
+        if entry.mode == "aria" and entry.selector:
+            candidates.append(target.locator(entry.selector))
+        if entry.mode == "role" and entry.selector:
+            candidates.append(target.locator(entry.selector))
+        for locator in candidates:
+            if entry.nth is not None:
+                locator = locator.nth(entry.nth)
+            try:
+                handle = await locator.element_handle()
+            except Exception:
+                continue
+            if handle is not None:
+                return locator
+        raise ValueError("ref_not_resolvable")
 
     async def _list_tabs(self) -> list[dict[str, Any]]:
         tabs = []
@@ -345,6 +801,35 @@ class BrowserAgent:
                     action_type,
                     {"x": x, "y": y, "button": button, "clicks": clicks},
                 )
+            elif action_type == "click_ref":
+                ref = str(action.get("ref") or "")
+                ref_generation_raw = action.get("ref_generation")
+                ref_generation = int(ref_generation_raw) if ref_generation_raw is not None else -1
+                if not self._ref_generation_matches(active_tab_id, ref_generation):
+                    return {
+                        "ok": False,
+                        "error": "ref_generation_mismatch",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                entry = self._get_ref_entry(active_tab_id, ref)
+                if entry is None:
+                    return {
+                        "ok": False,
+                        "error": "unknown_ref",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                locator = await self._resolve_ref_locator(page, entry)
+                with contextlib.suppress(Exception):
+                    await locator.scroll_into_view_if_needed(timeout=5_000)
+                try:
+                    await locator.click(timeout=self.default_timeout_ms)
+                except Exception:
+                    await locator.click(timeout=self.default_timeout_ms, force=True)
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"ref": ref, "generation": ref_generation},
+                )
             elif action_type == "new_tab":
                 url = action.get("url")
                 focus = action.get("focus", True)
@@ -446,6 +931,35 @@ class BrowserAgent:
                         "text": self._truncate_detail(action.get("text")),
                     },
                 )
+            elif action_type == "fill_ref":
+                ref = str(action.get("ref") or "")
+                ref_generation_raw = action.get("ref_generation")
+                ref_generation = int(ref_generation_raw) if ref_generation_raw is not None else -1
+                if not self._ref_generation_matches(active_tab_id, ref_generation):
+                    return {
+                        "ok": False,
+                        "error": "ref_generation_mismatch",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                entry = self._get_ref_entry(active_tab_id, ref)
+                if entry is None:
+                    return {
+                        "ok": False,
+                        "error": "unknown_ref",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                locator = await self._resolve_ref_locator(page, entry)
+                text = str(action.get("text", ""))
+                try:
+                    await locator.fill(text)
+                except Exception:
+                    fallback = locator.locator("input, textarea, [contenteditable=true]").first
+                    await fallback.fill(text)
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"ref": ref, "generation": ref_generation, "text": self._truncate_detail(text)},
+                )
             elif action_type == "type":
                 text = str(action.get("text", ""))
                 await page.keyboard.type(text)
@@ -467,6 +981,56 @@ class BrowserAgent:
                     active_tab_id,
                     action_type,
                     {"state": self._truncate_detail(action.get("state", "load"))},
+                )
+            elif action_type == "hover_ref":
+                ref = str(action.get("ref") or "")
+                ref_generation_raw = action.get("ref_generation")
+                ref_generation = int(ref_generation_raw) if ref_generation_raw is not None else -1
+                if not self._ref_generation_matches(active_tab_id, ref_generation):
+                    return {
+                        "ok": False,
+                        "error": "ref_generation_mismatch",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                entry = self._get_ref_entry(active_tab_id, ref)
+                if entry is None:
+                    return {
+                        "ok": False,
+                        "error": "unknown_ref",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                locator = await self._resolve_ref_locator(page, entry)
+                with contextlib.suppress(Exception):
+                    await locator.scroll_into_view_if_needed(timeout=5_000)
+                await locator.hover()
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"ref": ref, "generation": ref_generation},
+                )
+            elif action_type in {"scroll_ref", "scroll_into_view_ref"}:
+                ref = str(action.get("ref") or "")
+                ref_generation_raw = action.get("ref_generation")
+                ref_generation = int(ref_generation_raw) if ref_generation_raw is not None else -1
+                if not self._ref_generation_matches(active_tab_id, ref_generation):
+                    return {
+                        "ok": False,
+                        "error": "ref_generation_mismatch",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                entry = self._get_ref_entry(active_tab_id, ref)
+                if entry is None:
+                    return {
+                        "ok": False,
+                        "error": "unknown_ref",
+                        "observation": (await self.observe()).to_dict(),
+                    }
+                locator = await self._resolve_ref_locator(page, entry)
+                await locator.scroll_into_view_if_needed(timeout=5_000)
+                self._record_action(
+                    active_tab_id,
+                    action_type,
+                    {"ref": ref, "generation": ref_generation},
                 )
             elif action_type == "observe":
                 pass
