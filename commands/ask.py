@@ -15,6 +15,7 @@ import re
 import secrets
 import shlex
 import shutil
+import subprocess
 import socket
 import tempfile
 import zipfile
@@ -229,6 +230,16 @@ DEFAULT_OPERATOR_AUTOSTART = True
 ASK_OPERATOR_HEADLESS = (
     (os.getenv("ASK_OPERATOR_HEADLESS") or "").strip().lower() in {"1", "true", "yes"}
 )
+ASK_OPERATOR_START_COOLDOWN_S = float(
+    os.getenv("ASK_OPERATOR_START_COOLDOWN_S", "20")
+)
+ASK_OPERATOR_AUTOSTART_XVFB = (
+    (os.getenv("ASK_OPERATOR_AUTOSTART_XVFB") or "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+ASK_OPERATOR_XVFB_SCREEN = os.getenv("ASK_OPERATOR_XVFB_SCREEN", "1920x1080x24")
+ASK_OPERATOR_XVFB_DISPLAY_BASE = int(os.getenv("ASK_OPERATOR_XVFB_DISPLAY_BASE", "99"))
+ASK_OPERATOR_XVFB_DISPLAY_TRIES = int(os.getenv("ASK_OPERATOR_XVFB_DISPLAY_TRIES", "20"))
 OPERATOR_SCREENSHOT_MIN_INTERVAL_S = float(
     os.getenv("ASK_OPERATOR_SCREENSHOT_MIN_INTERVAL_S", "0.3")
 )
@@ -279,6 +290,15 @@ class OperatorSession:
 class OperatorScreenshotCache:
     image_bytes: bytes
     captured_at: float
+
+
+@dataclass(frozen=True)
+class _OperatorStartFailure:
+    at_monotonic: float
+    error: str
+    headless: bool
+    mode: str
+
 
 @dataclass
 class ShellPolicy:
@@ -1993,12 +2013,17 @@ class Ask(commands.Cog):
         self._operator_revoked_before: dict[str, datetime] = {}
         self._operator_start_warnings: dict[str, str] = {}
         self._operator_screenshot_cache: dict[str, OperatorScreenshotCache] = {}
+        self._operator_last_start_failure: dict[str, _OperatorStartFailure] = {}
+        self._operator_xvfb_proc: subprocess.Popen | None = None
+        self._operator_xvfb_display: str | None = None
+        self._operator_xvfb_original_display: str | None = None
         self._operator_app: web.Application | None = None
         self._operator_runner: web.AppRunner | None = None
         self._operator_site: web.TCPSite | None = None
         self._operator_host = DEFAULT_OPERATOR_HOST
         self._operator_port = DEFAULT_OPERATOR_PORT
         self._operator_base_url = DEFAULT_OPERATOR_BASE_URL
+        self._operator_base_host = urlparse(self._operator_base_url).hostname
         self._operator_default_url = (
             os.getenv("ASK_OPERATOR_DEFAULT_URL") or DEFAULT_OPERATOR_URL
         ).strip()
@@ -2444,10 +2469,117 @@ class Ask(commands.Cog):
         if runner is not None:
             with contextlib.suppress(Exception):
                 await runner.cleanup()
+        self._operator_stop_xvfb()
 
     def cog_unload(self) -> None:
         if self._operator_runner is not None:
             asyncio.create_task(self._shutdown_operator_server())
+        self._operator_stop_xvfb()
+
+    def _operator_stop_xvfb(self) -> None:
+        proc = self._operator_xvfb_proc
+        original_display = self._operator_xvfb_original_display
+        display = self._operator_xvfb_display
+        self._operator_xvfb_proc = None
+        self._operator_xvfb_display = None
+        self._operator_xvfb_original_display = None
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.terminate()
+                proc.wait(timeout=1)
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+        if display and os.getenv("DISPLAY") == display:
+            if original_display is None:
+                os.environ.pop("DISPLAY", None)
+            else:
+                os.environ["DISPLAY"] = original_display
+
+    def _operator_pick_free_display(self) -> str:
+        for display_id in range(
+            ASK_OPERATOR_XVFB_DISPLAY_BASE,
+            ASK_OPERATOR_XVFB_DISPLAY_BASE + ASK_OPERATOR_XVFB_DISPLAY_TRIES,
+        ):
+            if not Path(f"/tmp/.X11-unix/X{display_id}").exists():
+                return f":{display_id}"
+        return f":{ASK_OPERATOR_XVFB_DISPLAY_BASE}"
+
+    def _operator_display_is_live(self, display: str | None) -> bool:
+        if not display:
+            return False
+        display = display.strip()
+        if not display.startswith(":"):
+            return False
+        display_id = display[1:].split(".", 1)[0]
+        if not display_id.isdigit():
+            return False
+        return Path(f"/tmp/.X11-unix/X{display_id}").exists()
+
+    async def _operator_ensure_xvfb(self) -> str | None:
+        current_display = os.getenv("DISPLAY")
+        if current_display and self._operator_display_is_live(current_display):
+            return None
+        if current_display and not self._operator_display_is_live(current_display):
+            os.environ.pop("DISPLAY", None)
+        if not ASK_OPERATOR_AUTOSTART_XVFB:
+            return (
+                "xserver_missing: $DISPLAY が無いので headed ブラウザを起動できない。"
+                " 対処: (1) ASK_OPERATOR_HEADLESS=1 にする か、"
+                " (2) Xvfb を用意して bot を xvfb-run 配下で起動する か、"
+                " (3) ASK_OPERATOR_AUTOSTART_XVFB=1 で自動起動する。"
+            )
+        if shutil.which("Xvfb") is None:
+            return (
+                "xvfb_not_installed: Xvfb が見つからない。"
+                " Ubuntuなら `sudo apt-get update && sudo apt-get install -y xvfb`。"
+            )
+        if self._operator_xvfb_proc is not None and self._operator_xvfb_proc.poll() is None:
+            if not os.getenv("DISPLAY"):
+                os.environ["DISPLAY"] = self._operator_xvfb_display or self._operator_pick_free_display()
+            return None
+        display = self._operator_pick_free_display()
+        try:
+            self._operator_xvfb_proc = subprocess.Popen(
+                ["Xvfb", display, "-screen", "0", ASK_OPERATOR_XVFB_SCREEN, "-nolisten", "tcp"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            return f"xvfb_start_failed: {exc}"
+        self._operator_xvfb_display = display
+        if self._operator_xvfb_original_display is None:
+            self._operator_xvfb_original_display = (
+                current_display if self._operator_display_is_live(current_display) else None
+            )
+        await asyncio.sleep(0.08)
+        if self._operator_xvfb_proc.poll() is not None:
+            return (
+                "xvfb_start_failed: Xvfb が即終了した。"
+                " screen指定や権限/依存関係を確認して。"
+            )
+        os.environ["DISPLAY"] = display
+        log.info(
+            "Operator Xvfb started: DISPLAY=%s screen=%s",
+            display,
+            ASK_OPERATOR_XVFB_SCREEN,
+        )
+        return None
+
+    def _operator_map_start_exception(self, exc: Exception) -> str:
+        msg = str(exc)
+        if (
+            "Missing X server" in msg
+            or ("$DISPLAY" in msg and "XServer" in msg)
+            or ("headed browser" in msg and "XServer" in msg)
+        ):
+            return (
+                "xserver_missing: headed ブラウザ起動に XServer($DISPLAY) が必要。"
+                " 対処: ASK_OPERATOR_HEADLESS=1 か、Xvfb (xvfb-run) を使う。"
+            )
+        first_line = msg.splitlines()[0].strip() if msg else repr(exc)
+        return f"browser_start_failed: {first_line}"
 
     async def _ensure_operator_browser_started(
         self,
@@ -2472,9 +2604,29 @@ class Ask(commands.Cog):
             self._browser_prefer_cdp_by_channel.pop(state_key, None)
             warning = "cdp_fallback_missing_url"
         user_data_dir = None
+        last_failure = self._operator_last_start_failure.get(state_key)
+        if last_failure is not None:
+            age = time.monotonic() - last_failure.at_monotonic
+            if (
+                age < ASK_OPERATOR_START_COOLDOWN_S
+                and last_failure.headless == headless
+                and last_failure.mode == mode
+            ):
+                return None, last_failure.error
+            self._operator_last_start_failure.pop(state_key, None)
         if mode == "launch":
             user_data_dir = str(self._browser_profile_dir(state_key))
             cdp_url = None
+            if not headless and not os.getenv("DISPLAY"):
+                xvfb_error = await self._operator_ensure_xvfb()
+                if xvfb_error is not None:
+                    self._operator_last_start_failure[state_key] = _OperatorStartFailure(
+                        at_monotonic=time.monotonic(),
+                        error=xvfb_error,
+                        headless=headless,
+                        mode=mode,
+                    )
+                    return None, xvfb_error
         if mode == "cdp":
             try:
                 await agent.start(
@@ -2504,13 +2656,25 @@ class Ask(commands.Cog):
                 )
                 self._operator_record_headless_running(state_key, headless)
             except Exception as exc:
-                log.exception("Failed to start operator browser: %s", type(exc).__name__)
-                return None, "browser_start_failed"
+                error = self._operator_map_start_exception(exc)
+                self._operator_last_start_failure[state_key] = _OperatorStartFailure(
+                    at_monotonic=time.monotonic(),
+                    error=error,
+                    headless=headless,
+                    mode=mode,
+                )
+                log.exception(
+                    "Failed to start operator browser: %s error=%s",
+                    type(exc).__name__,
+                    error,
+                )
+                return None, error
         if warning:
             self._operator_start_warnings[state_key] = warning
         else:
             self._operator_start_warnings.pop(state_key, None)
         await self._maybe_navigate_operator_default(agent)
+        self._operator_last_start_failure.pop(state_key, None)
         return agent, None
 
     async def _maybe_navigate_operator_default(self, agent: BrowserAgent) -> None:
@@ -2566,11 +2730,15 @@ class Ask(commands.Cog):
         running_headless = self._operator_headless_running.get(state_key)
         session_headless = self._operator_headless_by_state.get(state_key)
         domain_headless = self._operator_headless_by_domain.get(domain) if domain else None
+        cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
+        server_host = self._operator_base_host
         return web.json_response(
             {
                 "ok": True,
                 "observation": observation,
                 "warning": warning,
+                "cdp_url": cdp_url,
+                "server_host": server_host,
                 "headless": {
                     "running": running_headless,
                     "default": self._operator_headless_default,
@@ -2780,6 +2948,9 @@ class Ask(commands.Cog):
       .status-banner.hidden {{
         display: none;
       }}
+      .hidden {{
+        display: none;
+      }}
       .controls {{
         display: flex;
         flex-direction: column;
@@ -2864,6 +3035,23 @@ class Ask(commands.Cog):
       .row .meta {{
         margin-bottom: 0;
       }}
+      .link {{
+        color: #8ab4f8;
+        text-decoration: none;
+        font-size: 12px;
+      }}
+      .link:hover {{
+        text-decoration: underline;
+      }}
+      code {{
+        background: #0f141d;
+        border: 1px solid #263042;
+        border-radius: 8px;
+        padding: 6px 8px;
+        font-size: 12px;
+        color: #d4dcf4;
+        word-break: break-all;
+      }}
     </style>
   </head>
   <body>
@@ -2896,6 +3084,19 @@ class Ask(commands.Cog):
             <button class="secondary" id="headlessApplySessionBtn">Apply to session</button>
           </div>
           <div class="meta" id="headlessMeta">Mode: --</div>
+          <div class="meta hidden" id="cdpRow">
+            <a class="link" id="cdpLink" href="#" target="_blank" rel="noreferrer">
+              Open CDP endpoint
+            </a>
+            <div class="meta hidden" id="cdpNote"></div>
+            <div class="meta hidden" id="cdpSshRow">
+              <div class="meta">Suggested SSH tunnel:</div>
+              <div class="row">
+                <code id="cdpSshCommand"></code>
+                <button class="secondary" id="cdpCopyBtn">Copy</button>
+              </div>
+            </div>
+          </div>
         </div>
         <div>
           <label for="urlInput">Go to URL</label>
@@ -2962,6 +3163,12 @@ class Ask(commands.Cog):
       const headlessApplyDomainBtn = document.getElementById("headlessApplyDomainBtn");
       const headlessApplySessionBtn = document.getElementById("headlessApplySessionBtn");
       const headlessMeta = document.getElementById("headlessMeta");
+      const cdpRow = document.getElementById("cdpRow");
+      const cdpLink = document.getElementById("cdpLink");
+      const cdpNote = document.getElementById("cdpNote");
+      const cdpSshRow = document.getElementById("cdpSshRow");
+      const cdpSshCommand = document.getElementById("cdpSshCommand");
+      const cdpCopyBtn = document.getElementById("cdpCopyBtn");
       const refreshRange = document.getElementById("refreshRange");
       const refreshLabel = document.getElementById("refreshLabel");
       const fpsLabel = document.getElementById("fpsLabel");
@@ -3083,6 +3290,46 @@ class Ask(commands.Cog):
         }}, delay);
       }}
 
+      function updateCdpTunnel(urlText, serverHost) {{
+        if (!cdpSshRow || !cdpSshCommand) return;
+        if (!urlText) {{
+          cdpSshRow.classList.add("hidden");
+          return;
+        }}
+        let port = "9222";
+        try {{
+          const parsed = new URL(urlText);
+          if (parsed.port) {{
+            port = parsed.port;
+          }} else if (parsed.protocol === "https:") {{
+            port = "443";
+          }}
+        }} catch (err) {{
+          // Keep default port.
+        }}
+        const host = serverHost || window.location.hostname || "simajilord.com";
+        const command = `ssh -N -L ${port}:127.0.0.1:${port} user@${host}`;
+        cdpSshCommand.textContent = command;
+        cdpSshRow.classList.remove("hidden");
+      }}
+
+      if (cdpCopyBtn && cdpSshCommand) {{
+        cdpCopyBtn.addEventListener("click", async () => {{
+          try {{
+            await navigator.clipboard.writeText(cdpSshCommand.textContent || "");
+            cdpCopyBtn.textContent = "Copied!";
+            setTimeout(() => {{
+              cdpCopyBtn.textContent = "Copy";
+            }}, 1200);
+          }} catch (err) {{
+            cdpCopyBtn.textContent = "Copy failed";
+            setTimeout(() => {{
+              cdpCopyBtn.textContent = "Copy";
+            }}, 1200);
+          }}
+        }});
+      }}
+
       function showBanner(message) {{
         bannerEl.textContent = message;
         bannerEl.classList.remove("hidden");
@@ -3121,6 +3368,49 @@ class Ask(commands.Cog):
             }}
             headlessState = data.headless || null;
             updateHeadlessUi();
+            if (cdpRow && cdpLink && data.cdp_url) {{
+              const serverHost = data.server_host || "";
+              let localPort = "9222";
+              try {{
+                const parsed = new URL(data.cdp_url);
+                if (parsed.port) {{
+                  localPort = parsed.port;
+                }} else if (parsed.protocol === "https:") {{
+                  localPort = "443";
+                }}
+              }} catch (err) {{
+                // Keep default port.
+              }}
+              cdpLink.href = data.cdp_url;
+              cdpLink.textContent = `Open CDP endpoint (${data.cdp_url})`;
+              cdpRow.classList.remove("hidden");
+              if (cdpNote) {{
+                try {{
+                  const parsed = new URL(data.cdp_url);
+                  const host = parsed.hostname;
+                  if (["127.0.0.1", "localhost", "::1"].includes(host)) {{
+                    cdpNote.textContent =
+                      "CDP is bound to localhost. Open via SSH tunnel or run the UI on the same host.";
+                    cdpNote.classList.remove("hidden");
+                    updateCdpTunnel(data.cdp_url, serverHost);
+                    cdpLink.href = `http://localhost:${localPort}`;
+                    cdpLink.textContent = `Open CDP endpoint (http://localhost:${localPort})`;
+                  }} else {{
+                    cdpNote.classList.add("hidden");
+                    updateCdpTunnel(null, serverHost);
+                  }}
+                }} catch (err) {{
+                  cdpNote.classList.add("hidden");
+                  updateCdpTunnel(null, serverHost);
+                }}
+              }}
+            }} else if (cdpRow) {{
+              cdpRow.classList.add("hidden");
+              if (cdpNote) {{
+                cdpNote.classList.add("hidden");
+              }}
+              updateCdpTunnel(null, "");
+            }}
           }}
         }} catch (err) {{
           metaEl.textContent = `State error: ${{err.message}}`;
