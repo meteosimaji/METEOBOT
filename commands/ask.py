@@ -235,7 +235,7 @@ ASK_OPERATOR_START_COOLDOWN_S = float(
     os.getenv("ASK_OPERATOR_START_COOLDOWN_S", "20")
 )
 ASK_OPERATOR_AUTOSTART_XVFB = (
-    (os.getenv("ASK_OPERATOR_AUTOSTART_XVFB") or "").strip().lower()
+    (os.getenv("ASK_OPERATOR_AUTOSTART_XVFB", "true") or "").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 ASK_OPERATOR_XVFB_SCREEN = os.getenv("ASK_OPERATOR_XVFB_SCREEN", "1920x1080x24")
@@ -2757,10 +2757,41 @@ class Ask(commands.Cog):
             raise web.HTTPNotFound(text="Operator session expired or invalid.")
         state_key = session.state_key
         lock = self._get_browser_lock_for_state_key(state_key)
-        async with lock:
+        fast_mode = request.query.get("mode") == "fast" or request.query.get("fast") == "1"
+        min_interval_s = 0.05 if fast_mode else OPERATOR_SCREENSHOT_MIN_INTERVAL_S
+        now = time.monotonic()
+        cached = self._operator_screenshot_cache.get(state_key)
+        if cached and now - cached.captured_at < min_interval_s:
+            return web.Response(body=cached.image_bytes, content_type="image/png")
+        acquired = False
+        lock_acquired_at = None
+        try:
+            if lock.locked():
+                if cached:
+                    log.debug("Operator screenshot busy; serving cached frame (state=%s)", state_key)
+                    return web.Response(body=cached.image_bytes, content_type="image/png")
+                log.debug("Operator screenshot busy; no cached frame available (state=%s)", state_key)
+                return web.json_response({"ok": False, "error": "browser_busy"}, status=423)
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=0.001)
+            except asyncio.TimeoutError:
+                if cached:
+                    log.debug(
+                        "Operator screenshot busy after lock attempt; serving cached frame (state=%s)",
+                        state_key,
+                    )
+                    return web.Response(body=cached.image_bytes, content_type="image/png")
+                log.debug(
+                    "Operator screenshot busy after lock attempt; no cached frame available (state=%s)",
+                    state_key,
+                )
+                return web.json_response({"ok": False, "error": "browser_busy"}, status=423)
+            acquired = True
+            lock_acquired_at = time.monotonic()
+            log.debug("Operator screenshot lock acquired (state=%s)", state_key)
             now = time.monotonic()
             cached = self._operator_screenshot_cache.get(state_key)
-            if cached and now - cached.captured_at < OPERATOR_SCREENSHOT_MIN_INTERVAL_S:
+            if cached and now - cached.captured_at < min_interval_s:
                 return web.Response(body=cached.image_bytes, content_type="image/png")
             agent, error = await self._ensure_operator_browser_started(
                 state_key=state_key,
@@ -2785,7 +2816,18 @@ class Ask(commands.Cog):
                 image_bytes=image_bytes,
                 captured_at=time.monotonic(),
             )
-        return web.Response(body=image_bytes, content_type="image/png")
+            return web.Response(body=image_bytes, content_type="image/png")
+        finally:
+            if acquired:
+                held_ms = 0.0
+                if lock_acquired_at is not None:
+                    held_ms = (time.monotonic() - lock_acquired_at) * 1000
+                log.debug(
+                    "Operator screenshot lock released (state=%s, held_ms=%.1f)",
+                    state_key,
+                    held_ms,
+                )
+                lock.release()
 
     async def _operator_handle_action(self, request: web.Request) -> web.Response:
         token = request.match_info.get("token", "")
@@ -2837,7 +2879,9 @@ class Ask(commands.Cog):
             if not agent.is_started():
                 return web.json_response({"ok": False, "error": "browser_not_started"}, status=409)
             result = await agent.act(action)
-            observation = await self._operator_observation(agent)
+            observation = result.get("observation")
+            if not isinstance(observation, dict):
+                observation = await self._operator_observation(agent)
             if action_type != "list_tabs":
                 self._operator_screenshot_cache.pop(state_key, None)
         return web.json_response({"ok": bool(result.get("ok")), "result": result, "observation": observation})
@@ -3136,6 +3180,7 @@ class Ask(commands.Cog):
         <div class="row">
           <button id="refreshBtn">Refresh screenshot</button>
           <button class="secondary" id="autoRefreshBtn">Auto refresh: Off</button>
+          <button class="secondary" id="fastRefreshBtn">Fast mode: Off</button>
         </div>
         <div>
           <label for="refreshRange">Auto refresh interval</label>
@@ -3173,11 +3218,14 @@ class Ask(commands.Cog):
       const refreshRange = document.getElementById("refreshRange");
       const refreshLabel = document.getElementById("refreshLabel");
       const fpsLabel = document.getElementById("fpsLabel");
+      const fastRefreshBtn = document.getElementById("fastRefreshBtn");
       let lastScreenUrl = null;
       let autoRefresh = false;
       let autoRefreshTimer = null;
       let refreshInFlight = false;
       let pendingRefresh = false;
+      let fastRefresh = false;
+      let lastMetaRefreshAt = 0;
       let baseIntervalMs = Number.parseFloat(refreshRange?.value || "300");
       let adaptiveIntervalMs = baseIntervalMs;
       let lastFrameAt = null;
@@ -3216,7 +3264,7 @@ class Ask(commands.Cog):
           const message = await parseError(response);
           throw new Error(message);
         }}
-        if (path === "screenshot") {{
+        if (path.startsWith("screenshot")) {{
           return await response.blob();
         }}
         return await response.json();
@@ -3228,7 +3276,9 @@ class Ask(commands.Cog):
 
       function updateRefreshLabel() {{
         if (refreshLabel) {{
-          refreshLabel.textContent = `${{Math.round(baseIntervalMs)}} ms`;
+          refreshLabel.textContent = fastRefresh
+            ? "Fast mode"
+            : `${{Math.round(baseIntervalMs)}} ms`;
         }}
       }}
 
@@ -3285,7 +3335,7 @@ class Ask(commands.Cog):
         if (autoRefreshTimer) {{
           clearTimeout(autoRefreshTimer);
         }}
-        const delay = clamp(adaptiveIntervalMs, 300, 5000);
+        const delay = fastRefresh ? clamp(adaptiveIntervalMs, 30, 200) : clamp(adaptiveIntervalMs, 300, 5000);
         autoRefreshTimer = setTimeout(() => {{
           refreshScreenshot();
         }}, delay);
@@ -3463,7 +3513,8 @@ class Ask(commands.Cog):
         refreshInFlight = true;
         const startedAt = performance.now();
         try {{
-          const blob = await api("screenshot");
+          const path = fastRefresh ? "screenshot?mode=fast" : "screenshot";
+          const blob = await api(path);
           const nextUrl = URL.createObjectURL(blob);
           screen.src = nextUrl;
           if (lastScreenUrl && lastScreenUrl.startsWith("blob:")) {{
@@ -3472,19 +3523,32 @@ class Ask(commands.Cog):
           lastScreenUrl = nextUrl;
           clearScreenError();
           clearBanner();
-          await refreshState();
-          await refreshTabs({{ preserveSelection: true }});
+          const now = performance.now();
+          const shouldMetaRefresh = !fastRefresh || now - lastMetaRefreshAt > 1000;
+          if (shouldMetaRefresh) {{
+            await refreshState();
+            await refreshTabs({{ preserveSelection: true }});
+            lastMetaRefreshAt = now;
+          }}
           updateFps(performance.now());
           const elapsed = performance.now() - startedAt;
-          const target = clamp(Math.max(baseIntervalMs, elapsed * 1.4 + 80), 300, 5000);
-          adaptiveIntervalMs = adaptiveIntervalMs * 0.7 + target * 0.3;
+          if (!fastRefresh) {{
+            const target = clamp(Math.max(baseIntervalMs, elapsed * 1.4 + 80), 300, 5000);
+            adaptiveIntervalMs = adaptiveIntervalMs * 0.7 + target * 0.3;
+          }}
         }} catch (err) {{
           const message = `Screenshot error: ${{err.message}}`;
           statusEl.textContent = message;
           showScreenError(message);
           showBanner(message);
-          const target = clamp(Math.max(baseIntervalMs * 1.6, adaptiveIntervalMs * 1.4), 300, 5000);
-          adaptiveIntervalMs = adaptiveIntervalMs * 0.5 + target * 0.5;
+          if (!fastRefresh) {{
+            const target = clamp(
+              Math.max(baseIntervalMs * 1.6, adaptiveIntervalMs * 1.4),
+              300,
+              5000
+            );
+            adaptiveIntervalMs = adaptiveIntervalMs * 0.5 + target * 0.5;
+          }}
         }} finally {{
           refreshInFlight = false;
           scheduleAutoRefresh();
@@ -3607,6 +3671,19 @@ class Ask(commands.Cog):
           autoRefreshTimer = null;
         }}
       }});
+      if (fastRefreshBtn) {{
+        fastRefreshBtn.addEventListener("click", () => {{
+          fastRefresh = !fastRefresh;
+          fastRefreshBtn.textContent = fastRefresh ? "Fast mode: On" : "Fast mode: Off";
+          if (refreshRange) {{
+            refreshRange.disabled = fastRefresh;
+          }}
+          updateRefreshLabel();
+          if (autoRefresh) {{
+            scheduleAutoRefresh();
+          }}
+        }});
+      }}
 
       if (headlessToggleBtn) {{
         headlessToggleBtn.addEventListener("click", () => {{
