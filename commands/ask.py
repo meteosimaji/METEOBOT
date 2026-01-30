@@ -3308,7 +3308,7 @@ class Ask(commands.Cog):
           // Keep default port.
         }}
         const host = serverHost || window.location.hostname || "simajilord.com";
-        const command = `ssh -N -L ${port}:127.0.0.1:${port} user@${host}`;
+        const command = `ssh -N -L ${{port}}:127.0.0.1:${{port}} user@${{host}}`;
         cdpSshCommand.textContent = command;
         cdpSshRow.classList.remove("hidden");
       }}
@@ -3382,7 +3382,7 @@ class Ask(commands.Cog):
                 // Keep default port.
               }}
               cdpLink.href = data.cdp_url;
-              cdpLink.textContent = `Open CDP endpoint (${data.cdp_url})`;
+              cdpLink.textContent = `Open CDP endpoint (${{data.cdp_url}})`;
               cdpRow.classList.remove("hidden");
               if (cdpNote) {{
                 try {{
@@ -3393,8 +3393,8 @@ class Ask(commands.Cog):
                       "CDP is bound to localhost. Open via SSH tunnel or run the UI on the same host.";
                     cdpNote.classList.remove("hidden");
                     updateCdpTunnel(data.cdp_url, serverHost);
-                    cdpLink.href = `http://localhost:${localPort}`;
-                    cdpLink.textContent = `Open CDP endpoint (http://localhost:${localPort})`;
+                    cdpLink.href = `http://localhost:${{localPort}}`;
+                    cdpLink.textContent = `Open CDP endpoint (http://localhost:${{localPort}})`;
                   }} else {{
                     cdpNote.classList.add("hidden");
                     updateCdpTunnel(null, serverHost);
