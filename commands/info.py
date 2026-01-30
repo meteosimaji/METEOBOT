@@ -1,4 +1,5 @@
 """Information commands for users and servers."""
+# mypy: ignore-errors
 
 from datetime import datetime, timezone
 

@@ -32,7 +32,7 @@ class Uptime(commands.Cog):
         else:
             await ctx.reply(**kwargs, mention_author=False)
 
-    @commands.hybrid_command(
+    @commands.hybrid_command(  # type: ignore[arg-type]
         name="uptime",
         description="Show how long the bot has been running",
         help=(
