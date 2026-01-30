@@ -13,7 +13,7 @@
    - `ASK_WORKSPACE_MAX_ORIGINAL_BYTES` — max size of original files to keep in workspaces (defaults to `50MiB`).
    - `ASK_OPERATOR_DEFAULT_URL` — initial URL to open in the operator browser (defaults to `https://www.google.com`).
    - `ASK_OPERATOR_HEADLESS` — whether `/operator` starts headless (`true`/`false`, defaults to `false`).
-   - `ASK_OPERATOR_AUTOSTART_XVFB` — when headed mode needs an X server and `$DISPLAY` is missing, start `Xvfb` automatically (`true`/`false`, defaults to `false`).
+   - `ASK_OPERATOR_AUTOSTART_XVFB` — when headed mode needs an X server and `$DISPLAY` is missing, start `Xvfb` automatically (`true`/`false`, defaults to `true`).
    - `ASK_OPERATOR_XVFB_SCREEN` — virtual screen size/depth for Xvfb (defaults to `1920x1080x24`).
    - `ASK_OPERATOR_TOKEN_SECRET` — HMAC secret for `/operator` session tokens (defaults to `DISCORD_BOT_TOKEN`, set the same value across instances).
    - `ASK_OPERATOR_INSTANCE_ID` — instance identifier embedded in operator tokens (defaults to a random value on boot).
@@ -23,9 +23,9 @@
    - Operator instance IDs persist in `data/operator_instance_id.txt` unless overridden by `ASK_OPERATOR_INSTANCE_ID`. Set a fixed ID for restart-safe links.
    - Shared tokens do **not** share browser state across instances. Use sticky sessions (or a single instance) for `/operator/*` traffic to avoid profile conflicts or separate browser sessions. If `ASK_OPERATOR_ALLOW_SHARED_TOKENS` is enabled, expect a separate browser per instance.
 
-2. Start the bot with `python run.py`. Use `python run.py --bootstrap` to install/update dependencies
-   (`pip install -r requirements.txt`, `pip-review --auto`) and install Playwright browsers before
-   running `bot.py`. Running `bot.py` directly skips the bootstrap step.
+2. Start the bot with `python bot.py`. Install/update dependencies with
+   `pip install -r requirements.txt` and install Playwright browsers before
+   running `bot.py`.
 
 ## Commands
 - `ask` — Ask the AI anything; attach up to three images (about 3MB max each, i.e., ~3,000,000 bytes, including images on the message you replied to) for analysis, and it will note the current time, tap web search plus a read-only shell for repo context, use a code interpreter for calculations, attempt network access when needed, and drive a Playwright browser for live web interactions (run `playwright install` to fetch browsers). The browser tool can attach screenshots to Discord on request; large screenshots may be recompressed to JPEG to fit size limits, and browser sessions persist per channel until an admin runs `/ask` with action `reset` (which closes the browser and deletes the channel profile to clear logins). Browser profiles are stored on disk per channel under `data/browser_profiles` by default (configurable via `ASK_BROWSER_PROFILE_DIR`), so logins can survive bot restarts until they are reset. **Do not point multiple browser instances at the same profile dir or at your everyday Chrome profile; Playwright can corrupt it.** Browser controls lock to the first user who drives a channel’s browser session; admins can reset to release it. For manual navigation, the bot can post a ref-labeled screenshot so you can pick a target and then call click_ref with the matching ref and ref_generation; use `/operator` to get the web panel link (`/operator/<token>`) so you can click, scroll, and type directly against the browser session. The operator panel base URL/host/port are hardcoded in `commands/ask.py` (simajilord.com + 127.0.0.1:8080) and should be updated there if deployment changes. Operator browser mode defaults to headed and can be toggled in the panel per session or domain; toggling restarts the browser but keeps the operator link valid. Note that CDP connections share the same Chrome profile; if you need per-channel logins with CDP, use separate Chrome instances or different CDP URLs per channel. Other file types cache metadata (name/URL) only and are downloaded from Discord CDN only when the AI requests text extraction; extraction is supported for PDFs, Office files (`.docx/.pptx/.xlsx/.xlsm`), and common text/code formats, while other extensions will be reported as unsupported. Attachment downloads are capped at 500MiB by default (configurable via `ASK_MAX_ATTACHMENT_BYTES`) with a configurable timeout (`ASK_ATTACHMENT_DOWNLOAD_TIMEOUT_S`). Extracted text is stored in per-run ask workspaces under `data/ask_workspaces/<run_id>` (configurable via `ASK_WORKSPACE_DIR`) with a default TTL of 24 hours; the prompt only includes summaries and paths so the model reads needed sections via the shell. If the original Discord message is deleted, access is lost, the link expires, or a download times out, the file must be re-uploaded or converted. Scanned PDFs may return empty text unless they are OCR’d, and XLSX values depend on cached Excel calculations. Oversized images are automatically resized/compressed toward the limit. Admins can pick action `reset` to clear channel history while non-admin reset requests are treated as normal questions. Reply-based image pickup works best with prefix commands/mentions; slash commands rely on explicitly attached files. Message link fetching respects both user and bot permissions, even across guilds.
@@ -81,9 +81,9 @@ Prefix commands work with either the configured `BOT_PREFIX` or by mentioning th
 When `/operator` runs headed (`ASK_OPERATOR_HEADLESS=false`), it requires an X server (`$DISPLAY`). On a headless host
 you have two options:
 
-1) Run the bot under `xvfb-run` (works with systemd too).
+1) Run the bot under `xvfb-run` (works with systemd too). If `xvfb-run` is on PATH and `ASK_OPERATOR_AUTOSTART_XVFB=true`, running `python bot.py` will auto-restart itself under `xvfb-run` when `$DISPLAY` is missing, using the `ASK_OPERATOR_XVFB_SCREEN` size.
 
-2) Set `ASK_OPERATOR_AUTOSTART_XVFB=true` so the bot auto-starts `Xvfb` when needed.
+2) Set `ASK_OPERATOR_AUTOSTART_XVFB=false` if you prefer to manage `Xvfb` manually; by default the bot auto-starts `Xvfb` when needed.
 
 `xvfb-run` is a wrapper around `Xvfb` that sets up X authority and requires `xauth`, so install both on Ubuntu:
 

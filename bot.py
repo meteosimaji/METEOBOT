@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -191,6 +193,26 @@ def main() -> None:
     """Bot startup sequence."""
 
     load_dotenv()
+    if (
+        (os.getenv("ASK_OPERATOR_HEADLESS") or "").strip().lower() not in {"1", "true", "yes"}
+        and not os.getenv("DISPLAY")
+        and (os.getenv("ASK_OPERATOR_AUTOSTART_XVFB", "true") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+        and not os.getenv("ASK_OPERATOR_XVFB_WRAPPED")
+    ):
+        xvfb_run = shutil.which("xvfb-run")
+        if xvfb_run:
+            screen = os.getenv("ASK_OPERATOR_XVFB_SCREEN", "1920x1080x24")
+            os.environ["ASK_OPERATOR_XVFB_WRAPPED"] = "1"
+            cmd = [
+                xvfb_run,
+                "-a",
+                f"--server-args=-screen 0 {screen} -nolisten tcp",
+                sys.executable,
+                os.path.abspath(__file__),
+                *sys.argv[1:],
+            ]
+            os.execvp(cmd[0], cmd)
     token = os.getenv("DISCORD_BOT_TOKEN")
     prefix = os.getenv("BOT_PREFIX", "c!")
     if not token or token.startswith("YOUR_"):

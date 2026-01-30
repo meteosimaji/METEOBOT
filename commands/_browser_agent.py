@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 # mypy: ignore-errors
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections import deque
+import asyncio
 import contextlib
 import logging
-from typing import Any, Literal
+import time
+from typing import Any, Awaitable, Callable, Literal
 import uuid
 import re
 
@@ -123,6 +125,15 @@ class BrowserObservation:
     ref_generation: int
     ref_snapshot: str
     refs: list[dict[str, Any]]
+    ok: bool = True
+    title_error: str | None = None
+    aria_error: str | None = None
+    ref_error: str | None = None
+    nav_race: bool = False
+    last_good_used: bool = False
+    retry_count: int = 0
+    error: str | None = None
+    timestamp: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,11 +143,30 @@ class BrowserObservation:
             "ref_generation": self.ref_generation,
             "ref_snapshot": self.ref_snapshot,
             "refs": self.refs,
+            "ok": self.ok,
+            "title_error": self.title_error,
+            "aria_error": self.aria_error,
+            "ref_error": self.ref_error,
+            "nav_race": self.nav_race,
+            "last_good_used": self.last_good_used,
+            "retry_count": self.retry_count,
+            "error": self.error,
+            "timestamp": self.timestamp,
         }
 
 
 class BrowserAgent:
     """Async browser controller for LLM-driven actions."""
+
+    _NAVIGATION_ERROR_MARKERS = (
+        "Execution context was destroyed",
+        "most likely because of a navigation",
+        "Frame was detached",
+        "Target closed",
+        "has been closed",
+    )
+    _OBSERVE_READ_TIMEOUT_S = 1.0
+    _POST_ACTION_LOAD_TIMEOUT_S = 1.0
 
     def __init__(
         self,
@@ -162,6 +192,7 @@ class BrowserAgent:
         self._refs_by_tab: dict[str, dict[str, RefEntry]] = {}
         self._ref_generation_by_tab: dict[str, int] = {}
         self._aria_snapshot_ref_supported: bool | None = None
+        self._last_good_observation_by_tab: dict[str, BrowserObservation] = {}
 
     @property
     def page(self) -> Page:
@@ -184,6 +215,9 @@ class BrowserAgent:
             ref_generation=0,
             ref_snapshot="",
             refs=[],
+            ok=False,
+            error="empty_observation",
+            timestamp=time.time(),
         )
 
     def _register_page(self, page: Page, *, set_active: bool = True) -> str:
@@ -340,39 +374,106 @@ class BrowserAgent:
         page = self._page
         if page is None:
             return self._empty_observation()
-        return await self._observe_page(page)
+        if page.is_closed():
+            observation = self._empty_observation()
+            return replace(observation, error="page_closed", timestamp=time.time())
+        tab_id = self._active_tab_id or self._page_ids.get(page)
+        try:
+            observation = await self._observe_page(page)
+        except Exception as exc:
+            log.debug(
+                "Observation failed: %s",
+                f"{type(exc).__name__}: {exc}",
+            )
+            last_good = (
+                self._last_good_observation_by_tab.get(tab_id) if tab_id else None
+            )
+            if last_good:
+                return replace(
+                    last_good,
+                    ok=False,
+                    last_good_used=True,
+                    error=f"observe_failed: {type(exc).__name__}",
+                    timestamp=time.time(),
+                )
+            observation = self._empty_observation()
+            return replace(
+                observation,
+                error=f"observe_failed: {type(exc).__name__}",
+                timestamp=time.time(),
+            )
+        if observation.ok and observation.ref_error is None and tab_id:
+            self._last_good_observation_by_tab[tab_id] = observation
+        return observation
 
     async def _observe_page(self, page: Page) -> BrowserObservation:
-        title = await page.title()
+        title, title_retry_count, title_error, title_nav_race = await self._safe_page_read(
+            page,
+            "title",
+            page.title,
+            default="",
+        )
 
         aria = ""
         aria_ref_snapshot: str | None = None
-        try:
-            locator = page.locator("body")
-            if hasattr(locator, "aria_snapshot"):
-                if self._aria_snapshot_ref_supported is not False:
-                    try:
-                        aria_ref_snapshot = await locator.aria_snapshot(ref=True)
-                        self._aria_snapshot_ref_supported = True
-                    except TypeError:
+        aria_error = None
+        nav_race = title_nav_race
+        retry_count = title_retry_count
+        locator = page.locator("body")
+        if hasattr(locator, "aria_snapshot"):
+            if self._aria_snapshot_ref_supported is not False:
+                aria_ref_snapshot, aria_retry_count, aria_ref_error, aria_nav_race = (
+                    await self._safe_page_read(
+                        page,
+                        "aria_snapshot_ref",
+                        lambda: locator.aria_snapshot(ref=True),
+                        default=None,
+                    )
+                )
+                retry_count += aria_retry_count
+                if aria_ref_error:
+                    if "TypeError" in aria_ref_error:
                         if self._aria_snapshot_ref_supported is None:
                             log.debug(
                                 "aria_snapshot(ref=True) unsupported; using non-ref snapshot fallback."
                             )
                         self._aria_snapshot_ref_supported = False
-                        aria_ref_snapshot = None
-                if aria_ref_snapshot:
-                    aria = aria_ref_snapshot
+                    else:
+                        aria_error = aria_ref_error
                 else:
-                    aria = await locator.aria_snapshot()
+                    self._aria_snapshot_ref_supported = True
+                nav_race = nav_race or aria_nav_race
+            if aria_ref_snapshot:
+                aria = aria_ref_snapshot
             else:
-                raise AttributeError("aria_snapshot not available")
-        except Exception:
-            try:
-                snapshot = await page.accessibility.snapshot()
+                aria, aria_retry_count, aria_snapshot_error, aria_snapshot_nav_race = (
+                    await self._safe_page_read(
+                        page,
+                        "aria_snapshot",
+                        locator.aria_snapshot,
+                        default="",
+                    )
+                )
+                retry_count += aria_retry_count
+                nav_race = nav_race or aria_snapshot_nav_race
+                if aria_snapshot_error:
+                    aria_error = aria_snapshot_error
+        else:
+            aria_error = "aria_snapshot not available"
+        if not aria:
+            snapshot, snap_retry_count, snapshot_error, snapshot_nav_race = await self._safe_page_read(
+                page,
+                "accessibility_snapshot",
+                page.accessibility.snapshot,
+                default=None,
+            )
+            retry_count += snap_retry_count
+            nav_race = nav_race or snapshot_nav_race
+            if snapshot is not None:
                 aria = str(snapshot)
-            except Exception:
-                aria = ""
+                aria_error = None
+            if snapshot_error and aria_error is None:
+                aria_error = snapshot_error
 
         if len(aria) > self.max_aria_chars:
             aria = aria[: self.max_aria_chars] + "\n...[truncated]"
@@ -381,13 +482,24 @@ class BrowserAgent:
         ref_generation = 0
         ref_snapshot = ""
         refs: list[dict[str, Any]] = []
+        ref_error = None
         if tab_id:
             ref_generation = self._ref_generation_by_tab.get(tab_id, 0) + 1
-            entries = await self._build_ref_entries(page, aria_ref_snapshot)
+            entries, ref_retry_count, ref_error, ref_nav_race = await self._safe_page_read(
+                page,
+                "ref_entries",
+                lambda: self._build_ref_entries(page, aria_ref_snapshot),
+                default=[],
+            )
+            retry_count += ref_retry_count
+            nav_race = nav_race or ref_nav_race
             self._refs_by_tab[tab_id] = {entry.ref: entry for entry in entries}
             self._ref_generation_by_tab[tab_id] = ref_generation
             ref_snapshot = self._format_ref_snapshot(entries)
             refs = [entry.to_dict() for entry in entries]
+
+        ok = not any([title_error, aria_error])
+        error = "partial_observation" if not ok else None
 
         return BrowserObservation(
             url=page.url,
@@ -396,7 +508,82 @@ class BrowserAgent:
             ref_generation=ref_generation,
             ref_snapshot=ref_snapshot,
             refs=refs,
+            ok=ok,
+            title_error=title_error,
+            aria_error=aria_error,
+            ref_error=ref_error,
+            nav_race=nav_race,
+            retry_count=retry_count,
+            error=error,
+            timestamp=time.time(),
         )
+
+    async def _safe_page_read(
+        self,
+        page: Page,
+        label: str,
+        func: Callable[[], Awaitable[Any]],
+        *,
+        default: Any,
+        max_retries: int = 2,
+        timeout_s: float | None = None,
+    ) -> tuple[Any, int, str | None, bool]:
+        retry_count = 0
+        nav_race = False
+        last_error: str | None = None
+        read_timeout = self._OBSERVE_READ_TIMEOUT_S if timeout_s is None else timeout_s
+        for attempt in range(max_retries + 1):
+            try:
+                read_task = asyncio.create_task(func())
+                done, _ = await asyncio.wait({read_task}, timeout=read_timeout)
+                if read_task in done:
+                    return read_task.result(), retry_count, None, nav_race
+                read_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await read_task
+                raise asyncio.TimeoutError()
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                if self._is_navigation_error(exc) and attempt < max_retries:
+                    nav_race = True
+                    retry_count += 1
+                    log.debug(
+                        "Retrying %s after navigation race (attempt %s/%s): %s",
+                        label,
+                        attempt + 1,
+                        max_retries,
+                        last_error,
+                    )
+                    await self._short_navigation_wait(page)
+                    continue
+                break
+        log.debug("Observation %s failed: %s", label, last_error)
+        return default, retry_count, last_error, nav_race
+
+    async def _short_navigation_wait(self, page: Page) -> None:
+        with contextlib.suppress(Exception):
+            await page.wait_for_load_state(
+                "domcontentloaded", timeout=int(self._POST_ACTION_LOAD_TIMEOUT_S * 1000)
+            )
+        with contextlib.suppress(Exception):
+            await page.wait_for_timeout(100)
+
+    def _is_navigation_error(self, exc: Exception) -> bool:
+        message = str(exc)
+        return any(marker in message for marker in self._NAVIGATION_ERROR_MARKERS)
+
+    async def _post_action_sync(self, page: Page, action_type: str, action: dict[str, Any]) -> None:
+        navigation_prone = {"click", "click_ref", "click_role", "click_xy", "goto"}
+        if action_type == "press":
+            key = str(action.get("key") or "")
+            if key.lower() in {"enter", "numpadenter"}:
+                navigation_prone.add("press")
+        if action_type == "type":
+            text = str(action.get("text") or "")
+            if "\n" in text or "\r" in text:
+                navigation_prone.add("type")
+        if action_type in navigation_prone:
+            await self._short_navigation_wait(page)
 
     async def _build_ref_entries(
         self,
@@ -738,6 +925,7 @@ class BrowserAgent:
             }
         action_type = str(action.get("type") or "")
         active_tab_id = self._active_tab_id
+        post_action_sync = False
 
         try:
             if action_type == "goto":
@@ -747,6 +935,7 @@ class BrowserAgent:
                     action_type,
                     {"url": self._truncate_detail(action.get("url"))},
                 )
+                post_action_sync = True
             elif action_type == "click":
                 locator = page.locator(str(action["selector"]))
                 with contextlib.suppress(Exception):
@@ -802,6 +991,7 @@ class BrowserAgent:
                     action_type,
                     {"x": x, "y": y, "button": button, "clicks": clicks},
                 )
+                post_action_sync = True
             elif action_type == "click_ref":
                 ref = str(action.get("ref") or "")
                 ref_generation_raw = action.get("ref_generation")
@@ -969,6 +1159,8 @@ class BrowserAgent:
                     action_type,
                     {"text": self._truncate_detail(text)},
                 )
+                if "\n" in text or "\r" in text:
+                    post_action_sync = True
             elif action_type == "press":
                 await page.keyboard.press(str(action["key"]))
                 self._record_action(
@@ -976,6 +1168,9 @@ class BrowserAgent:
                     action_type,
                     {"key": self._truncate_detail(action.get("key"))},
                 )
+                key = str(action.get("key") or "")
+                if key.lower() in {"enter", "numpadenter"}:
+                    post_action_sync = True
             elif action_type == "wait_for_load":
                 await page.wait_for_load_state(str(action.get("state", "load")))
                 self._record_action(
@@ -1042,6 +1237,8 @@ class BrowserAgent:
                     "observation": (await self.observe()).to_dict(),
                 }
 
+            if post_action_sync:
+                await self._post_action_sync(page, action_type, action)
             return {"ok": True, "observation": (await self.observe()).to_dict()}
         except PlaywrightTimeoutError as exc:
             return {
