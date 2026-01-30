@@ -82,11 +82,16 @@ async def ensure_voice(ctx: commands.Context) -> bool:
     """
 
     guild = ctx.guild
+    author = ctx.author
+
+    # In guild channels, ctx.author is typically a Member, but discord.py types
+    # it as User | Member. Guard so mypy knows `voice` is present.
     if (
         not guild
-        or not ctx.author.voice
+        or not isinstance(author, discord.Member)
+        or not author.voice
         or not guild.voice_client
-        or ctx.author.voice.channel != guild.voice_client.channel
+        or author.voice.channel != guild.voice_client.channel
     ):
         await safe_reply(
             ctx,

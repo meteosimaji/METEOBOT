@@ -42,6 +42,12 @@ source venv/bin/activate
 python bot.py
 
 ## systemdで常駐（任意）
+※ `/operator` を headed (`ASK_OPERATOR_HEADLESS=false`) で使う場合、GUI の無いサーバでは Xvfb が必要です。
+この repo の `deploy/systemd/capbot.service` は `xvfb-run` で bot をラップする想定なので、先に入れてください。
+
+sudo apt update
+sudo apt install -y xvfb xauth
+
 sudo cp deploy/systemd/capbot.service /etc/systemd/system/capbot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now capbot

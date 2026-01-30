@@ -8,7 +8,7 @@ import tempfile
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import discord
 from discord.ext import commands
@@ -409,11 +409,16 @@ def _encode_png_with_limit(img: Image.Image, max_bytes: int) -> tuple[bytes, Ima
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
+    resample_filter = getattr(
+        getattr(Image, "Resampling", Image),
+        "LANCZOS",
+        getattr(Image, "LANCZOS", 1),
+    )
     while buf.tell() > max_bytes and img.width > 16 and img.height > 16:
         scale = (max_bytes / buf.tell()) ** 0.5
         new_w = max(16, int(img.width * scale))
         new_h = max(16, int(img.height * scale))
-        img = img.resize((new_w, new_h), resample=Image.LANCZOS)
+        img = img.resize((new_w, new_h), resample=resample_filter)
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=True)
     return buf.getvalue(), img
@@ -564,7 +569,7 @@ async def _send_response(
     if embed is not None and embeds is not None:
         raise ValueError("Pass either embed or embeds, not both.")
 
-    send_kwargs = {}
+    send_kwargs: dict[str, Any] = {}
     if content is not None:
         send_kwargs["content"] = content
     if embed is not None:
@@ -623,7 +628,7 @@ class Tex(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.hybrid_command(
+    @commands.hybrid_command(  # type: ignore[arg-type]
         name="tex",
         description="Render LaTeX to PNG (transparent + white) and PDF.",
         help=(

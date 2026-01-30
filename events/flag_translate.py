@@ -152,6 +152,9 @@ EVENT_INFO = EventInfo(
 class FlagTranslate(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # Keep the OpenAI client loosely typed; the SDK may be missing stubs.
+        # We still guard at runtime when the feature is disabled.
+        self.client: Any = None
         token = os.getenv("OPENAI_TOKEN")
         self.enabled = bool(token)
         if not token:
@@ -174,9 +177,12 @@ class FlagTranslate(commands.Cog):
         self._sema = asyncio.Semaphore(max(1, DEFAULT_CONCURRENCY))
 
     async def _responses_create(self, **kwargs: Any):
+        client = self.client
+        if client is None:
+            raise RuntimeError("OPENAI_TOKEN is not set; flag translation is disabled.")
         if self._async_client:
-            return await self.client.responses.create(**kwargs)
-        return await asyncio.to_thread(self.client.responses.create, **kwargs)
+            return await client.responses.create(**kwargs)
+        return await asyncio.to_thread(client.responses.create, **kwargs)
 
     async def _fetch_message_with_embed_retry(
         self,
@@ -226,7 +232,11 @@ class FlagTranslate(commands.Cog):
         if getattr(emoji, "id", None) is not None:
             return
 
-        emoji_str = emoji.name if hasattr(emoji, "name") else str(emoji)
+        emoji_name = getattr(emoji, "name", None)
+        # discord.PartialEmoji.name is Optional[str] in type hints.
+        # Keep this a plain `str` so cooldown/inflight dict keys stay stable.
+        emoji_str: str = emoji_name if isinstance(emoji_name, str) else str(emoji)
+        emoji_str = emoji_str.strip()
         locale = self.flag_map.get(emoji_str)
         if locale is None:
             emoji_str = _normalize_emoji(str(emoji))
@@ -288,7 +298,7 @@ class FlagTranslate(commands.Cog):
             )
             return
 
-        key = (payload.message_id, emoji_str)
+        key: tuple[int, str] = (payload.message_id, emoji_str)
         last = self._cooldown.get(key, 0.0)
         emoji_remaining = 8.0 - (now - last)
         if emoji_remaining > 0:
@@ -302,7 +312,7 @@ class FlagTranslate(commands.Cog):
             )
             return
 
-        inflight_key = (payload.message_id, emoji_str)
+        inflight_key: tuple[int, str] = (payload.message_id, emoji_str)
         if inflight_key in self._inflight or payload.user_id in self._inflight_user:
             await self._send_temporary_notice(
                 messageable,
@@ -499,14 +509,14 @@ class FlagTranslate(commands.Cog):
             self._cooldown_msg[payload.message_id] = now
             self._cooldown[key] = now
             if len(self._cooldown) > 5000:
-                for old_key in list(self._cooldown.keys())[:2500]:
-                    self._cooldown.pop(old_key, None)
+                for old_cooldown_key in list(self._cooldown.keys())[:2500]:
+                    self._cooldown.pop(old_cooldown_key, None)
             if len(self._cooldown_user) > 5000:
-                for old_key in list(self._cooldown_user.keys())[:2500]:
-                    self._cooldown_user.pop(old_key, None)
+                for old_user_id in list(self._cooldown_user.keys())[:2500]:
+                    self._cooldown_user.pop(old_user_id, None)
             if len(self._cooldown_msg) > 5000:
-                for old_key in list(self._cooldown_msg.keys())[:2500]:
-                    self._cooldown_msg.pop(old_key, None)
+                for old_message_id in list(self._cooldown_msg.keys())[:2500]:
+                    self._cooldown_msg.pop(old_message_id, None)
 
             try:
                 async with self._sema:
@@ -630,7 +640,9 @@ class FlagTranslate(commands.Cog):
 
 
 async def setup(bot: commands.Bot) -> None:
-    if not hasattr(bot, "events"):
-        bot.events = []
-    bot.events.append(EVENT_INFO)
+    events = getattr(bot, "events", None)
+    if events is None:
+        events = []
+        setattr(bot, "events", events)
+    events.append(EVENT_INFO)
     await bot.add_cog(FlagTranslate(bot))

@@ -7,7 +7,9 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/capBOT-main
 EnvironmentFile=/home/ubuntu/capBOT-main/.env
-ExecStart=/home/ubuntu/capBOT-main/venv/bin/python /home/ubuntu/capBOT-main/bot.py
+# /operator を headed (ASK_OPERATOR_HEADLESS=false) で使う場合、X server ($DISPLAY) が必要。
+# GUI の無いサーバでは xvfb-run 経由で起動して仮想ディスプレイを提供する。
+ExecStart=/usr/bin/xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24 -nolisten tcp" /home/ubuntu/capBOT-main/venv/bin/python /home/ubuntu/capBOT-main/bot.py
 Restart=on-failure
 RestartSec=3
 

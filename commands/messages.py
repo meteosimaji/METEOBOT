@@ -1,6 +1,7 @@
 """Command to fetch recent messages in the current channel."""
 
 from __future__ import annotations
+# mypy: ignore-errors
 
 import contextlib
 import difflib

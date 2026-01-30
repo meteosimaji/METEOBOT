@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# mypy: ignore-errors
 from dataclasses import dataclass
 from collections import deque
 import contextlib

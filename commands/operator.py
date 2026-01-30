@@ -13,7 +13,7 @@ class OperatorCommand(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    @commands.hybrid_command(
+    @commands.hybrid_command(  # type: ignore[arg-type]
         name="operator",
         description="Open the operator panel for manual browser control.",
         usage="",

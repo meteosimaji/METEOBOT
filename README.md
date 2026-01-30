@@ -13,6 +13,8 @@
    - `ASK_WORKSPACE_MAX_ORIGINAL_BYTES` — max size of original files to keep in workspaces (defaults to `50MiB`).
    - `ASK_OPERATOR_DEFAULT_URL` — initial URL to open in the operator browser (defaults to `https://www.google.com`).
    - `ASK_OPERATOR_HEADLESS` — whether `/operator` starts headless (`true`/`false`, defaults to `false`).
+   - `ASK_OPERATOR_AUTOSTART_XVFB` — when headed mode needs an X server and `$DISPLAY` is missing, start `Xvfb` automatically (`true`/`false`, defaults to `false`).
+   - `ASK_OPERATOR_XVFB_SCREEN` — virtual screen size/depth for Xvfb (defaults to `1920x1080x24`).
    - `ASK_OPERATOR_TOKEN_SECRET` — HMAC secret for `/operator` session tokens (defaults to `DISCORD_BOT_TOKEN`, set the same value across instances).
    - `ASK_OPERATOR_INSTANCE_ID` — instance identifier embedded in operator tokens (defaults to a random value on boot).
    - `ASK_OPERATOR_ALLOW_SHARED_TOKENS` — allow operator tokens from other instances (defaults to `false`).
@@ -74,6 +76,21 @@ Error responses for excluded commands (for example, the `/video` usage limit not
 - Enable the **Voice States** intent (and any other intents your host requires) so the bot can see voice joins.
 
 Prefix commands work with either the configured `BOT_PREFIX` or by mentioning the bot (for example, `@Bot ping`). Messages that start with a bot mention or reply to the bot will fall back to `ask` when they are not recognized as commands.
+
+### Operator (headed) prerequisites
+When `/operator` runs headed (`ASK_OPERATOR_HEADLESS=false`), it requires an X server (`$DISPLAY`). On a headless host
+you have two options:
+
+1) Run the bot under `xvfb-run` (works with systemd too).
+
+2) Set `ASK_OPERATOR_AUTOSTART_XVFB=true` so the bot auto-starts `Xvfb` when needed.
+
+`xvfb-run` is a wrapper around `Xvfb` that sets up X authority and requires `xauth`, so install both on Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y xvfb xauth
+```
 
 ### TeX prerequisites
 - Install **Tectonic** (required; uses untrusted mode for safety).

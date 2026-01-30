@@ -11,8 +11,10 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import ipaddress
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Any, TypedDict, cast
 
 import discord
+from discord.abc import Messageable
 from discord.ext import commands
 from PIL import Image as PILImage, ImageOps, UnidentifiedImageError, features as PILFeatures
 
@@ -29,8 +31,12 @@ except Exception:
 
 # Safety guard against decompression bombs in untrusted images
 PILImage.MAX_IMAGE_PIXELS = 4096 * 4096 * 4
-DecompressionBombError = getattr(PILImage, "DecompressionBombError", OSError)
-DecompressionBombWarning = getattr(PILImage, "DecompressionBombWarning", Warning)
+DecompressionBombError = cast(
+    type[BaseException], getattr(PILImage, "DecompressionBombError", OSError)
+)
+DecompressionBombWarning = cast(
+    type[Warning], getattr(PILImage, "DecompressionBombWarning", Warning)
+)
 
 log = logging.getLogger(__name__)
 
@@ -245,6 +251,35 @@ def _format_utc(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 
+_LimitStore = TypedDict(
+    "_LimitStore",
+    {
+        "users": dict[str, dict[str, object]],
+        "guilds": dict[str, dict[str, object]],
+        "global": dict[str, object],
+    },
+)
+
+
+def _coerce_int(value: object, default: int = 0) -> int:
+    """Best-effort int() for JSON-ish values (dicts read from disk)."""
+    if value is None:
+        return default
+    # bool is a subclass of int, but keep intent explicit
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return default
+    return default
+
+
 def _extract_video_error(video: object) -> str | None:
     for attr in ("error", "last_error", "reason"):
         value = getattr(video, attr, None)
@@ -290,7 +325,7 @@ class Video(commands.Cog):
             self._async_client = False
         self._limit_lock = asyncio.Lock()
 
-    async def _load_limits(self) -> dict[str, dict[str, dict[str, object]]]:
+    async def _load_limits(self) -> _LimitStore:
         if not LIMITS_PATH.exists():
             return {"users": {}, "guilds": {}, "global": {}}
         try:
@@ -304,9 +339,9 @@ class Video(commands.Cog):
         data.setdefault("users", {})
         data.setdefault("guilds", {})
         data.setdefault("global", {})
-        return data  # type: ignore[return-value]
+        return cast(_LimitStore, data)
 
-    async def _save_limits(self, data: dict[str, dict[str, dict[str, object]]]) -> None:
+    async def _save_limits(self, data: _LimitStore) -> None:
         LIMITS_PATH.parent.mkdir(parents=True, exist_ok=True)
         LIMITS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -330,7 +365,7 @@ class Video(commands.Cog):
             errors: list[str] = []
             user_entry = users.get(user_id, {})
             user_day = user_entry.get("day")
-            user_count = int(user_entry.get("count", 0) or 0)
+            user_count = _coerce_int(user_entry.get("count"), 0)
             if user_day != day_key:
                 user_count = 0
             if user_count >= USER_DAILY_LIMIT:
@@ -342,7 +377,7 @@ class Video(commands.Cog):
             if guild_id:
                 guild_entry = guilds.get(guild_id, {})
                 guild_week = guild_entry.get("week_start")
-                count = int(guild_entry.get("count", 0) or 0)
+                count = _coerce_int(guild_entry.get("count"), 0)
                 if guild_week != week_key:
                     count = 0
                 if count >= GUILD_WEEKLY_LIMIT:
@@ -353,7 +388,7 @@ class Video(commands.Cog):
                     )
 
             global_day = global_limits.get("day")
-            global_count = int(global_limits.get("count", 0) or 0)
+            global_count = _coerce_int(global_limits.get("count"), 0)
             if global_day != day_key:
                 global_count = 0
             if global_count >= GLOBAL_DAILY_LIMIT:
@@ -375,12 +410,12 @@ class Video(commands.Cog):
                 guild_entry = guilds.get(guild_id, {})
                 if guild_entry.get("week_start") != week_key:
                     guild_entry = {"week_start": week_key, "count": 0}
-                guild_entry["count"] = int(guild_entry.get("count", 0) or 0) + 1
+                guild_entry["count"] = _coerce_int(guild_entry.get("count"), 0) + 1
                 guilds[guild_id] = guild_entry
 
             if global_limits.get("day") != day_key:
                 global_limits = {"day": day_key, "count": 0}
-            global_limits["count"] = int(global_limits.get("count", 0) or 0) + 1
+            global_limits["count"] = _coerce_int(global_limits.get("count"), 0) + 1
             global_limits["day"] = day_key
             data["global"] = global_limits
 
@@ -486,7 +521,7 @@ class Video(commands.Cog):
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("error", DecompressionBombWarning)
-                    img = PILImage.open(BytesIO(data))
+                    img = cast(PILImage.Image, PILImage.open(BytesIO(data)))
                     img.load()
             except (
                 UnidentifiedImageError,
@@ -739,7 +774,8 @@ class Video(commands.Cog):
                             continue
 
                         try:
-                            linked_message = await channel.fetch_message(message_id)
+                            messageable = cast(Messageable, channel)
+                            linked_message = await messageable.fetch_message(message_id)
                         except (discord.Forbidden, discord.NotFound):
                             notes.append(f"Skipped message link (can't read message): {url}")
                             continue
@@ -942,7 +978,7 @@ class Video(commands.Cog):
 
         return images, notes, had_candidates, cleaned_prompt
 
-    @commands.hybrid_command(
+    @commands.hybrid_command(  # type: ignore[arg-type]
         name="video",
         description="Generate a video from a text prompt using Sora.",
         help=(
@@ -1093,7 +1129,7 @@ class Video(commands.Cog):
                     )
                 return
 
-            request_kwargs = {
+            request_kwargs: dict[str, Any] = {
                 "model": model,
                 "prompt": prompt,
                 "size": size,
@@ -1143,9 +1179,8 @@ class Video(commands.Cog):
                 )
 
             video_bytes = await self._download_content(video.id, variant="video")
-            max_upload_bytes = (
-                ctx.guild.filesize_limit if getattr(ctx, "guild", None) else MAX_VIDEO_BYTES
-            )
+            guild = getattr(ctx, "guild", None)
+            max_upload_bytes = guild.filesize_limit if guild is not None else MAX_VIDEO_BYTES
             if len(video_bytes) > max_upload_bytes:
                 notes.append(
                     "Video output exceeded the Discord upload limit. Try shorter duration, smaller size, or use sora-2 for faster, lighter renders."

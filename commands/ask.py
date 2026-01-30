@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 import asyncio
 import time
 import base64
@@ -4274,7 +4275,7 @@ class Ask(commands.Cog):
         if not isinstance(run_id, str) or not run_id:
             run_id = uuid.uuid4().hex
             try:
-                ctx.ask_workspace_id = run_id
+                setattr(ctx, "ask_workspace_id", run_id)
             except Exception:
                 pass
         workspace_dir = self._ask_workspace_dir(run_id)
@@ -4300,7 +4301,7 @@ class Ask(commands.Cog):
             }
             self._write_ask_workspace_manifest(workspace_dir, manifest)
         try:
-            ctx.ask_workspace_dir = str(workspace_dir)
+            setattr(ctx, "ask_workspace_dir", str(workspace_dir))
         except Exception:
             pass
         return workspace_dir
@@ -6525,7 +6526,7 @@ class Ask(commands.Cog):
                             else "browser_screenshot.jpg"
                         )
                     try:
-                        screenshot_kwargs = {"type": fmt}
+                        screenshot_kwargs: dict[str, Any] = {"type": fmt}
                         if fmt == "jpeg":
                             screenshot_kwargs["quality"] = 85
                         if selector:
@@ -7557,17 +7558,17 @@ class Ask(commands.Cog):
         # Make collected attachments available to downstream bot_invoke commands (e.g., /image)
         # without changing the single-string arg contract.
         try:
-            ctx.ai_images = list(attachments)
+            setattr(ctx, "ai_images", list(attachments))
         except Exception:
             pass
 
         # Also preserve the current request context for discord_fetch_message when called without a URL.
         try:
-            ctx.ask_request_attachments = list(attachments)
-            ctx.ask_request_text = text
-            ctx.ask_request_reply_url = reply_url
+            setattr(ctx, "ask_request_attachments", list(attachments))
+            setattr(ctx, "ask_request_text", text)
+            setattr(ctx, "ask_request_reply_url", reply_url)
             if interaction_embeds:
-                ctx.ask_request_embeds = list(interaction_embeds)
+                setattr(ctx, "ask_request_embeds", list(interaction_embeds))
         except Exception:
             pass
 

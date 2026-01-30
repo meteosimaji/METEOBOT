@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, Coroutine
+from typing import Any, Coroutine, cast
 from urllib.parse import urlparse, parse_qs
 
 import discord
@@ -233,11 +233,15 @@ class MusicPlayer:
     def sync_voice_client(self) -> None:
         """Adopt an existing guild voice_client if we lost reference."""
 
+        # discord.py types `Guild.voice_client` as `VoiceProtocol | None`.
+        # In practice it's usually a `VoiceClient`, but mypy needs an explicit
+        # narrowing so we don't assign a generic protocol to `self.voice`.
         vc = getattr(self.guild, "voice_client", None)
-        if vc and vc.is_connected():
+        vc_client = vc if isinstance(vc, discord.VoiceClient) else None
+        if vc_client and vc_client.is_connected():
             if not self.voice or not self.voice.is_connected():
-                self.voice = vc
-            ch = getattr(vc, "channel", None)
+                self.voice = vc_client
+            ch = getattr(vc_client, "channel", None)
             if ch:
                 self.last_channel_id = ch.id
 
@@ -251,7 +255,9 @@ class MusicPlayer:
                 raise VoiceConnectionError("Not connected to voice (ensure_connected failed)")
 
         try:
-            self.voice.play(source, after=after)  # type: ignore[union-attr]
+            if self.voice is None:
+                raise VoiceConnectionError("Not connected to voice (voice client missing)")
+            self.voice.play(source, after=after)
             return
         except discord.ClientException as exc:
             if "Not connected to voice" not in str(exc):
@@ -261,7 +267,9 @@ class MusicPlayer:
         self.voice = None
         if not await self.ensure_connected():
             raise VoiceConnectionError("Not connected to voice after retry")
-        self.voice.play(source, after=after)  # type: ignore[union-attr]
+        if self.voice is None:
+            raise VoiceConnectionError("Not connected to voice after retry")
+        self.voice.play(source, after=after)
 
     async def join(self, channel: discord.VoiceChannel) -> None:
         async with self._connect_lock:
@@ -291,7 +299,12 @@ class MusicPlayer:
                 return
 
             try:
-                self.voice = await channel.connect(reconnect=True, timeout=15.0, self_deaf=True)
+                # discord.py typing returns `VoiceProtocol`; cast to the concrete
+                # `VoiceClient` the rest of this module expects.
+                self.voice = cast(
+                    discord.VoiceClient,
+                    await channel.connect(reconnect=True, timeout=15.0, self_deaf=True),
+                )
             except (asyncio.TimeoutError, discord.DiscordException) as exc:
                 log.exception("Failed to connect to voice channel %s", channel.id)
                 raise VoiceConnectionError(f"Failed to connect to voice channel {channel.id}") from exc
@@ -442,6 +455,8 @@ class MusicPlayer:
                 if not await self.ensure_connected():
                     return
             self._cancel_auto_leave_task()
+            if self.voice is None:
+                return
             if self.voice.is_playing() or self.voice.is_paused():
                 return
 
@@ -908,6 +923,8 @@ async def yt_search(query: str) -> Track:
                             break
                 search_related = _build_related_from_entries(entries, entry_url, youtube_only)
                 if _is_youtube_video_url(entry_url) and not info.get("related_videos"):
+                    if entry_url is None:
+                        raise yt_dlp.utils.DownloadError("No entry URL for refresh")
                     refreshed = ydl.extract_info(entry_url, download=False)
                     if "entries" not in refreshed:
                         info = refreshed
