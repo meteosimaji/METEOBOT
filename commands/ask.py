@@ -1946,6 +1946,48 @@ class _AskAutoDeleteButton(discord.ui.Button):
                 await interaction.followup.send("Auto-delete stopped.", ephemeral=True)
 
 
+def _collect_strict_schema_issues(schema: Any, path: str = "") -> list[str]:
+    issues: list[str] = []
+    if isinstance(schema, dict):
+        if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+            properties = schema["properties"]
+            required = schema.get("required")
+            if schema.get("additionalProperties") is not False:
+                issues.append(f"{path}: additionalProperties must be false for strict mode")
+            if not isinstance(required, list):
+                issues.append(f"{path}: missing required list for object properties")
+            else:
+                property_keys = set(properties.keys())
+                required_keys = set(required)
+                missing = sorted(property_keys - required_keys)
+                extra = sorted(required_keys - property_keys)
+                if missing or extra:
+                    issues.append(
+                        f"{path}: required mismatch missing={missing} extra={extra}"
+                    )
+        for key, value in schema.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            issues.extend(_collect_strict_schema_issues(value, child_path))
+    elif isinstance(schema, list):
+        for index, value in enumerate(schema):
+            child_path = f"{path}[{index}]"
+            issues.extend(_collect_strict_schema_issues(value, child_path))
+    return issues
+
+
+def _validate_strict_tool_schemas(tools: list[dict[str, Any]]) -> list[str]:
+    issues: list[str] = []
+    for tool in tools:
+        if tool.get("type") != "function":
+            continue
+        if not tool.get("strict"):
+            continue
+        parameters = tool.get("parameters")
+        name = tool.get("name", "<unknown>")
+        issues.extend(_collect_strict_schema_issues(parameters, f"{name}.parameters"))
+    return issues
+
+
 class Ask(commands.Cog):
     """Ask the AI (with optional web search)."""
 
@@ -2046,6 +2088,13 @@ class Ask(commands.Cog):
             or ""
         ).strip()
         self._operator_token_secret = operator_secret.encode() if operator_secret else None
+        strict_schema_issues = _validate_strict_tool_schemas(
+            [*self._build_bot_tools(), *self._build_browser_tools()]
+        )
+        if strict_schema_issues:
+            for issue in strict_schema_issues:
+                log.error("Strict tool schema violation: %s", issue)
+            raise ValueError("Strict tool schema validation failed.")
 
         if not hasattr(self.bot, "ai_last_response_id"):
             self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
@@ -5471,7 +5520,8 @@ class Ask(commands.Cog):
             },
         ]
 
-    def _build_browser_tools(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _build_browser_tools() -> list[dict[str, Any]]:
         return [
             {
                 "type": "function",
@@ -5928,7 +5978,21 @@ class Ask(commands.Cog):
                                             "description": "Screenshot format.",
                                         },
                                     },
-                                    "required": ["type"],
+                                    "required": [
+                                        "type",
+                                        "mode",
+                                        "ensure_assets",
+                                        "freeze_animations",
+                                        "max_screens",
+                                        "tile_height_px",
+                                        "overlap_px",
+                                        "wait_ms",
+                                        "stitch",
+                                        "full_page",
+                                        "selector",
+                                        "filename",
+                                        "format",
+                                    ],
                                     "additionalProperties": False,
                                 },
                                 {
