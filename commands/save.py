@@ -16,7 +16,7 @@ import discord
 from discord.ext import commands
 import yt_dlp
 
-from utils import BOT_PREFIX, defer_interaction, humanize_delta, safe_reply, tag_error_text
+from utils import ASK_ERROR_TAG, BOT_PREFIX, defer_interaction, humanize_delta, safe_reply, tag_error_text
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +29,8 @@ DEFAULT_MAX_CONCURRENT = 2
 DEFAULT_LOG_TAIL = 60
 DEFAULT_WORK_ROOT = "data/savevideo"
 DEFAULT_DNS_TIMEOUT_S = 2
+DEFAULT_ERROR_TEXT_MAX = 1900
+DISCORD_CONTENT_LIMIT = 4000
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -202,6 +204,7 @@ class SaveConfig:
     user_agent: str
     cookies_file: str | None
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None
+    impersonate: str | None
 
     @staticmethod
     def from_env() -> "SaveConfig":
@@ -217,6 +220,7 @@ class SaveConfig:
             cookies_from_browser=_parse_cookies_from_browser(
                 _env_str("SAVEVIDEO_COOKIES_FROM_BROWSER")
             ),
+            impersonate=_env_str("SAVEVIDEO_IMPERSONATE"),
         )
 
 
@@ -230,12 +234,64 @@ def _human_size(value: int) -> str:
     return f"{size:.1f}GB"
 
 
+def _truncate_text(text: str, max_len: int) -> str:
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    suffix = "...(truncated)"
+    keep = max(max_len - len(suffix), 0)
+    return f"{text[:keep]}{suffix}"
+
+
+def _assemble_error_message(*, base: str, tail: str, max_len: int) -> str:
+    if max_len <= 0:
+        return ""
+    tail = tail.strip()
+    if not tail:
+        return _truncate_text(base, max_len)
+
+    tail_prefix = "\n```text\n"
+    tail_suffix = "\n```"
+    trunc_suffix = "\n...(truncated)"
+
+    headroom = max_len - len(base) - len(tail_prefix) - len(tail_suffix)
+    if headroom <= 0:
+        return _truncate_text(base, max_len)
+
+    if len(tail) <= headroom:
+        return f"{base}{tail_prefix}{tail}{tail_suffix}"
+
+    trimmed_tail = tail[: max(headroom - len(trunc_suffix), 0)]
+    return f"{base}{tail_prefix}{trimmed_tail}{trunc_suffix}{tail_suffix}"
+
+
+def _cap_error_message(text: str, max_len: int) -> str:
+    if max_len <= 0:
+        return ""
+
+    tagged = tag_error_text(text)
+    if len(tagged) <= max_len:
+        return tagged
+
+    cleaned = tagged.replace(ASK_ERROR_TAG, "").rstrip()
+    suffix = f"\n{ASK_ERROR_TAG}"
+    available = max_len - len(suffix)
+    if available <= 0:
+        return ASK_ERROR_TAG[:max_len]
+
+    truncated = _truncate_text(cleaned, available)
+    return f"{truncated}{suffix}"
+
+
 def _extra_headers(url: str, user_agent: str) -> dict[str, str]:
     headers = {"User-Agent": user_agent}
     host = urlparse(url).hostname or ""
     if "tiktok.com" in host:
         # cobaltもここを強めにやってる。Refererが無いと弾かれることがある。
         headers["Referer"] = "https://www.tiktok.com/"
+    if host.endswith("x.com") or host.endswith("twitter.com"):
+        headers["Referer"] = "https://x.com/"
     return headers
 
 
@@ -248,6 +304,7 @@ def _base_ydl_opts(
     cookies_file: str | None,
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None,
     socket_timeout: int,
+    impersonate: str | None,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -271,6 +328,8 @@ def _base_ydl_opts(
     if cookies_from_browser:
         # e.g. "chrome", "firefox" (yt-dlpの仕様)
         opts["cookiesfrombrowser"] = cookies_from_browser
+    if impersonate:
+        opts["impersonate"] = impersonate
     return opts
 
 
@@ -280,6 +339,7 @@ def _probe_info(
     headers: dict[str, str],
     cookies_file: str | None,
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None,
+    impersonate: str | None,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -294,6 +354,8 @@ def _probe_info(
         opts["cookiefile"] = cookies_file
     if cookies_from_browser:
         opts["cookiesfrombrowser"] = cookies_from_browser
+    if impersonate:
+        opts["impersonate"] = impersonate
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if not isinstance(info, dict):
@@ -501,6 +563,7 @@ def _download_with_spec(
     cookies_file: str | None,
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None,
     socket_timeout: int,
+    impersonate: str | None,
 ) -> tuple[dict[str, Any], Path]:
     opts = _base_ydl_opts(
         logger=logger,
@@ -510,6 +573,7 @@ def _download_with_spec(
         cookies_file=cookies_file,
         cookies_from_browser=cookies_from_browser,
         socket_timeout=socket_timeout,
+        impersonate=impersonate,
     )
     opts["format"] = format_spec
 
@@ -550,7 +614,8 @@ class Save(commands.Cog):
             "Optional: `/save <url> max_height:<int>`\n\n"
             "Env knobs: SAVEVIDEO_MAX_BYTES, SAVEVIDEO_TIMEOUT_S, SAVEVIDEO_MAX_CONCURRENT, "
             "SAVEVIDEO_LOG_TAIL_LINES, SAVEVIDEO_WORK_DIR, SAVEVIDEO_DNS_TIMEOUT_S, "
-            "SAVEVIDEO_USER_AGENT, SAVEVIDEO_COOKIES_FILE, SAVEVIDEO_COOKIES_FROM_BROWSER\n\n"
+            "SAVEVIDEO_USER_AGENT, SAVEVIDEO_COOKIES_FILE, SAVEVIDEO_COOKIES_FROM_BROWSER, "
+            "SAVEVIDEO_IMPERSONATE\n\n"
             f"Prefix: `{BOT_PREFIX}save <url>`"
         ),
         extras={
@@ -598,6 +663,12 @@ class Save(commands.Cog):
         async with self._sem:
             logger = YTDLLogger()
             headers = _extra_headers(url, self.cfg.user_agent)
+            host = urlparse(url).hostname or ""
+            impersonate = self.cfg.impersonate
+            if impersonate is None and (
+                "tiktok.com" in host or host.endswith("x.com") or host.endswith("twitter.com")
+            ):
+                impersonate = "chrome"
 
             try:
                 self.cfg.work_root.mkdir(parents=True, exist_ok=True)
@@ -613,6 +684,7 @@ class Save(commands.Cog):
                             headers,
                             self.cfg.cookies_file,
                             self.cfg.cookies_from_browser,
+                            impersonate,
                         ),
                         timeout=float(self.cfg.timeout_s),
                     )
@@ -657,6 +729,7 @@ class Save(commands.Cog):
                                     cookies_file=self.cfg.cookies_file,
                                     cookies_from_browser=self.cfg.cookies_from_browser,
                                     socket_timeout=max(10, int(self.cfg.timeout_s)),
+                                    impersonate=impersonate,
                                 ),
                                 timeout=float(self.cfg.timeout_s),
                             )
@@ -724,8 +797,8 @@ class Save(commands.Cog):
         logger: YTDLLogger,
         max_upload_bytes: int,
     ) -> None:
-        message = f"{exc}"
-        kind = _classify_error(message)
+        raw_error = f"{exc}"
+        kind = _classify_error(raw_error)
 
         reason = {
             "unsupported_url": "Unsupported URL or no compatible formats.",
@@ -740,11 +813,16 @@ class Save(commands.Cog):
         }.get(kind, "Extraction failed.")
 
         tail = logger.tail(self.cfg.log_tail_lines)
-        tail_block = f"\n```text\n{tail}\n```" if tail else ""
+        base = f"{reason}\nURL: {url}\nRaw error: {_truncate_text(raw_error, 500)}"
+        message = _assemble_error_message(
+            base=base,
+            tail=tail,
+            max_len=DEFAULT_ERROR_TEXT_MAX,
+        )
 
         await safe_reply(
             ctx,
-            tag_error_text(f"{reason}\nURL: {url}{tail_block}"),
+            _cap_error_message(message, DISCORD_CONTENT_LIMIT),
             mention_author=False,
             ephemeral=True,
         )
