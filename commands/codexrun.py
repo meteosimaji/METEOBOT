@@ -28,11 +28,11 @@ DEFAULT_SCHEMA = {
     "properties": {
         "summary": {"type": "string"},
         "files_changed": {"type": "array", "items": {"type": "string"}},
-        "tests_run": {"type": "array", "items": {"type": "string"}},
-        "notes": {"type": "string"},
+        "tests_run": {"type": ["array", "null"], "items": {"type": "string"}},
+        "notes": {"type": ["string", "null"]},
     },
-    "required": ["summary", "files_changed"],
-    "additionalProperties": True,
+    "required": ["summary", "files_changed", "tests_run", "notes"],
+    "additionalProperties": False,
 }
 
 SAFE_ENV_KEYS = {
