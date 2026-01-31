@@ -146,6 +146,8 @@ venv.bak/
 
 # Playwright browser profiles (ask persistent sessions)
 /data/browser_profiles/
+# /save video download workspace
+/data/savevideo/
 
 # Spyder project settings
 .spyderproject
