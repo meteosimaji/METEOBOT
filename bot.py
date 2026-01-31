@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -85,6 +86,7 @@ class Bot(commands.Bot):
         log.info("Extensions loaded: %d success, %d failed", len(successes), len(failures))
         if failures:
             log.info("Failed extensions: %s", ", ".join(failures))
+        await self._maybe_start_codex()
         ask_cog = self.get_cog("Ask")
         if ask_cog and hasattr(ask_cog, "start_operator_server"):
             try:
@@ -94,6 +96,42 @@ class Bot(commands.Bot):
         synced = await self.tree.sync()
         names = ", ".join(cmd.name for cmd in synced)
         log.info("Synced %d application command(s): %s", len(synced), names)
+
+    async def _maybe_start_codex(self) -> None:
+        """Warm up Codex CLI on startup when configured."""
+        if (os.getenv("CODEX_AUTOSTART", "true") or "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
+        codex_bin = os.getenv("CODEX_BIN", "codex")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                codex_bin,
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            log.warning("Codex CLI not found (CODEX_BIN=%s).", codex_bin)
+            return
+        except OSError as exc:
+            log.warning("Failed to start Codex CLI: %s", exc)
+            return
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            log.warning("Codex CLI version check timed out.")
+            return
+        output = (out_b or b"").decode("utf-8", "replace").strip()
+        error_out = (err_b or b"").decode("utf-8", "replace").strip()
+        if proc.returncode == 0:
+            log.info("Codex CLI ready: %s", output or "version check ok")
+        else:
+            log.warning("Codex CLI version check failed: %s", error_out or "unknown error")
 
     async def load_all_extensions(self) -> tuple[list[str], list[str]]:
         """Load every extension under the commands and cogs directories."""
