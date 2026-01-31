@@ -3864,6 +3864,199 @@ class Ask(commands.Cog):
         except Exception:
             return data, out_ext
 
+    @staticmethod
+    async def _get_viewport_asset_stats(page: Any) -> dict[str, int]:
+        return await page.evaluate(
+            """
+            () => {
+              const imgs = Array.from(document.images || []);
+              const viewport = {
+                top: 0,
+                left: 0,
+                right: window.innerWidth,
+                bottom: window.innerHeight,
+              };
+              let total = 0;
+              let loaded = 0;
+              let failed = 0;
+              for (const img of imgs) {
+                const rect = img.getBoundingClientRect();
+                if (rect.bottom <= viewport.top || rect.top >= viewport.bottom) continue;
+                if (rect.right <= viewport.left || rect.left >= viewport.right) continue;
+                total += 1;
+                const complete = img.complete;
+                const width = img.naturalWidth || 0;
+                if (complete && width > 0) {
+                  loaded += 1;
+                } else if (complete && width === 0) {
+                  failed += 1;
+                }
+              }
+              return { total, loaded, failed };
+            }
+            """
+        )
+
+    async def _wait_for_viewport_assets(
+        self, page: Any, *, timeout_ms: int
+    ) -> tuple[dict[str, int], str | None]:
+        try:
+            await page.wait_for_function(
+                """
+                () => {
+                  const imgs = Array.from(document.images || []);
+                  const viewport = {
+                    top: 0,
+                    left: 0,
+                    right: window.innerWidth,
+                    bottom: window.innerHeight,
+                  };
+                  let total = 0;
+                  let loadedOrFailed = 0;
+                  for (const img of imgs) {
+                    const rect = img.getBoundingClientRect();
+                    if (rect.bottom <= viewport.top || rect.top >= viewport.bottom) continue;
+                    if (rect.right <= viewport.left || rect.left >= viewport.right) continue;
+                    total += 1;
+                    const complete = img.complete;
+                    const width = img.naturalWidth || 0;
+                    if (complete && width > 0) {
+                      loadedOrFailed += 1;
+                    } else if (complete && width === 0) {
+                      loadedOrFailed += 1;
+                    }
+                  }
+                  return total === 0 || loadedOrFailed >= total;
+                }
+                """,
+                timeout=timeout_ms,
+            )
+        except Exception as exc:
+            return await self._get_viewport_asset_stats(page), f"{type(exc).__name__}: {exc}"
+        return await self._get_viewport_asset_stats(page), None
+
+    async def _warm_assets_full(
+        self,
+        page: Any,
+        *,
+        max_screens: int,
+        wait_ms: int,
+    ) -> tuple[dict[str, int], str | None]:
+        metrics = await self._get_page_metrics(page)
+        scroll_height = metrics.get("scroll_height", 0)
+        viewport_height = metrics.get("viewport_height", 0)
+        if not scroll_height or not viewport_height:
+            return await self._get_viewport_asset_stats(page), None
+        step = max(1, viewport_height)
+        screens = min(max_screens, max(1, int(scroll_height / step) + 1))
+        stats: dict[str, int] = {"total": 0, "loaded": 0, "failed": 0}
+        first_error: str | None = None
+        for idx in range(screens):
+            y = min(idx * step, max(0, scroll_height - viewport_height))
+            await page.evaluate("y => window.scrollTo(0, y)", y)
+            if wait_ms:
+                await page.wait_for_timeout(wait_ms)
+            stats, last_error = await self._wait_for_viewport_assets(page, timeout_ms=1500)
+            if last_error and first_error is None:
+                first_error = last_error
+        return stats, first_error
+
+    @staticmethod
+    async def _get_page_metrics(page: Any) -> dict[str, int]:
+        return await page.evaluate(
+            """
+            () => {
+              const scroller = document.scrollingElement || document.documentElement || document.body;
+              return {
+                scroll_height: Math.max(scroller ? scroller.scrollHeight : 0, document.body ? document.body.scrollHeight : 0),
+                viewport_height: window.innerHeight || 0,
+                viewport_width: window.innerWidth || 0,
+                node_count: document.getElementsByTagName("*").length,
+              };
+            }
+            """
+        )
+
+    @staticmethod
+    async def _detect_virtual_scroll(page: Any) -> dict[str, Any]:
+        return await page.evaluate(
+            """
+            () => {
+              const scroller = document.scrollingElement || document.documentElement || document.body;
+              const scrollHeight = Math.max(scroller ? scroller.scrollHeight : 0, document.body ? document.body.scrollHeight : 0);
+              const viewportHeight = window.innerHeight || 0;
+              let sampleCount = 0;
+              let maxBottom = 0;
+              const walker = document.createTreeWalker(
+                document.body || document.documentElement,
+                NodeFilter.SHOW_ELEMENT
+              );
+              while (walker.nextNode()) {
+                const el = walker.currentNode;
+                const rect = el.getBoundingClientRect();
+                maxBottom = Math.max(maxBottom, rect.bottom + window.scrollY);
+                sampleCount += 1;
+                if (sampleCount >= 2000) break;
+              }
+              const ratio = viewportHeight ? scrollHeight / viewportHeight : 0;
+              const gap = scrollHeight - maxBottom;
+              const suspected = (ratio > 8 && sampleCount < 1500) || gap > viewportHeight * 3;
+              return {
+                suspected,
+                scroll_height: scrollHeight,
+                viewport_height: viewportHeight,
+                node_count: sampleCount,
+                max_bottom: maxBottom,
+              };
+            }
+            """
+        )
+
+    @staticmethod
+    def _stitch_vertical_images(
+        images: list[bytes],
+        *,
+        overlap_px: int,
+        fmt: str,
+        quality: int,
+    ) -> bytes:
+        if not images:
+            return b""
+        decoded = []
+        widths = []
+        heights = []
+        for blob in images:
+            img = PILImage.open(BytesIO(blob))
+            if fmt == "jpeg":
+                img = img.convert("RGB")
+            decoded.append(img)
+            widths.append(img.width)
+            heights.append(img.height)
+        max_width = max(widths)
+        total_height = 0
+        cropped_heights: list[int] = []
+        for idx, height in enumerate(heights):
+            crop_top = overlap_px if idx > 0 else 0
+            crop_top = min(crop_top, height)
+            cropped_height = max(0, height - crop_top)
+            cropped_heights.append(cropped_height)
+            total_height += cropped_height
+        stitched = PILImage.new("RGB" if fmt == "jpeg" else "RGBA", (max_width, total_height))
+        y = 0
+        for idx, img in enumerate(decoded):
+            crop_top = overlap_px if idx > 0 else 0
+            crop_top = min(crop_top, img.height)
+            if crop_top:
+                img = img.crop((0, crop_top, img.width, img.height))
+            stitched.paste(img, (0, y))
+            y += img.height
+        buffer = BytesIO()
+        if fmt == "jpeg":
+            stitched.save(buffer, format="JPEG", quality=quality, optimize=True)
+        else:
+            stitched.save(buffer, format="PNG")
+        return buffer.getvalue()
+
     def _get_ask_queue(self, state_key: str) -> deque[QueuedAskRequest]:
         queue = self._ask_queue_by_channel.get(state_key)
         if queue is None:
@@ -5316,7 +5509,7 @@ class Ask(commands.Cog):
                                 "hover_ref {ref,ref_generation}, scroll_ref {ref,ref_generation}, "
                                 "scroll_into_view_ref {ref,ref_generation}, type {text}, press {key}, "
                                 "wait_for_load {state}, content {}, download {selector|url}, "
-                                "screenshot {full_page?, selector?, filename?, format?}, "
+                                "screenshot {mode?, selector?, filename?, format?, ensure_assets?, freeze_animations?, max_screens?, tile_height_px?, overlap_px?, wait_ms?, stitch?}, "
                                 "screenshot_marked {max_items?}, observe {}, "
                                 "list_tabs {}, new_tab {url?, focus?}, switch_tab {tab_id}, close_tab {tab_id}, "
                                 "observe_tabs {max_tabs?, include_aria?}, close {}, release {}."
@@ -5662,9 +5855,59 @@ class Ask(commands.Cog):
                                     "type": "object",
                                     "properties": {
                                         "type": {"type": "string", "enum": ["screenshot"]},
+                                        "mode": {
+                                            "type": "string",
+                                            "enum": ["viewport", "full", "auto", "scroll", "tiles"],
+                                            "description": "Screenshot mode (default viewport).",
+                                            "default": "viewport",
+                                        },
+                                        "ensure_assets": {
+                                            "type": "string",
+                                            "enum": ["none", "viewport", "full"],
+                                            "description": "Wait for lazy-loaded assets (default viewport).",
+                                            "default": "viewport",
+                                        },
+                                        "freeze_animations": {
+                                            "type": ["boolean", "null"],
+                                            "description": "Temporarily disable animations during capture.",
+                                            "default": None,
+                                        },
+                                        "max_screens": {
+                                            "type": ["integer", "null"],
+                                            "description": "Maximum screens to capture for scroll/auto (default 8).",
+                                            "minimum": 1,
+                                            "maximum": 50,
+                                            "default": 8,
+                                        },
+                                        "tile_height_px": {
+                                            "type": ["integer", "null"],
+                                            "description": "Tile height in pixels for tiles mode (default 8000).",
+                                            "minimum": 1000,
+                                            "maximum": 20000,
+                                            "default": 8000,
+                                        },
+                                        "overlap_px": {
+                                            "type": ["integer", "null"],
+                                            "description": "Overlap in pixels for scroll/tiles (default 200).",
+                                            "minimum": 0,
+                                            "maximum": 2000,
+                                            "default": 200,
+                                        },
+                                        "wait_ms": {
+                                            "type": ["integer", "null"],
+                                            "description": "Wait time after scrolling in milliseconds (default 200).",
+                                            "minimum": 0,
+                                            "maximum": 5000,
+                                            "default": 200,
+                                        },
+                                        "stitch": {
+                                            "type": ["boolean", "null"],
+                                            "description": "Whether to stitch scroll/tiles captures into one image.",
+                                            "default": None,
+                                        },
                                         "full_page": {
-                                            "type": "boolean",
-                                            "description": "Full-page screenshot.",
+                                            "type": ["boolean", "null"],
+                                            "description": "Deprecated: use mode instead.",
                                         },
                                         "selector": {
                                             "type": ["string", "null"],
@@ -5685,13 +5928,7 @@ class Ask(commands.Cog):
                                             "description": "Screenshot format.",
                                         },
                                     },
-                                    "required": [
-                                        "type",
-                                        "full_page",
-                                        "selector",
-                                        "filename",
-                                        "format",
-                                    ],
+                                    "required": ["type"],
                                     "additionalProperties": False,
                                 },
                                 {
@@ -6589,7 +6826,58 @@ class Ask(commands.Cog):
                     }
                 if action_type == "screenshot":
                     selector = _get_action_str(action, "selector").strip()
-                    full_page = bool(action.get("full_page", False))
+                    mode = _get_action_str(action, "mode").strip().lower()
+                    full_page_raw = action.get("full_page")
+                    if not mode:
+                        if full_page_raw is not None:
+                            mode = "full" if bool(full_page_raw) else "viewport"
+                        else:
+                            mode = "viewport"
+                    if mode not in {"viewport", "full", "auto", "scroll", "tiles"}:
+                        mode = "viewport"
+                    ensure_assets_input = _get_action_str(action, "ensure_assets").strip().lower()
+                    if ensure_assets_input not in {"none", "viewport", "full"}:
+                        ensure_assets_input = ""
+                    freeze_animations = action.get("freeze_animations")
+                    if freeze_animations is None:
+                        freeze_animations = mode != "viewport"
+                    else:
+                        freeze_animations = bool(freeze_animations)
+
+                    def _coerce_int(
+                        value: Any, *, default: int, min_value: int, max_value: int
+                    ) -> int:
+                        try:
+                            parsed = int(value)
+                        except (TypeError, ValueError):
+                            parsed = default
+                        return max(min_value, min(parsed, max_value))
+
+                    max_screens = _coerce_int(
+                        action.get("max_screens"),
+                        default=8,
+                        min_value=1,
+                        max_value=50,
+                    )
+                    tile_height_px = _coerce_int(
+                        action.get("tile_height_px"),
+                        default=8000,
+                        min_value=1000,
+                        max_value=20000,
+                    )
+                    overlap_px = _coerce_int(
+                        action.get("overlap_px"),
+                        default=200,
+                        min_value=0,
+                        max_value=2000,
+                    )
+                    wait_ms = _coerce_int(
+                        action.get("wait_ms"),
+                        default=200,
+                        min_value=0,
+                        max_value=5000,
+                    )
+                    stitch_raw = action.get("stitch")
                     fmt = _get_action_str(action, "format").lower() or "png"
                     if fmt == "jpg":
                         fmt = "jpeg"
@@ -6602,19 +6890,227 @@ class Ask(commands.Cog):
                             if fmt == "png"
                             else "browser_screenshot.jpg"
                         )
+                    requested_mode = mode
+                    used_mode = mode
+                    assets_stats = {"total": 0, "loaded": 0, "failed": 0}
+                    assets_wait_error = None
+                    tile_count = 1
+                    estimated_total_tiles = 1
+                    estimated_total_screens = 1
+                    truncated = False
+                    shot_parts: list[bytes] = []
+                    selector_used = False
+                    page_metrics = await self._get_page_metrics(agent.page)
+                    virtual_info = await self._detect_virtual_scroll(agent.page)
+                    suspected_virtual_scroll = bool(virtual_info.get("suspected"))
+                    page_height_px = int(virtual_info.get("scroll_height") or 0)
+                    viewport_height_px = int(virtual_info.get("viewport_height") or 0)
+
+                    if mode == "auto":
+                        if suspected_virtual_scroll:
+                            used_mode = "scroll"
+                        elif page_height_px > 16000:
+                            used_mode = "tiles"
+                        else:
+                            used_mode = "full"
+                    if mode == "full" and page_height_px > 16000:
+                        used_mode = "tiles"
+                    if mode == "full" and suspected_virtual_scroll:
+                        used_mode = "scroll"
+
+                    if stitch_raw is None:
+                        stitch = used_mode not in {"scroll", "tiles"}
+                    else:
+                        stitch = bool(stitch_raw)
+
+                    if ensure_assets_input:
+                        ensure_assets = ensure_assets_input
+                    elif used_mode in {"full", "tiles"} and mode == "auto":
+                        ensure_assets = "full"
+                    else:
+                        ensure_assets = "viewport"
+
+                    max_screens_effective = min(max_screens, 10) if not stitch else max_screens
+
+                    style_handle = None
+                    freeze_injected = False
+                    if freeze_animations:
+                        try:
+                            style_handle = await agent.page.add_style_tag(
+                                content="""
+                                * {
+                                  animation: none !important;
+                                  transition: none !important;
+                                }
+                                html {
+                                  scroll-behavior: auto !important;
+                                }
+                                """,
+                            )
+                            freeze_injected = True
+                        except Exception:
+                            style_handle = None
                     try:
                         screenshot_kwargs: dict[str, Any] = {"type": fmt}
                         if fmt == "jpeg":
                             screenshot_kwargs["quality"] = 85
+                        if ensure_assets != "none":
+                            if ensure_assets == "full" and used_mode in {"full", "tiles", "scroll"}:
+                                assets_stats, wait_error = await self._warm_assets_full(
+                                    agent.page,
+                                    max_screens=max_screens_effective,
+                                    wait_ms=wait_ms,
+                                )
+                                if wait_error and assets_wait_error is None:
+                                    assets_wait_error = wait_error
+                                await agent.page.evaluate("() => window.scrollTo(0, 0)")
+                                assets_stats, wait_error = await self._wait_for_viewport_assets(
+                                    agent.page, timeout_ms=1500
+                                )
+                                if wait_error and assets_wait_error is None:
+                                    assets_wait_error = wait_error
+                            else:
+                                assets_stats, wait_error = await self._wait_for_viewport_assets(
+                                    agent.page, timeout_ms=1500
+                                )
+                                if wait_error and assets_wait_error is None:
+                                    assets_wait_error = wait_error
                         if selector:
+                            selector_used = True
                             shot = await agent.page.locator(selector).screenshot(
                                 **screenshot_kwargs
                             )
-                        else:
+                        elif used_mode == "viewport":
+                            shot = await agent.page.screenshot(**screenshot_kwargs)
+                        elif used_mode == "full":
                             shot = await agent.page.screenshot(
-                                full_page=full_page,
+                                full_page=True,
                                 **screenshot_kwargs,
                             )
+                        elif used_mode == "scroll":
+                            await agent.page.evaluate("() => window.scrollTo(0, 0)")
+                            if wait_ms:
+                                await agent.page.wait_for_timeout(wait_ms)
+                            shots: list[bytes] = []
+                            last_y = -1
+                            for idx in range(max_screens_effective):
+                                scroll_state = await agent.page.evaluate(
+                                    """
+                                    () => {
+                                      const scroller = document.scrollingElement || document.documentElement || document.body;
+                                      return {
+                                        scroll_height: Math.max(scroller ? scroller.scrollHeight : 0, document.body ? document.body.scrollHeight : 0),
+                                        viewport_height: window.innerHeight || 0,
+                                        scroll_y: window.scrollY || 0,
+                                      };
+                                    }
+                                    """
+                                )
+                                scroll_height = max(
+                                    page_height_px,
+                                    int(scroll_state.get("scroll_height") or 0),
+                                )
+                                viewport_height = max(
+                                    viewport_height_px,
+                                    int(scroll_state.get("viewport_height") or 0),
+                                )
+                                step = max(1, viewport_height - overlap_px)
+                                estimated_total_screens = max(
+                                    estimated_total_screens,
+                                    max(1, int((scroll_height - 1) / step) + 1),
+                                )
+                                if idx == 0:
+                                    target_y = 0
+                                else:
+                                    target_y = min(
+                                        last_y + step,
+                                        max(0, scroll_height - viewport_height),
+                                    )
+                                if idx > 0 and target_y == last_y:
+                                    break
+                                await agent.page.evaluate("y => window.scrollTo(0, y)", target_y)
+                                if wait_ms:
+                                    await agent.page.wait_for_timeout(wait_ms)
+                                if ensure_assets != "none":
+                                    assets_stats, wait_error = await self._wait_for_viewport_assets(
+                                        agent.page, timeout_ms=1500
+                                    )
+                                    if wait_error and assets_wait_error is None:
+                                        assets_wait_error = wait_error
+                                shots.append(
+                                    await agent.page.screenshot(**screenshot_kwargs)
+                                )
+                                last_y = target_y
+                                if idx == max_screens_effective - 1:
+                                    if target_y < max(0, scroll_height - viewport_height):
+                                        truncated = True
+                            tile_count = len(shots)
+                            if stitch:
+                                shot = self._stitch_vertical_images(
+                                    shots,
+                                    overlap_px=overlap_px,
+                                    fmt=fmt,
+                                    quality=screenshot_kwargs.get("quality", 85),
+                                )
+                            else:
+                                shot_parts = shots
+                        elif used_mode == "tiles":
+                            try:
+                                cdp = await agent.page.context.new_cdp_session(agent.page)
+                                layout = await cdp.send("Page.getLayoutMetrics")
+                                content_size = layout.get("contentSize") or {}
+                                content_height = int(content_size.get("height") or page_height_px)
+                                content_width = int(content_size.get("width") or 0)
+                                if content_width <= 0 or content_height <= 0:
+                                    used_mode = "full"
+                                    shot = await agent.page.screenshot(
+                                        full_page=True,
+                                        **screenshot_kwargs,
+                                    )
+                                else:
+                                    step = max(1, tile_height_px - overlap_px)
+                                    total_tiles = max(1, int((content_height - 1) / step) + 1)
+                                    estimated_total_tiles = total_tiles
+                                    if total_tiles > max_screens_effective:
+                                        truncated = True
+                                    total_tiles = min(total_tiles, max_screens_effective)
+                                    shots = []
+                                    for idx in range(total_tiles):
+                                        y = min(idx * step, max(0, content_height - tile_height_px))
+                                        clip_height = min(tile_height_px, content_height - y)
+                                        params: dict[str, Any] = {
+                                            "format": fmt,
+                                            "clip": {
+                                                "x": 0,
+                                                "y": y,
+                                                "width": content_width,
+                                                "height": clip_height,
+                                                "scale": 1,
+                                            },
+                                            "captureBeyondViewport": True,
+                                        }
+                                        if fmt == "jpeg":
+                                            params["quality"] = screenshot_kwargs.get("quality", 85)
+                                        result = await cdp.send("Page.captureScreenshot", params)
+                                        shots.append(base64.b64decode(result.get("data", "")))
+                                    tile_count = len(shots)
+                                    if stitch:
+                                        shot = self._stitch_vertical_images(
+                                            shots,
+                                            overlap_px=overlap_px,
+                                            fmt=fmt,
+                                            quality=screenshot_kwargs.get("quality", 85),
+                                        )
+                                    else:
+                                        shot_parts = shots
+                            except Exception:
+                                used_mode = "full"
+                                shot = await agent.page.screenshot(
+                                    full_page=True,
+                                    **screenshot_kwargs,
+                                )
+                        else:
+                            shot = await agent.page.screenshot(**screenshot_kwargs)
                     except Exception as exc:
                         return {
                             "ok": False,
@@ -6622,32 +7118,89 @@ class Ask(commands.Cog):
                             "reason": f"{type(exc).__name__}: {exc}",
                             "observation": (await agent.observe()).to_dict(),
                         }
+                    finally:
+                        if style_handle is not None:
+                            with contextlib.suppress(Exception):
+                                await style_handle.evaluate("node => node.remove()")
 
-                    data, out_ext = self._compress_browser_screenshot(shot, fmt)
+                    files: list[discord.File] = []
+                    if shot_parts and not stitch:
+                        max_attachments = 10
+                        if len(shot_parts) > max_attachments:
+                            shot_parts = shot_parts[:max_attachments]
+                            truncated = True
 
-                    if out_ext == "jpg" and not filename.lower().endswith((".jpg", ".jpeg")):
-                        filename = "browser_screenshot.jpg"
-                    if out_ext == "png" and not filename.lower().endswith(".png"):
-                        filename = "browser_screenshot.png"
+                        def _part_filename(base_name: str, index: int, out_ext: str) -> str:
+                            base = Path(base_name)
+                            return f"{base.stem}_part{index:02d}.{out_ext}"
+
+                        for idx, part in enumerate(shot_parts, start=1):
+                            data, out_ext = self._compress_browser_screenshot(part, fmt)
+                            files.append(
+                                discord.File(
+                                    fp=BytesIO(data),
+                                    filename=_part_filename(filename, idx, out_ext),
+                                )
+                            )
+                    else:
+                        data, out_ext = self._compress_browser_screenshot(shot, fmt)
+
+                        if out_ext == "jpg" and not filename.lower().endswith((".jpg", ".jpeg")):
+                            filename = "browser_screenshot.jpg"
+                        if out_ext == "png" and not filename.lower().endswith(".png"):
+                            filename = "browser_screenshot.png"
+
+                        files.append(discord.File(fp=BytesIO(data), filename=filename))
 
                     msg = await self._reply(
                         ctx,
                         content="📸 Browser screenshot",
-                        files=[discord.File(fp=BytesIO(data), filename=filename)],
+                        files=files,
                     )
                     attachment_url = ""
+                    attachment_urls: list[str] = []
                     message_url = ""
                     if msg is not None:
                         message_url = getattr(msg, "jump_url", "") or ""
                         attachments = getattr(msg, "attachments", None)
                         if attachments:
-                            with contextlib.suppress(Exception):
-                                attachment_url = attachments[0].url
+                            for attachment in attachments:
+                                url = getattr(attachment, "url", "") or ""
+                                if url:
+                                    attachment_urls.append(url)
+                            if attachment_urls:
+                                attachment_url = attachment_urls[0]
                     return {
                         "ok": True,
                         "sent": bool(attachment_url or message_url),
                         "attachment_url": attachment_url,
+                        "attachment_urls": attachment_urls,
                         "message_url": message_url,
+                        "capture": {
+                            "requested_mode": requested_mode,
+                            "used_mode": used_mode,
+                            "ensure_assets": ensure_assets,
+                            "stitch": stitch,
+                            "selector_used": selector_used,
+                            "freeze_injected": freeze_injected,
+                            "assets_wait_error": assets_wait_error,
+                            "assets_total_viewport": int(assets_stats.get("total", 0)),
+                            "assets_loaded_viewport": int(assets_stats.get("loaded", 0)),
+                            "assets_failed_viewport": int(assets_stats.get("failed", 0)),
+                            "suspected_virtual_scroll": suspected_virtual_scroll,
+                            "page_height_px": int(page_height_px),
+                            "viewport_height_px": int(viewport_height_px),
+                            "tiled": used_mode in {"tiles", "scroll"},
+                            "tile_count": tile_count if used_mode in {"tiles", "scroll"} else 1,
+                            "estimated_total_tiles": (
+                                estimated_total_tiles if used_mode == "tiles" else 1
+                            ),
+                            "estimated_total_screens": (
+                                estimated_total_screens if used_mode == "scroll" else 1
+                            ),
+                            "truncated": truncated,
+                            "attachment_count": len(files),
+                        },
                         "observation": (await agent.observe()).to_dict(),
                     }
                 if action_type == "screenshot_marked":
