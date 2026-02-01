@@ -53,9 +53,13 @@ DEFAULT_USER_AGENT = (
 )
 DEFAULT_AUDIO_EXTS = ("m4a", "mp4", "webm", "opus", "ogg")
 DEFAULT_COOKIES_AUTO_BROWSER = "chrome"
+DEFAULT_COOKIES_PATH = Path(__file__).resolve().parents[1] / "cookie" / "cookies.txt"
 
 ERROR_PATTERNS: dict[str, re.Pattern[str]] = {
-    "unsupported_url": re.compile(r"(unsupported\s+url|no\s+video\s+formats)", re.I),
+    "unsupported_url": re.compile(
+        r"(unsupported\s+url|no\s+video\s+formats|mp4[-\s]?compatible\s+formats)",
+        re.I,
+    ),
     "forbidden": re.compile(r"(403|forbidden|access\s+denied)", re.I),
     "rate_limited": re.compile(r"(429|rate\s*limit|too\s+many\s+requests)", re.I),
     "private": re.compile(r"(private|unavailable|not\s+available|deleted)", re.I),
@@ -88,6 +92,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _default_cookie_file() -> str | None:
+    if DEFAULT_COOKIES_PATH.exists():
+        return str(DEFAULT_COOKIES_PATH)
+    return None
 
 
 def _strip_ansi(text: str) -> str:
@@ -412,12 +422,12 @@ class SaveConfig:
             work_root=Path(os.getenv("SAVEVIDEO_WORK_DIR", DEFAULT_WORK_ROOT)),
             dns_timeout_s=_env_int("SAVEVIDEO_DNS_TIMEOUT_S", DEFAULT_DNS_TIMEOUT_S),
             user_agent=os.getenv("SAVEVIDEO_USER_AGENT", DEFAULT_USER_AGENT),
-            cookies_file=_env_str("SAVEVIDEO_COOKIES_FILE"),
+            cookies_file=_env_str("SAVEVIDEO_COOKIES_FILE") or _default_cookie_file(),
             cookies_from_browser=_parse_cookies_from_browser(
                 _env_str("SAVEVIDEO_COOKIES_FROM_BROWSER")
             ),
             impersonate=_env_str("SAVEVIDEO_IMPERSONATE"),
-            cookies_auto=_env_bool("SAVEVIDEO_COOKIES_AUTO", True),
+            cookies_auto=False,
             cookies_auto_browser=_env_str("SAVEVIDEO_COOKIES_AUTO_BROWSER")
             or DEFAULT_COOKIES_AUTO_BROWSER,
         )
@@ -812,6 +822,13 @@ def _estimate_format_size(fmt: dict[str, Any], duration_s: float | None) -> int 
     return None
 
 
+def _is_mp4_video(fmt: dict[str, Any]) -> bool:
+    if (fmt.get("vcodec") or "none") == "none":
+        return False
+    ext = (fmt.get("ext") or "").lower()
+    return ext in {"mp4", "m4v"}
+
+
 def _is_mp4_h264ish_video(fmt: dict[str, Any]) -> bool:
     if (fmt.get("vcodec") or "none") == "none":
         return False
@@ -849,6 +866,7 @@ def _iter_mp4_candidates(
     *,
     max_bytes: int,
     max_height: int | None,
+    allow_any_mp4: bool = False,
 ) -> Iterable[tuple[str, dict[str, Any], dict[str, Any] | None, int | None]]:
     """Yield candidates as (format_spec, vfmt, afmt, est_size).
 
@@ -880,6 +898,10 @@ def _iter_mp4_candidates(
             videos.append(f)
         elif _is_m4a_aacish_audio(f):
             audios.append(f)
+        elif allow_any_mp4 and _is_mp4_video(f) and (f.get("acodec") or "none") != "none":
+            muxed.append(f)
+        elif allow_any_mp4 and _is_mp4_video(f):
+            videos.append(f)
 
     # Apply max_height filter.
     if max_height is not None:
@@ -978,25 +1000,40 @@ def _pick_best_formats(
 
     safety = int(max_bytes * 0.97)
 
-    in_limit: list[tuple[str, dict[str, Any], dict[str, Any] | None, int | None]] = []
-    unknown: list[tuple[str, dict[str, Any], dict[str, Any] | None, int | None]] = []
+    def _collect_candidates(allow_any_mp4: bool) -> list[
+        tuple[str, dict[str, Any], dict[str, Any] | None, int | None]
+    ]:
+        in_limit: list[tuple[str, dict[str, Any], dict[str, Any] | None, int | None]] = []
+        unknown: list[tuple[str, dict[str, Any], dict[str, Any] | None, int | None]] = []
+        seen: set[str] = set()
+        for spec, vfmt, afmt, est in _iter_mp4_candidates(
+            info, max_bytes=max_bytes, max_height=max_height, allow_any_mp4=allow_any_mp4
+        ):
+            if spec in seen:
+                continue
+            seen.add(spec)
+            if isinstance(est, int):
+                if est <= safety:
+                    in_limit.append((spec, vfmt, afmt, est))
+            else:
+                unknown.append((spec, vfmt, afmt, est))
 
-    seen: set[str] = set()
-    for spec, vfmt, afmt, est in _iter_mp4_candidates(info, max_bytes=max_bytes, max_height=max_height):
-        if spec in seen:
-            continue
-        seen.add(spec)
-        if isinstance(est, int):
-            if est <= safety:
-                in_limit.append((spec, vfmt, afmt, est))
-        else:
-            unknown.append((spec, vfmt, afmt, est))
+        in_limit.sort(
+            key=lambda t: _rank_candidate(t[1], t[2], t[3], audio_focus=audio_focus),
+            reverse=True,
+        )
+        unknown.sort(
+            key=lambda t: _rank_candidate(t[1], t[2], t[3], audio_focus=audio_focus),
+            reverse=True,
+        )
 
-    in_limit.sort(key=lambda t: _rank_candidate(t[1], t[2], t[3], audio_focus=audio_focus), reverse=True)
-    unknown.sort(key=lambda t: _rank_candidate(t[1], t[2], t[3], audio_focus=audio_focus), reverse=True)
+        # Try known-good candidates first, then unknown.
+        return in_limit + unknown
 
-    # Try known-good candidates first, then unknown.
-    return in_limit + unknown
+    primary = _collect_candidates(False)
+    if primary:
+        return primary
+    return _collect_candidates(True)
 
 
 def _iter_audio_candidates(
@@ -1293,16 +1330,29 @@ class Save(commands.Cog):
                 impersonate = "chrome"
             cookies_file = self.cfg.cookies_file
             cookies_from_browser = self.cfg.cookies_from_browser
-            auto_cookie_allowed = (
+            auto_cookie_eligible = (
                 self.cfg.cookies_auto
                 and not cookies_file
                 and not cookies_from_browser
                 and (host.endswith("x.com") or host.endswith("twitter.com") or "tiktok.com" in host)
             )
-            if auto_cookie_allowed and _browser_cookie_db_exists(self.cfg.cookies_auto_browser):
+            cookie_db_exists = (
+                _browser_cookie_db_exists(self.cfg.cookies_auto_browser)
+                if auto_cookie_eligible
+                else False
+            )
+            auto_cookie_active = auto_cookie_eligible and cookie_db_exists
+            if auto_cookie_active:
                 cookies_from_browser = (self.cfg.cookies_auto_browser,)
-            else:
-                auto_cookie_allowed = False
+            log.info(
+                "save cookies config: file=%s from_browser=%s auto=%s auto_browser=%s db_exists=%s active=%s",
+                cookies_file or "-",
+                cookies_from_browser or "-",
+                self.cfg.cookies_auto,
+                self.cfg.cookies_auto_browser,
+                cookie_db_exists,
+                auto_cookie_active,
+            )
             used_generic_extractor = False
 
             progress_title = "⏳ Downloading audio..." if audio_only else "⏳ Downloading video..."
@@ -1353,7 +1403,7 @@ class Save(commands.Cog):
                                 if kind == "unknown" and tail:
                                     kind = _classify_error(tail)
 
-                                if auto_cookie_allowed and cookies_from_browser is None and kind in {
+                                if auto_cookie_active and cookies_from_browser is None and kind in {
                                     "login_required",
                                     "forbidden",
                                     "rate_limited",
@@ -1487,7 +1537,7 @@ class Save(commands.Cog):
                             "tiktok.com" in host or host.endswith("x.com") or host.endswith("twitter.com")
                         ):
                             impersonate = "chrome"
-                        if auto_cookie_allowed:
+                        if auto_cookie_active:
                             cookies_from_browser = (self.cfg.cookies_auto_browser,)
                         else:
                             cookies_from_browser = self.cfg.cookies_from_browser
@@ -1705,7 +1755,8 @@ class Save(commands.Cog):
         host = urlparse(url).hostname or ""
         cookies_hint = ""
         if (
-            not self.cfg.cookies_file
+            kind in {"unknown", "login_required", "forbidden", "rate_limited", "private"}
+            and not self.cfg.cookies_file
             and not self.cfg.cookies_from_browser
             and (host.endswith("x.com") or host.endswith("twitter.com") or "tiktok.com" in host)
         ):

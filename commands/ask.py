@@ -132,6 +132,8 @@ DENY_BASENAMES = {
     "secrets.yml",
     "secrets.env",
     "secrets.txt",
+    "cookies.json",
+    "cookies.txt",
     "private.key",
     "private.pem",
 }
