@@ -52,12 +52,30 @@ DEFAULT_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 DEFAULT_AUDIO_EXTS = ("m4a", "mp4", "webm", "opus", "ogg")
+DEFAULT_VIDEO_EXTS = ("mp4", "m4v")
+SUPPORTED_AUDIO_FORMATS = ("wav", "mp3", "flac", "m4a", "opus", "ogg")
+SUPPORTED_AUDIO_CODECS = {
+    "wav": "wav",
+    "mp3": "mp3",
+    "flac": "flac",
+    "m4a": "m4a",
+    "opus": "opus",
+    "ogg": "vorbis",
+}
+SUPPORTED_AUDIO_EXTS = {
+    "wav": ("wav",),
+    "mp3": ("mp3",),
+    "flac": ("flac",),
+    "m4a": ("m4a", "mp4"),
+    "opus": ("opus", "ogg"),
+    "ogg": ("ogg",),
+}
 DEFAULT_COOKIES_AUTO_BROWSER = "chrome"
 DEFAULT_COOKIES_PATH = Path(__file__).resolve().parents[1] / "cookie" / "cookies.txt"
 
 ERROR_PATTERNS: dict[str, re.Pattern[str]] = {
     "unsupported_url": re.compile(
-        r"(unsupported\s+url|no\s+video\s+formats|mp4[-\s]?compatible\s+formats)",
+        r"(unsupported\s+url|no\s+video\s+formats|no\s+compatible\s+formats|mp4[-\s]?compatible\s+formats)",
         re.I,
     ),
     "forbidden": re.compile(r"(403|forbidden|access\s+denied)", re.I),
@@ -104,6 +122,27 @@ def _strip_ansi(text: str) -> str:
     if not text:
         return text
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def _normalize_audio_format(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized not in SUPPORTED_AUDIO_FORMATS:
+        raise ValueError("Unsupported audio format.")
+    return normalized
+
+
+def _safe_filename(value: str, *, max_len: int = 120) -> str:
+    cleaned = re.sub(r"[^\w\s\-]+", "_", value, flags=re.UNICODE).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        cleaned = "download"
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip()
+    return cleaned
 
 
 def _parse_cookies_from_browser(
@@ -279,6 +318,8 @@ def _parse_save_cli_args(
     default_audio_only: bool,
     default_audio_focus: bool,
     default_item: int,
+    default_force_url: bool,
+    default_audio_format: str | None,
 ) -> tuple[SaveRequest | None, str | None]:
     try:
         tokens = shlex.split(raw)
@@ -290,6 +331,8 @@ def _parse_save_cli_args(
     audio_only = default_audio_only
     audio_focus = default_audio_focus
     item = default_item
+    force_url = default_force_url
+    audio_format = default_audio_format
     unknown: list[str] = []
 
     idx = 0
@@ -312,6 +355,11 @@ def _parse_save_cli_args(
                 audio_only = True if value is None else str(value).lower() not in {"0", "false", "no"}
             elif name in {"audio-focus", "audio-priority", "audio-quality"}:
                 audio_focus = True if value is None else str(value).lower() not in {"0", "false", "no"}
+            elif name in {"wav", "mp3", "flac", "m4a", "opus", "ogg"}:
+                if audio_format and audio_format != name:
+                    return None, "Only one audio format flag can be set."
+                audio_only = True
+                audio_format = name
             elif name in {"max-height", "height", "resolution"}:
                 raw_value = _consume_value()
                 if raw_value is None:
@@ -332,6 +380,12 @@ def _parse_save_cli_args(
                     return None, "Item index must be a number."
                 if item <= 0:
                     return None, "Item index must be 1 or higher."
+            elif name in {"url", "link", "external"}:
+                force_url = True if value is None else str(value).lower() not in {
+                    "0",
+                    "false",
+                    "no",
+                }
             else:
                 unknown.append(token)
         else:
@@ -346,6 +400,8 @@ def _parse_save_cli_args(
 
     if not url:
         return None, "Provide a video URL to save."
+    if audio_format and not audio_only:
+        return None, "Audio format flags require --audio."
 
     return SaveRequest(
         url=url,
@@ -353,6 +409,8 @@ def _parse_save_cli_args(
         audio_only=audio_only,
         audio_focus=audio_focus,
         item=item,
+        force_url=force_url,
+        audio_format=audio_format,
     ), None
 
 
@@ -440,6 +498,8 @@ class SaveRequest:
     audio_only: bool
     audio_focus: bool
     item: int
+    force_url: bool
+    audio_format: str | None
 
 
 def _human_size(value: int) -> str:
@@ -845,6 +905,26 @@ def _is_mp4_h264ish_video(fmt: dict[str, Any]) -> bool:
     )
 
 
+def _is_hls_video(fmt: dict[str, Any]) -> bool:
+    vcodec = (fmt.get("vcodec") or "none").lower()
+    if vcodec == "none":
+        return False
+    ext = (fmt.get("ext") or "").lower()
+    protocol = (fmt.get("protocol") or "").lower()
+    # ts を雑に拾うと関係ない ts を掴む可能性があるので、m3u8 系に寄せる
+    return ext == "m3u8" or protocol.startswith("m3u8")
+
+
+def _is_hls_audio(fmt: dict[str, Any]) -> bool:
+    if (fmt.get("vcodec") or "none").lower() != "none":
+        return False
+    if (fmt.get("acodec") or "none").lower() == "none":
+        return False
+    ext = (fmt.get("ext") or "").lower()
+    protocol = (fmt.get("protocol") or "").lower()
+    return ext == "m3u8" or protocol.startswith("m3u8")
+
+
 def _is_m4a_aacish_audio(fmt: dict[str, Any]) -> bool:
     if (fmt.get("acodec") or "none") == "none":
         return False
@@ -867,6 +947,7 @@ def _iter_mp4_candidates(
     max_bytes: int,
     max_height: int | None,
     allow_any_mp4: bool = False,
+    allow_hls_fallback: bool = False,
 ) -> Iterable[tuple[str, dict[str, Any], dict[str, Any] | None, int | None]]:
     """Yield candidates as (format_spec, vfmt, afmt, est_size).
 
@@ -897,6 +978,13 @@ def _iter_mp4_candidates(
         elif _is_mp4_h264ish_video(f):
             videos.append(f)
         elif _is_m4a_aacish_audio(f):
+            audios.append(f)
+        elif allow_hls_fallback and _is_hls_video(f):
+            if (f.get("acodec") or "none") != "none":
+                muxed.append(f)
+            else:
+                videos.append(f)
+        elif allow_hls_fallback and _is_hls_audio(f):
             audios.append(f)
         elif allow_any_mp4 and _is_mp4_video(f) and (f.get("acodec") or "none") != "none":
             muxed.append(f)
@@ -1000,14 +1088,18 @@ def _pick_best_formats(
 
     safety = int(max_bytes * 0.97)
 
-    def _collect_candidates(allow_any_mp4: bool) -> list[
+    def _collect_candidates(allow_any_mp4: bool, allow_hls_fallback: bool) -> list[
         tuple[str, dict[str, Any], dict[str, Any] | None, int | None]
     ]:
         in_limit: list[tuple[str, dict[str, Any], dict[str, Any] | None, int | None]] = []
         unknown: list[tuple[str, dict[str, Any], dict[str, Any] | None, int | None]] = []
         seen: set[str] = set()
         for spec, vfmt, afmt, est in _iter_mp4_candidates(
-            info, max_bytes=max_bytes, max_height=max_height, allow_any_mp4=allow_any_mp4
+            info,
+            max_bytes=max_bytes,
+            max_height=max_height,
+            allow_any_mp4=allow_any_mp4,
+            allow_hls_fallback=allow_hls_fallback,
         ):
             if spec in seen:
                 continue
@@ -1030,10 +1122,13 @@ def _pick_best_formats(
         # Try known-good candidates first, then unknown.
         return in_limit + unknown
 
-    primary = _collect_candidates(False)
+    primary = _collect_candidates(False, False)
     if primary:
         return primary
-    return _collect_candidates(True)
+    secondary = _collect_candidates(True, False)
+    if secondary:
+        return secondary
+    return _collect_candidates(True, True)
 
 
 def _iter_audio_candidates(
@@ -1185,13 +1280,16 @@ class Save(commands.Cog):
             "and attach it to Discord. The bot auto-selects an mp4-compatible format "
             "and can honor a max-height cap you provide.\n\n"
             "**Usage**: `/save <url>`\n"
-            "**Optional**: `/save <url> max_height:<int> audio_only:<bool> audio_focus:<bool> item:<int>`\n"
-            "**Prefix flags**: `--audio`, `--audio-focus`, `--max-height 720`, `--item 2`\n\n"
+            "**Optional**: `/save <url> max_height:<int> audio_only:<bool> audio_focus:<bool> item:<int> "
+            "force_url:<bool> audio_format:<str>`\n"
+            "**Prefix flags**: `--audio`, `--audio-focus`, `--max-height 720`, `--item 2`, `--url`, "
+            "`--wav`, `--mp3`, `--flac`, `--m4a`, `--opus`, `--ogg`\n\n"
             "Env knobs: SAVEVIDEO_MAX_BYTES, SAVEVIDEO_TIMEOUT_S, SAVEVIDEO_MAX_CONCURRENT, "
             "SAVEVIDEO_LOG_TAIL_LINES, SAVEVIDEO_WORK_DIR, SAVEVIDEO_DNS_TIMEOUT_S, "
             "SAVEVIDEO_USER_AGENT, SAVEVIDEO_COOKIES_FILE, SAVEVIDEO_COOKIES_FROM_BROWSER, "
             "SAVEVIDEO_COOKIES_AUTO, SAVEVIDEO_COOKIES_AUTO_BROWSER, SAVEVIDEO_IMPERSONATE\n\n"
-            f"Prefix: `{BOT_PREFIX}save <url> [--audio] [--audio-focus] [--max-height <h>] [--item <n>]`"
+            f"Prefix: `{BOT_PREFIX}save <url> [--audio] [--audio-focus] [--max-height <h>] "
+            f"[--item <n>] [--url] [--wav|--mp3|--flac|--m4a|--opus|--ogg]`"
         ),
         extras={
             "category": "Tools",
@@ -1202,7 +1300,7 @@ class Save(commands.Cog):
             "destination": "Download a public video or audio-only URL and attach it to Discord.",
             "plus": (
                 "Supports audio-only mode, audio-focused ranking, max-height caps, and item "
-                "selection for carousel/playlist-style URLs."
+                "selection for carousel/playlist-style URLs. Use --url to return a download link."
             ),
         },
     )
@@ -1213,6 +1311,8 @@ class Save(commands.Cog):
             default_audio_only=False,
             default_audio_focus=False,
             default_item=1,
+            default_force_url=False,
+            default_audio_format=None,
         )
         if error:
             await safe_reply(
@@ -1242,6 +1342,8 @@ class Save(commands.Cog):
         audio_only="Download audio-only instead of video.",
         audio_focus="Prefer higher audio bitrate when picking formats.",
         item="Select which item to download from a carousel/playlist-like URL.",
+        force_url="Always return a download link instead of uploading to Discord.",
+        audio_format="Audio format for audio-only (wav, mp3, flac, m4a, opus, ogg).",
     )
     async def save_slash(
         self,
@@ -1251,6 +1353,8 @@ class Save(commands.Cog):
         audio_only: bool = False,
         audio_focus: bool = False,
         item: int = 1,
+        force_url: bool = False,
+        audio_format: str | None = None,
     ) -> None:
         ctx_factory = getattr(commands.Context, "from_interaction", None)
         if ctx_factory is None:
@@ -1260,6 +1364,29 @@ class Save(commands.Cog):
             return
         ctx_candidate = ctx_factory(interaction)
         ctx = await ctx_candidate if inspect.isawaitable(ctx_candidate) else ctx_candidate
+        try:
+            normalized_audio_format = _normalize_audio_format(audio_format)
+        except ValueError:
+            await safe_reply(
+                ctx,
+                embed=error_embed(
+                    desc=(
+                        "Unsupported audio format. Choose from: "
+                        f"{', '.join(SUPPORTED_AUDIO_FORMATS)}."
+                    )
+                ),
+                mention_author=False,
+                ephemeral=True,
+            )
+            return
+        if normalized_audio_format and not audio_only:
+            await safe_reply(
+                ctx,
+                embed=error_embed(desc="Audio format options require audio-only mode."),
+                mention_author=False,
+                ephemeral=True,
+            )
+            return
         await self._save_impl(
             ctx,
             SaveRequest(
@@ -1268,6 +1395,8 @@ class Save(commands.Cog):
                 audio_only=audio_only,
                 audio_focus=audio_focus,
                 item=item,
+                force_url=force_url,
+                audio_format=normalized_audio_format,
             ),
         )
 
@@ -1277,11 +1406,21 @@ class Save(commands.Cog):
         audio_only = request.audio_only
         audio_focus = request.audio_focus
         item = request.item
+        force_url = request.force_url
+        audio_format = request.audio_format
 
         if not url:
             await safe_reply(
                 ctx,
                 embed=error_embed(desc="Provide a video URL to save."),
+                mention_author=False,
+                ephemeral=True,
+            )
+            return
+        if audio_format and not audio_only:
+            await safe_reply(
+                ctx,
+                embed=error_embed(desc="Audio format options require audio-only mode."),
                 mention_author=False,
                 ephemeral=True,
             )
@@ -1567,7 +1706,7 @@ class Save(commands.Cog):
                             audio_focus=audio_focus,
                         )
                         if not candidates:
-                            raise RuntimeError("No mp4-compatible formats found")
+                            raise RuntimeError("No compatible formats found")
 
                     last_error: Exception | None = None
                     download_info: dict[str, Any] | None = None
@@ -1577,6 +1716,19 @@ class Save(commands.Cog):
 
                     # Try a few best candidates first.
                     if audio_only:
+                        audio_prefer_exts = DEFAULT_AUDIO_EXTS
+                        audio_extra_opts = dict(probe_extra_opts or {})
+                        if audio_format:
+                            codec = SUPPORTED_AUDIO_CODECS.get(audio_format)
+                            if codec:
+                                postprocessors = list(audio_extra_opts.get("postprocessors") or [])
+                                postprocessors.append(
+                                    {"key": "FFmpegExtractAudio", "preferredcodec": codec}
+                                )
+                                audio_extra_opts["postprocessors"] = postprocessors
+                                audio_prefer_exts = SUPPORTED_AUDIO_EXTS.get(
+                                    audio_format, (audio_format,)
+                                )
                         for spec, _fmt, est in candidates[:8]:
                             try:
                                 chosen_spec = spec
@@ -1594,8 +1746,8 @@ class Save(commands.Cog):
                                         cookies_from_browser=cookies_from_browser,
                                         socket_timeout=max(10, int(self.cfg.timeout_s)),
                                         impersonate=impersonate,
-                                        prefer_exts=DEFAULT_AUDIO_EXTS,
-                                        extra_opts=probe_extra_opts,
+                                        prefer_exts=audio_prefer_exts,
+                                        extra_opts=audio_extra_opts or None,
                                     ),
                                     timeout=float(self.cfg.timeout_s),
                                 )
@@ -1621,6 +1773,7 @@ class Save(commands.Cog):
                                         cookies_from_browser=cookies_from_browser,
                                         socket_timeout=max(10, int(self.cfg.timeout_s)),
                                         impersonate=impersonate,
+                                        prefer_exts=DEFAULT_VIDEO_EXTS,
                                         extra_opts=probe_extra_opts,
                                     ),
                                     timeout=float(self.cfg.timeout_s),
@@ -1661,7 +1814,6 @@ class Save(commands.Cog):
                         embed.add_field(name="Format", value=chosen_spec, inline=False)
                     if chosen_est is not None:
                         embed.add_field(name="Est. size", value=_human_size(chosen_est), inline=True)
-                    embed.add_field(name="Discord limit", value=_human_size(max_upload_bytes), inline=True)
 
                     if audio_only:
                         abr = download_info.get("abr") or download_info.get("tbr")
@@ -1669,14 +1821,21 @@ class Save(commands.Cog):
                             embed.add_field(name="Bitrate", value=f"{abr:.0f}kbps", inline=True)
 
                     ext = download_path.suffix or ".mp4"
-                    filename = f"audio{ext}" if audio_only else f"video{ext}"
-                    if file_size > max_upload_bytes or file_size > DEFAULT_EXTERNAL_LINK_LIMIT_BYTES:
+                    base_name = _safe_filename(title)
+                    filename = f"{base_name}{ext}"
+                    if (
+                        force_url
+                        or file_size > max_upload_bytes
+                        or file_size > DEFAULT_EXTERNAL_LINK_LIMIT_BYTES
+                    ):
                         link = await self._create_external_download_link(
                             ctx,
                             download_path,
                             filename=filename,
                         )
                         if not link:
+                            if force_url:
+                                raise RuntimeError("Failed to create an external download link")
                             raise RuntimeError("max-filesize: exceeds Discord upload limit")
                         embed.add_field(
                             name="Download link (30 min)",

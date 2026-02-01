@@ -108,15 +108,10 @@ def _load_cookie_json(path: Path) -> list[dict[str, Any]]:
 def _ensure_cookies_txt() -> Path | None:
     if COOKIE_JSON_PATH.exists():
         try:
-            rebuild = (
-                not COOKIE_TXT_PATH.exists()
-                or COOKIE_JSON_PATH.stat().st_mtime > COOKIE_TXT_PATH.stat().st_mtime
-            )
-            if rebuild:
-                cookies = _load_cookie_json(COOKIE_JSON_PATH)
-                COOKIE_DIR.mkdir(parents=True, exist_ok=True)
-                COOKIE_TXT_PATH.write_text(_convert_cookie_json(cookies), encoding="utf-8")
-                log.info("Wrote %s (%d cookies)", COOKIE_TXT_PATH, len(cookies))
+            cookies = _load_cookie_json(COOKIE_JSON_PATH)
+            COOKIE_DIR.mkdir(parents=True, exist_ok=True)
+            COOKIE_TXT_PATH.write_text(_convert_cookie_json(cookies), encoding="utf-8")
+            log.info("Wrote %s (%d cookies)", COOKIE_TXT_PATH, len(cookies))
         except Exception:
             log.exception("Failed to build cookies.txt from %s", COOKIE_JSON_PATH)
 
