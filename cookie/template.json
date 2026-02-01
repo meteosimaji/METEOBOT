@@ -1,0 +1,18 @@
+{
+  "x": [
+    {
+      "domain": ".example.com",
+      "expirationDate": 1893456000,
+      "hostOnly": false,
+      "httpOnly": true,
+      "name": "sessionid",
+      "path": "/",
+      "sameSite": "no_restriction",
+      "secure": true,
+      "session": false,
+      "storeId": null,
+      "value": "REPLACE_WITH_VALUE"
+    }
+  ],
+  "tiktok": []
+}
