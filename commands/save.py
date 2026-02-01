@@ -443,6 +443,31 @@ def _cap_error_message(text: str, max_len: int) -> str:
     return _truncate_text(text, max_len)
 
 
+def _normalize_impersonate_opt(value: object, logger: "YTDLLogger") -> object | None:
+    """Normalize yt-dlp 'impersonate' option for Python API compatibility."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            from yt_dlp.networking.impersonate import ImpersonateTarget  # type: ignore
+        except Exception:
+            return raw
+        try:
+            import curl_cffi  # type: ignore  # noqa: F401
+        except Exception as exc:
+            logger.debug("impersonate disabled (curl-cffi missing): %r", exc)
+            return None
+        try:
+            return ImpersonateTarget.from_str(raw.lower())
+        except Exception as exc:
+            logger.debug("impersonate disabled (invalid target %r): %r", raw, exc)
+            return None
+    return value
+
+
 def _extra_headers(url: str, user_agent: str) -> dict[str, str]:
     headers = {"User-Agent": user_agent}
     host = urlparse(url).hostname or ""
@@ -660,7 +685,7 @@ def _base_ydl_opts(
     cookies_file: str | None,
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None,
     socket_timeout: int,
-    impersonate: str | None,
+    impersonate: object | None,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -684,8 +709,9 @@ def _base_ydl_opts(
     if cookies_from_browser:
         # e.g. "chrome", "firefox" (yt-dlpの仕様)
         opts["cookiesfrombrowser"] = cookies_from_browser
-    if impersonate:
-        opts["impersonate"] = impersonate
+    norm_impersonate = _normalize_impersonate_opt(impersonate, logger)
+    if norm_impersonate is not None:
+        opts["impersonate"] = norm_impersonate
     return opts
 
 
@@ -695,7 +721,7 @@ def _probe_info(
     headers: dict[str, str],
     cookies_file: str | None,
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None,
-    impersonate: str | None,
+    impersonate: object | None,
     extra_opts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
@@ -713,8 +739,9 @@ def _probe_info(
         opts["cookiefile"] = cookies_file
     if cookies_from_browser:
         opts["cookiesfrombrowser"] = cookies_from_browser
-    if impersonate:
-        opts["impersonate"] = impersonate
+    norm_impersonate = _normalize_impersonate_opt(impersonate, logger)
+    if norm_impersonate is not None:
+        opts["impersonate"] = norm_impersonate
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if not isinstance(info, dict):
@@ -998,7 +1025,7 @@ def _download_with_spec(
     cookies_file: str | None,
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None,
     socket_timeout: int,
-    impersonate: str | None,
+    impersonate: object | None,
     prefer_exts: Sequence[str] | None = None,
     extra_opts: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Path]:
@@ -1201,12 +1228,15 @@ class Save(commands.Cog):
                 and not cookies_from_browser
                 and (host.endswith("x.com") or host.endswith("twitter.com") or "tiktok.com" in host)
             )
+            if auto_cookie_allowed:
+                cookies_from_browser = (self.cfg.cookies_auto_browser,)
             used_generic_extractor = False
 
             progress_title = "⏳ Downloading audio..." if audio_only else "⏳ Downloading video..."
+            progress_link_label = "タイトル"
             progress_embed = discord.Embed(
                 title=progress_title,
-                description=f"[{url}]({url})",
+                description=f"[{progress_link_label}]({url})",
                 color=0xF1C40F,
             )
             progress_message: discord.Message | None = None
