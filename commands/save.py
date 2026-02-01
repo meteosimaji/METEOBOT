@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import html
 from html.parser import HTMLParser
+import http.cookiejar
 import inspect
 import json
 import logging
@@ -580,13 +581,36 @@ def _normalize_impersonate_opt(value: object, logger: "YTDLLogger") -> object | 
     return value
 
 
+def _log_cookie_file_status(cookies_file: str) -> None:
+    if not cookies_file:
+        return
+    path = Path(cookies_file)
+    if not path.exists():
+        log.info("save cookies file missing: %s", path)
+        return
+    try:
+        jar = http.cookiejar.MozillaCookieJar(str(path))
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except Exception as exc:
+        log.warning("save cookies file parse failed: %s (%s)", path, exc)
+        return
+    names = {cookie.name for cookie in jar}
+    log.info(
+        "save cookies file loaded: %s (cookies=%d auth_token=%s ct0=%s)",
+        path,
+        len(jar),
+        "yes" if "auth_token" in names else "no",
+        "yes" if "ct0" in names else "no",
+    )
+
+
 def _extra_headers(url: str, user_agent: str) -> dict[str, str]:
     headers = {"User-Agent": user_agent}
     host = urlparse(url).hostname or ""
     if "tiktok.com" in host:
         # cobaltもここを強めにやってる。Refererが無いと弾かれることがある。
         headers["Referer"] = "https://www.tiktok.com/"
-    if host.endswith("x.com") or host.endswith("twitter.com"):
+    if host.endswith("x.com") or host.endswith("twitter.com") or host.endswith("twimg.com"):
         headers["Referer"] = "https://x.com/"
     return headers
 
@@ -882,20 +906,38 @@ def _estimate_format_size(fmt: dict[str, Any], duration_s: float | None) -> int 
     return None
 
 
-def _is_mp4_video(fmt: dict[str, Any]) -> bool:
-    if (fmt.get("vcodec") or "none") == "none":
-        return False
+def _infer_format_ext(fmt: dict[str, Any]) -> str:
     ext = (fmt.get("ext") or "").lower()
-    return ext in {"mp4", "m4v"}
+    if ext:
+        return ext
+    url = fmt.get("url")
+    if isinstance(url, str):
+        path = urlparse(url).path
+        suffix = Path(path).suffix.lower().lstrip(".")
+        return suffix
+    return ""
+
+
+def _is_mp4_video(fmt: dict[str, Any]) -> bool:
+    ext = _infer_format_ext(fmt)
+    if ext not in {"mp4", "m4v"}:
+        return False
+    vcodec = fmt.get("vcodec")
+    if isinstance(vcodec, str) and vcodec:
+        return vcodec.lower() != "none"
+    return True
 
 
 def _is_mp4_h264ish_video(fmt: dict[str, Any]) -> bool:
-    if (fmt.get("vcodec") or "none") == "none":
+    vcodec = fmt.get("vcodec")
+    if isinstance(vcodec, str) and vcodec and vcodec.lower() == "none":
         return False
-    ext = (fmt.get("ext") or "").lower()
+    ext = _infer_format_ext(fmt)
     if ext != "mp4":
         return False
-    vcodec = (fmt.get("vcodec") or "").lower()
+    if not vcodec:
+        return True
+    vcodec = str(vcodec).lower()
     # avc1 (H.264) が最強に互換性高い。hevc (hvc1/hev1) も一応OK。
     return (
         vcodec.startswith("avc1")
@@ -930,11 +972,20 @@ def _is_m4a_aacish_audio(fmt: dict[str, Any]) -> bool:
         return False
     if (fmt.get("vcodec") or "none") != "none":
         return False
-    ext = (fmt.get("ext") or "").lower()
+    ext = _infer_format_ext(fmt)
     if ext not in {"m4a", "mp4"}:
         return False
     acodec = (fmt.get("acodec") or "").lower()
     return acodec.startswith("mp4a") or ("aac" in acodec)
+
+
+def _is_probably_muxed_mp4(fmt: dict[str, Any]) -> bool:
+    if not _is_mp4_h264ish_video(fmt):
+        return False
+    acodec = fmt.get("acodec")
+    if isinstance(acodec, str) and acodec:
+        return acodec.lower() != "none"
+    return True
 
 
 def _is_audio_only(fmt: dict[str, Any]) -> bool:
@@ -972,8 +1023,7 @@ def _iter_mp4_candidates(
         if not f.get("format_id"):
             continue
 
-        if _is_mp4_h264ish_video(f) and (f.get("acodec") or "none") != "none":
-            # muxed mp4 with audio
+        if _is_probably_muxed_mp4(f):
             muxed.append(f)
         elif _is_mp4_h264ish_video(f):
             videos.append(f)
@@ -1188,6 +1238,22 @@ def _pick_best_audio_formats(
     return in_limit + unknown
 
 
+def _pick_best_audio_fallback_formats(
+    info: dict[str, Any],
+    *,
+    max_bytes: int,
+    max_height: int | None,
+    audio_focus: bool,
+) -> list[tuple[str, dict[str, Any], int | None]]:
+    candidates = _pick_best_formats(
+        info,
+        max_bytes=max_bytes,
+        max_height=max_height,
+        audio_focus=audio_focus,
+    )
+    return [(spec, vfmt, est) for spec, vfmt, _afmt, est in candidates]
+
+
 def _download_with_spec(
     url: str,
     *,
@@ -1241,6 +1307,8 @@ class Save(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.cfg = SaveConfig.from_env()
+        if self.cfg.cookies_file:
+            _log_cookie_file_status(self.cfg.cookies_file)
         self._sem = asyncio.Semaphore(self.cfg.max_concurrent)
 
     async def _create_external_download_link(
@@ -1697,7 +1765,14 @@ class Save(commands.Cog):
                     if audio_only:
                         candidates = _pick_best_audio_formats(info, max_bytes=max_bytes)
                         if not candidates:
-                            raise RuntimeError("No audio-only formats found")
+                            candidates = _pick_best_audio_fallback_formats(
+                                info,
+                                max_bytes=max_bytes,
+                                max_height=max_height,
+                                audio_focus=audio_focus,
+                            )
+                        if not candidates:
+                            raise RuntimeError("No audio tracks found")
                     else:
                         candidates = _pick_best_formats(
                             info,
@@ -1729,6 +1804,12 @@ class Save(commands.Cog):
                                 audio_prefer_exts = SUPPORTED_AUDIO_EXTS.get(
                                     audio_format, (audio_format,)
                                 )
+                        elif any(not _is_audio_only(fmt) for _spec, fmt, _est in candidates):
+                            postprocessors = list(audio_extra_opts.get("postprocessors") or [])
+                            postprocessors.append(
+                                {"key": "FFmpegExtractAudio", "preferredcodec": "best"}
+                            )
+                            audio_extra_opts["postprocessors"] = postprocessors
                         for spec, _fmt, est in candidates[:8]:
                             try:
                                 chosen_spec = spec
