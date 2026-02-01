@@ -288,6 +288,15 @@ class OperatorSession:
 
 
 @dataclass
+class _DownloadToken:
+    token: str
+    path: Path
+    filename: str
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass
 class OperatorScreenshotCache:
     image_bytes: bytes
     captured_at: float
@@ -2058,6 +2067,8 @@ class Ask(commands.Cog):
         self._operator_start_warnings: dict[str, str] = {}
         self._operator_screenshot_cache: dict[str, OperatorScreenshotCache] = {}
         self._operator_last_start_failure: dict[str, _OperatorStartFailure] = {}
+        self._download_tokens: dict[str, _DownloadToken] = {}
+        self._download_cleanup_tasks: dict[str, asyncio.Task] = {}
         self._operator_xvfb_proc: subprocess.Popen | None = None
         self._operator_xvfb_display: str | None = None
         self._operator_xvfb_original_display: str | None = None
@@ -2324,6 +2335,76 @@ class Ask(commands.Cog):
                     if not tokens:
                         self._operator_sessions_by_state.pop(session.state_key, None)
 
+    def _prune_download_tokens(self) -> None:
+        if not self._download_tokens:
+            return
+        now = datetime.now(timezone.utc)
+        expired = [
+            token
+            for token, record in self._download_tokens.items()
+            if record.expires_at <= now
+        ]
+        for token in expired:
+            record = self._download_tokens.pop(token, None)
+            task = self._download_cleanup_tasks.pop(token, None)
+            if task:
+                task.cancel()
+            if record:
+                with contextlib.suppress(Exception):
+                    record.path.unlink()
+
+    async def _expire_download_token(self, token: str, *, delay_s: int) -> None:
+        try:
+            await asyncio.sleep(max(0, delay_s))
+        except asyncio.CancelledError:
+            return
+        record = self._download_tokens.pop(token, None)
+        self._download_cleanup_tasks.pop(token, None)
+        if record:
+            with contextlib.suppress(Exception):
+                record.path.unlink()
+
+    def _get_download_token(self, token: str) -> _DownloadToken | None:
+        self._prune_download_tokens()
+        record = self._download_tokens.get(token)
+        if record is None:
+            return None
+        if record.expires_at <= datetime.now(timezone.utc):
+            self._download_tokens.pop(token, None)
+            task = self._download_cleanup_tasks.pop(token, None)
+            if task:
+                task.cancel()
+            with contextlib.suppress(Exception):
+                record.path.unlink()
+            return None
+        return record
+
+    async def register_download(
+        self,
+        file_path: Path,
+        *,
+        filename: str,
+        expires_s: int,
+    ) -> str | None:
+        if not file_path.exists():
+            return None
+        if not await self._ensure_operator_server():
+            return None
+        self._prune_download_tokens()
+        created_at = datetime.now(timezone.utc)
+        expires_at = created_at + timedelta(seconds=expires_s)
+        token = secrets.token_urlsafe(18)
+        self._download_tokens[token] = _DownloadToken(
+            token=token,
+            path=file_path,
+            filename=filename,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+        task = asyncio.create_task(self._expire_download_token(token, delay_s=expires_s))
+        self._download_cleanup_tasks[token] = task
+        return f"{self._operator_public_base_url()}/save/{token}"
+
     def _create_operator_session(self, ctx: commands.Context) -> OperatorSession:
         self._prune_operator_sessions()
         created_at = datetime.now(timezone.utc)
@@ -2487,6 +2568,7 @@ class Ask(commands.Cog):
         app.router.add_get("/operator/{token}/screenshot", self._operator_handle_screenshot)
         app.router.add_post("/operator/{token}/action", self._operator_handle_action)
         app.router.add_post("/operator/{token}/mode", self._operator_handle_mode)
+        app.router.add_get("/save/{token}", self._operator_handle_download)
         runner = web.AppRunner(app)
         try:
             await runner.setup()
@@ -2526,6 +2608,13 @@ class Ask(commands.Cog):
         if self._operator_runner is not None:
             asyncio.create_task(self._shutdown_operator_server())
         self._operator_stop_xvfb()
+        for task in self._download_cleanup_tasks.values():
+            task.cancel()
+        self._download_cleanup_tasks.clear()
+        for record in self._download_tokens.values():
+            with contextlib.suppress(Exception):
+                record.path.unlink()
+        self._download_tokens.clear()
 
     def _operator_stop_xvfb(self) -> None:
         proc = self._operator_xvfb_proc
@@ -2754,6 +2843,14 @@ class Ask(commands.Cog):
             raise web.HTTPNotFound(text="Operator session expired or invalid.")
         html = self._operator_page_html(token)
         return web.Response(text=html, content_type="text/html")
+
+    async def _operator_handle_download(self, request: web.Request) -> web.Response:
+        token = request.match_info.get("token", "")
+        record = self._get_download_token(token)
+        if record is None or not record.path.exists():
+            raise web.HTTPNotFound(text="Download token expired or invalid.")
+        headers = {"Content-Disposition": f'attachment; filename="{record.filename}"'}
+        return web.FileResponse(path=record.path, headers=headers)
 
     async def _operator_handle_state(self, request: web.Request) -> web.Response:
         token = request.match_info.get("token", "")

@@ -50,7 +50,7 @@
 - `queue` — Show interactive queue panel (pause/resume, loop, skip, bye, remove, speed/pitch, toggle Auto Leave).
 - `remove` — Show recent additions when called without a number; pass a number or ID (e.g., `A12`) to remove by addition order (1=latest, 2=previous, etc.) or a comma-separated list like `A12,3,A14`.
 - `say` — Send a message now or schedule recurring posts with `--HH:MM` times and day tokens (e.g., `--7:30,everyday`), list schedules, or delete by id.
-- `save` — Download a public video URL (TikTok/YouTube/etc.) with yt-dlp and attach it as mp4 or audio-only, falling back to smaller resolutions to stay within the upload limit.
+- `save` — Download a public video URL (TikTok/YouTube/etc.) with yt-dlp and attach it as mp4 or audio-only, honoring any max-height cap you provide; if the result exceeds 10MB or the guild limit, a 30‑minute `simajilord.com/save/<token>` download link is sent instead.
 - `searchplay` — Search YouTube with yt-dlp without queuing; list candidates to pick before running `/play` (URLs should go to `/play` directly).
 - `seek` — Seek within the current track (e.g. `1:23`, `+30`, `-10`).
 - `serverinfo` — Display a polished snapshot of the current server, including public channel lists and voice activity.

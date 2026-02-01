@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 from html.parser import HTMLParser
 import inspect
@@ -10,8 +11,10 @@ import os
 import random
 import re
 import shlex
+import shutil
 import socket
 import tempfile
+import uuid
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
@@ -42,6 +45,8 @@ DEFAULT_ERROR_TEXT_MAX = 1900
 DISCORD_CONTENT_LIMIT = 4000
 DEFAULT_HTML_FALLBACK_MAX_BYTES = 2_000_000
 DEFAULT_X_SYNDICATION_ATTEMPTS = 3
+DEFAULT_EXTERNAL_LINK_LIMIT_BYTES = 10 * 1024 * 1024
+DEFAULT_EXTERNAL_LINK_TTL_S = 30 * 60
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -83,6 +88,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _strip_ansi(text: str) -> str:
+    if not text:
+        return text
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 def _parse_cookies_from_browser(
@@ -156,6 +167,33 @@ def _resolve_host_ips(host: str) -> set[str]:
         elif family == socket.AF_INET6:
             addrs.add(sockaddr[0])
     return addrs
+
+
+def _browser_cookie_db_exists(browser: str) -> bool:
+    name = browser.strip().lower()
+    if not name:
+        return False
+    home = Path.home()
+    if name in {"chrome", "google-chrome"}:
+        bases = [home / ".config/google-chrome"]
+    elif name == "chromium":
+        bases = [home / ".config/chromium"]
+    elif name in {"brave", "brave-browser"}:
+        bases = [home / ".config/BraveSoftware/Brave-Browser"]
+    elif name in {"edge", "microsoft-edge"}:
+        bases = [home / ".config/microsoft-edge"]
+    elif name == "firefox":
+        profile_root = home / ".mozilla/firefox"
+        if not profile_root.exists():
+            return False
+        return any(profile_root.rglob("cookies.sqlite"))
+    else:
+        return False
+
+    for base in bases:
+        if base.exists() and any(base.rglob("Cookies")):
+            return True
+    return False
 
 
 def _is_safe_redirect_target(url: str) -> bool:
@@ -412,6 +450,10 @@ def _truncate_text(text: str, max_len: int) -> str:
     suffix = "...(truncated)"
     keep = max(max_len - len(suffix), 0)
     return f"{text[:keep]}{suffix}"
+
+
+def _escape_markdown_link_label(text: str) -> str:
+    return text.replace("\\", "＼").replace("[", "［").replace("]", "］")
 
 
 def _assemble_error_message(*, base: str, tail: str, max_len: int) -> str:
@@ -1069,13 +1111,42 @@ class Save(commands.Cog):
         self.cfg = SaveConfig.from_env()
         self._sem = asyncio.Semaphore(self.cfg.max_concurrent)
 
+    async def _create_external_download_link(
+        self,
+        ctx: commands.Context,
+        download_path: Path,
+        *,
+        filename: str,
+    ) -> str | None:
+        ask_cog = self.bot.get_cog("Ask")
+        if not ask_cog or not hasattr(ask_cog, "register_download"):
+            return None
+        target_dir = self.cfg.work_root / "downloads"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_name = f"{uuid.uuid4().hex}_{filename}"
+        target_path = target_dir / target_name
+        try:
+            shutil.move(str(download_path), target_path)
+        except Exception:
+            return None
+        link = await ask_cog.register_download(
+            target_path,
+            filename=filename,
+            expires_s=DEFAULT_EXTERNAL_LINK_TTL_S,
+        )
+        if not link:
+            with contextlib.suppress(Exception):
+                target_path.unlink()
+            return None
+        return link
+
     @commands.command(
         name="save",
         description="Save a video or audio from a public URL and attach it.",
         help=(
             "Download a video from a public URL (TikTok, YouTube, etc.) with yt-dlp "
             "and attach it to Discord. The bot auto-selects an mp4-compatible format "
-            "that fits the guild's upload limit.\n\n"
+            "and can honor a max-height cap you provide.\n\n"
             "**Usage**: `/save <url>`\n"
             "**Optional**: `/save <url> max_height:<int> audio_only:<bool> audio_focus:<bool> item:<int>`\n"
             "**Prefix flags**: `--audio`, `--audio-focus`, `--max-height 720`, `--item 2`\n\n"
@@ -1089,7 +1160,7 @@ class Save(commands.Cog):
             "category": "Tools",
             "pro": (
                 "Fetches a single video (or audio-only) with yt-dlp, blocks private/localhost "
-                "targets, and auto-fits the result under the Discord upload limit."
+                "targets, and honors optional max-height caps."
             ),
             "destination": "Download a public video or audio-only URL and attach it to Discord.",
             "plus": (
@@ -1130,7 +1201,7 @@ class Save(commands.Cog):
     )
     @app_commands.describe(
         url="Public video URL to download.",
-        max_height="Optional max height to keep the file size down.",
+        max_height="Optional max height cap.",
         audio_only="Download audio-only instead of video.",
         audio_focus="Prefer higher audio bitrate when picking formats.",
         item="Select which item to download from a carousel/playlist-like URL.",
@@ -1200,7 +1271,7 @@ class Save(commands.Cog):
         if max_upload_bytes <= 0:
             max_upload_bytes = self.cfg.max_bytes
 
-        max_bytes = min(max_upload_bytes, self.cfg.max_bytes)
+        max_bytes = self.cfg.max_bytes
 
         async with self._sem:
             logger = YTDLLogger()
@@ -1228,12 +1299,14 @@ class Save(commands.Cog):
                 and not cookies_from_browser
                 and (host.endswith("x.com") or host.endswith("twitter.com") or "tiktok.com" in host)
             )
-            if auto_cookie_allowed:
+            if auto_cookie_allowed and _browser_cookie_db_exists(self.cfg.cookies_auto_browser):
                 cookies_from_browser = (self.cfg.cookies_auto_browser,)
+            else:
+                auto_cookie_allowed = False
             used_generic_extractor = False
 
             progress_title = "⏳ Downloading audio..." if audio_only else "⏳ Downloading video..."
-            progress_link_label = "タイトル"
+            progress_link_label = "Loading..."
             progress_embed = discord.Embed(
                 title=progress_title,
                 description=f"[{progress_link_label}]({url})",
@@ -1241,7 +1314,9 @@ class Save(commands.Cog):
             )
             progress_message: discord.Message | None = None
             try:
-                progress_message = await safe_reply(ctx, embed=progress_embed, mention_author=False)
+                progress_message = await safe_reply(
+                    ctx, embed=progress_embed, mention_author=False
+                )
             except Exception:
                 progress_message = None
 
@@ -1272,8 +1347,8 @@ class Save(commands.Cog):
                                 break
                             except yt_dlp.utils.DownloadError as exc:
                                 last_probe_error = exc
-                                raw_error = str(exc).strip() or repr(exc)
-                                tail = logger.tail(self.cfg.log_tail_lines)
+                                raw_error = _strip_ansi(str(exc).strip() or repr(exc))
+                                tail = _strip_ansi(logger.tail(self.cfg.log_tail_lines))
                                 kind = _classify_error(raw_error)
                                 if kind == "unknown" and tail:
                                     kind = _classify_error(tail)
@@ -1294,6 +1369,17 @@ class Save(commands.Cog):
                                 raise
                         else:
                             raise last_probe_error or RuntimeError("Download failed")
+                        title_text = str(info.get("title") or "Saved video")
+                        title_text = _truncate_text(title_text, 256)
+                        title_text = _escape_markdown_link_label(title_text)
+                        if progress_message is not None:
+                            updated_embed = discord.Embed(
+                                title=progress_title,
+                                description=f"[{title_text}]({url})",
+                                color=0xF1C40F,
+                            )
+                            with contextlib.suppress(Exception):
+                                await progress_message.edit(embed=updated_embed)
                     except yt_dlp.utils.DownloadError as exc:
                         fallback_urls: list[str] = []
                         if host.endswith("x.com") or host.endswith("twitter.com"):
@@ -1498,8 +1584,6 @@ class Save(commands.Cog):
                         raise last_error or RuntimeError("Download failed")
 
                     file_size = download_path.stat().st_size
-                    if file_size > max_upload_bytes:
-                        raise RuntimeError("max-filesize: exceeds Discord upload limit")
 
                     title = str(download_info.get("title") or info.get("title") or "Saved video")
                     duration = download_info.get("duration", info.get("duration"))
@@ -1536,16 +1620,27 @@ class Save(commands.Cog):
 
                     ext = download_path.suffix or ".mp4"
                     filename = f"audio{ext}" if audio_only else f"video{ext}"
+                    if file_size > max_upload_bytes or file_size > DEFAULT_EXTERNAL_LINK_LIMIT_BYTES:
+                        link = await self._create_external_download_link(
+                            ctx,
+                            download_path,
+                            filename=filename,
+                        )
+                        if not link:
+                            raise RuntimeError("max-filesize: exceeds Discord upload limit")
+                        embed.add_field(
+                            name="Download link (30 min)",
+                            value=link,
+                            inline=False,
+                        )
+                        if progress_message is not None:
+                            await self._cleanup_progress_message(progress_message)
+                        await safe_reply(ctx, embed=embed, mention_author=False)
+                        return
                     file_obj = discord.File(download_path, filename=filename)
                     if progress_message is not None:
-                        try:
-                            await progress_message.edit(
-                                embed=embed, attachments=[], files=[file_obj], content=None
-                            )
-                        except Exception:
-                            await safe_reply(ctx, embed=embed, file=file_obj, mention_author=False)
-                    else:
-                        await safe_reply(ctx, embed=embed, file=file_obj, mention_author=False)
+                        await self._cleanup_progress_message(progress_message)
+                    await safe_reply(ctx, embed=embed, file=file_obj, mention_author=False)
 
             except yt_dlp.utils.DownloadError as exc:
                 await self._handle_error(
@@ -1559,24 +1654,13 @@ class Save(commands.Cog):
                 log.info("save timed out: %s", timeout_message)
                 timeout_embed = error_embed(desc=timeout_message)
                 if progress_message is not None:
-                    try:
-                        await progress_message.edit(
-                            content=None, embed=timeout_embed, attachments=[]
-                        )
-                    except Exception:
-                        await safe_reply(
-                            ctx,
-                            embed=timeout_embed,
-                            mention_author=False,
-                            ephemeral=True,
-                        )
-                else:
-                    await safe_reply(
-                        ctx,
-                        embed=timeout_embed,
-                        mention_author=False,
-                        ephemeral=True,
-                    )
+                    await self._cleanup_progress_message(progress_message)
+                await safe_reply(
+                    ctx,
+                    embed=timeout_embed,
+                    mention_author=False,
+                    ephemeral=True,
+                )
             except Exception as exc:
                 await self._handle_error(
                     ctx, url, exc, logger, max_upload_bytes, progress_message=progress_message
@@ -1600,7 +1684,8 @@ class Save(commands.Cog):
         if not raw_error:
             raw_error = repr(exc)
 
-        tail = logger.tail(self.cfg.log_tail_lines)
+        raw_error = _strip_ansi(raw_error)
+        tail = _strip_ansi(logger.tail(self.cfg.log_tail_lines))
         kind = _classify_error(raw_error)
         if kind == "unknown" and tail:
             kind = _classify_error(tail)
@@ -1640,13 +1725,13 @@ class Save(commands.Cog):
         log.info("save error: %s", content)
         error = error_embed(desc=content)
         if progress_message is not None:
-            try:
-                await progress_message.edit(content=None, embed=error, attachments=[])
-                return
-            except Exception:
-                pass
-
+            await self._cleanup_progress_message(progress_message)
         await safe_reply(ctx, embed=error, mention_author=False, ephemeral=True)
+
+    @staticmethod
+    async def _cleanup_progress_message(message: discord.Message) -> None:
+        with contextlib.suppress(Exception):
+            await message.delete()
 
 
 async def setup(bot: commands.Bot) -> None:
