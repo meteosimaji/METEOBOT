@@ -135,7 +135,7 @@ async def _run_proc(
 
 
 def _copy_repo_to_worktree(repo: Path, worktree_dir: Path, runs_root: Path) -> None:
-    ignore_names = [".git"]
+    ignore_names = [".git", "cookies.json", "cookies.txt"]
     if _is_under(runs_root, repo):
         rel_runs_root = runs_root.resolve().relative_to(repo.resolve())
         if rel_runs_root.parts:

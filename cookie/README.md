@@ -9,14 +9,16 @@
 ## 使い方
 
 1. JSON を保存する  
-   例: `cookie/template.json` をコピーして `cookies.json` を作成し、値を貼り替えます。
+   例: `cookie/cookies.json` を開いて値を貼り替えます（ファイル名変更は不要）。
 
-2. 変換スクリプトを実行する
+2. 変換スクリプトを実行する（または Bot 起動時に自動生成）
 
    ```bash
    python cookie/convert_json.py cookies.json -o cookies.txt
    chmod 600 cookies.txt
    ```
+
+   Bot を起動すると `cookie/cookies.json` がある場合は自動で `cookie/cookies.txt` を作成します。
 
 3. BOT を起動するときに環境変数を指定する
 

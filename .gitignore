@@ -148,6 +148,8 @@ venv.bak/
 /data/browser_profiles/
 # /save video download workspace
 /data/savevideo/
+# Local cookies export (never commit)
+/cookie/cookies.txt
 
 # Spyder project settings
 .spyderproject

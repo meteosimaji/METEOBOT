@@ -64,8 +64,8 @@
 
 ### Save command notes
 - Prefix flags: `--audio` (audio-only), `--audio-focus` (prefer higher audio quality), `--max-height 720` (cap video height), `--item 2` (select item from a carousel/playlist-like URL).
-- Some sites (X/Twitter/TikTok) often require cookies. Set `SAVEVIDEO_COOKIES_FILE` (Netscape cookies.txt) or `SAVEVIDEO_COOKIES_FROM_BROWSER` (yt-dlp style, e.g. `chrome` or `chrome:Profile 1`) when running the bot.
-- To auto-try browser cookies on X/TikTok after a failed probe, use `SAVEVIDEO_COOKIES_AUTO=1` (enabled by default). Disable with `SAVEVIDEO_COOKIES_AUTO=0`. Optionally choose the browser with `SAVEVIDEO_COOKIES_AUTO_BROWSER=chrome` (default) or `firefox`.
+- Some sites (X/Twitter/TikTok) often require cookies. Set `SAVEVIDEO_COOKIES_FILE` (Netscape cookies.txt) or `SAVEVIDEO_COOKIES_FROM_BROWSER` (yt-dlp style, e.g. `chrome` or `chrome:Profile 1`) when running the bot. If `cookie/cookies.json` exists, the bot auto-generates `cookie/cookies.txt` on startup and defaults `SAVEVIDEO_COOKIES_FILE` to it when the env var is unset.
+- Auto-trying browser cookies for `/save` is now disabled by default in code. You can still use `SAVEVIDEO_COOKIES_FROM_BROWSER` or manually flip `SAVEVIDEO_COOKIES_AUTO` if needed. Optionally choose the browser with `SAVEVIDEO_COOKIES_AUTO_BROWSER=chrome` (default) or `firefox`.
 - When extraction fails, the bot retries with yt-dlp's generic extractor and then attempts an HTML metadata fallback (plus X/Twitter syndication JSON) to recover direct media URLs; this is best-effort and may still fail on heavily protected sites.
 - Short links that rely on meta refresh or simple JS redirects are resolved before policy checks to help `/save` reach the final target URL.
 
