@@ -50,7 +50,7 @@
 - `queue` — Show interactive queue panel (pause/resume, loop, skip, bye, remove, speed/pitch, toggle Auto Leave).
 - `remove` — Show recent additions when called without a number; pass a number or ID (e.g., `A12`) to remove by addition order (1=latest, 2=previous, etc.) or a comma-separated list like `A12,3,A14`.
 - `say` — Send a message now or schedule recurring posts with `--HH:MM` times and day tokens (e.g., `--7:30,everyday`), list schedules, or delete by id.
-- `save` — Download a public video URL (TikTok/YouTube/etc.) with yt-dlp and attach it as mp4, falling back to smaller resolutions to stay within the upload limit.
+- `save` — Download a public video URL (TikTok/YouTube/etc.) with yt-dlp and attach it as mp4 or audio-only, falling back to smaller resolutions to stay within the upload limit.
 - `searchplay` — Search YouTube with yt-dlp without queuing; list candidates to pick before running `/play` (URLs should go to `/play` directly).
 - `seek` — Seek within the current track (e.g. `1:23`, `+30`, `-10`).
 - `serverinfo` — Display a polished snapshot of the current server, including public channel lists and voice activity.
@@ -61,6 +61,13 @@
 - `uptime` — Show how long the bot has been running.
 - `userinfo` — Show a member's profile with timestamps, roles, and bot status.
 - `video` — Generate or remix short videos with Sora from a prompt, a reference image (first frame), or a `video_...` ID; best prompts describe shot type, subject, action, setting, and lighting. Attach images, HTTPS URLs, or Discord message links to use as reference. Optional tokens: `seconds:4|8|12`, `size:720x1280|1280x720`. Limits: global usage is capped at 2 videos per day across all servers; each user can run /video once per day across all servers; each server can run /video twice per week shared across users (weekly reset Sunday 00:00 UTC).
+
+### Save command notes
+- Prefix flags: `--audio` (audio-only), `--audio-focus` (prefer higher audio quality), `--max-height 720` (cap video height), `--item 2` (select item from a carousel/playlist-like URL).
+- Some sites (X/Twitter/TikTok) often require cookies. Set `SAVEVIDEO_COOKIES_FILE` (Netscape cookies.txt) or `SAVEVIDEO_COOKIES_FROM_BROWSER` (yt-dlp style, e.g. `chrome` or `chrome:Profile 1`) when running the bot.
+- To auto-try browser cookies on X/TikTok after a failed probe, use `SAVEVIDEO_COOKIES_AUTO=1` (enabled by default). Disable with `SAVEVIDEO_COOKIES_AUTO=0`. Optionally choose the browser with `SAVEVIDEO_COOKIES_AUTO_BROWSER=chrome` (default) or `firefox`.
+- When extraction fails, the bot retries with yt-dlp's generic extractor and then attempts an HTML metadata fallback (plus X/Twitter syndication JSON) to recover direct media URLs; this is best-effort and may still fail on heavily protected sites.
+- Short links that rely on meta refresh or simple JS redirects are resolved before policy checks to help `/save` reach the final target URL.
 
 ### Ask tool auto-delete
 When `/ask` uses `bot_invoke`, the bot's response message will auto-delete 5 seconds after the final `/ask` reply is sent. A "stop auto-delete" button appears on replies that do not already contain interactive components; pressing it cancels deletion for that message only. Messages that already include buttons/menus are not modified to avoid breaking their UI and are excluded from auto-delete unless they are tagged as errors. By default, all commands invoked via `/ask` auto-delete unless explicitly disabled in `commands/ask.py` via `ASK_AUTO_DELETE_OVERRIDES`. The current default exclusions (no auto-delete) are:
