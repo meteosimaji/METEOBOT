@@ -50,7 +50,7 @@
 - `queue` — Show interactive queue panel (pause/resume, loop, skip, bye, remove, speed/pitch, toggle Auto Leave).
 - `remove` — Show recent additions when called without a number; pass a number or ID (e.g., `A12`) to remove by addition order (1=latest, 2=previous, etc.) or a comma-separated list like `A12,3,A14`.
 - `say` — Send a message now or schedule recurring posts with `--HH:MM` times and day tokens (e.g., `--7:30,everyday`), list schedules, or delete by id.
-- `save` — Download a public video URL (TikTok/YouTube/etc.) with yt-dlp and attach it as mp4 or audio-only, honoring any max-height cap you provide; if the result exceeds 10MB or the guild limit, a 30‑minute `simajilord.com/save/<token>` download link is sent instead.
+- `save` — Download a public video URL (TikTok/YouTube/etc.) with yt-dlp and attach it as mp4 or audio-only, honoring any max-height cap you provide; if the result exceeds 10MB or the guild limit (or you pass `--url`), a 30‑minute `simajilord.com/save/<token>` download link is sent instead.
 - `searchplay` — Search YouTube with yt-dlp without queuing; list candidates to pick before running `/play` (URLs should go to `/play` directly).
 - `seek` — Seek within the current track (e.g. `1:23`, `+30`, `-10`).
 - `serverinfo` — Display a polished snapshot of the current server, including public channel lists and voice activity.
@@ -63,7 +63,7 @@
 - `video` — Generate or remix short videos with Sora from a prompt, a reference image (first frame), or a `video_...` ID; best prompts describe shot type, subject, action, setting, and lighting. Attach images, HTTPS URLs, or Discord message links to use as reference. Optional tokens: `seconds:4|8|12`, `size:720x1280|1280x720`. Limits: global usage is capped at 2 videos per day across all servers; each user can run /video once per day across all servers; each server can run /video twice per week shared across users (weekly reset Sunday 00:00 UTC).
 
 ### Save command notes
-- Prefix flags: `--audio` (audio-only), `--audio-focus` (prefer higher audio quality), `--max-height 720` (cap video height), `--item 2` (select item from a carousel/playlist-like URL).
+- Prefix flags: `--audio` (audio-only), `--audio-focus` (prefer higher audio quality), `--max-height 720` (cap video height), `--item 2` (select item from a carousel/playlist-like URL), `--url` (always return a download link), `--wav`/`--mp3`/`--flac`/`--m4a`/`--opus`/`--ogg` (audio format when using `--audio`).
 - Some sites (X/Twitter/TikTok) often require cookies. Set `SAVEVIDEO_COOKIES_FILE` (Netscape cookies.txt) or `SAVEVIDEO_COOKIES_FROM_BROWSER` (yt-dlp style, e.g. `chrome` or `chrome:Profile 1`) when running the bot. If `cookie/cookies.json` exists, the bot auto-generates `cookie/cookies.txt` on startup and defaults `SAVEVIDEO_COOKIES_FILE` to it when the env var is unset.
 - Auto-trying browser cookies for `/save` is now disabled by default in code. You can still use `SAVEVIDEO_COOKIES_FROM_BROWSER` or manually flip `SAVEVIDEO_COOKIES_AUTO` if needed. Optionally choose the browser with `SAVEVIDEO_COOKIES_AUTO_BROWSER=chrome` (default) or `firefox`.
 - When extraction fails, the bot retries with yt-dlp's generic extractor and then attempts an HTML metadata fallback (plus X/Twitter syndication JSON) to recover direct media URLs; this is best-effort and may still fail on heavily protected sites.
