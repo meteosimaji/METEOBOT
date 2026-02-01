@@ -1,22 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import html
+from html.parser import HTMLParser
+import inspect
+import json
 import logging
 import os
+import random
 import re
+import shlex
 import socket
 import tempfile
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 from urllib.parse import urlparse
+from urllib.parse import urljoin
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
-from utils import ASK_ERROR_TAG, BOT_PREFIX, defer_interaction, humanize_delta, safe_reply, tag_error_text
+from utils import BOT_PREFIX, defer_interaction, error_embed, humanize_delta, safe_reply
 
 log = logging.getLogger(__name__)
 
@@ -31,10 +40,14 @@ DEFAULT_WORK_ROOT = "data/savevideo"
 DEFAULT_DNS_TIMEOUT_S = 2
 DEFAULT_ERROR_TEXT_MAX = 1900
 DISCORD_CONTENT_LIMIT = 4000
+DEFAULT_HTML_FALLBACK_MAX_BYTES = 2_000_000
+DEFAULT_X_SYNDICATION_ATTEMPTS = 3
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
+DEFAULT_AUDIO_EXTS = ("m4a", "mp4", "webm", "opus", "ogg")
+DEFAULT_COOKIES_AUTO_BROWSER = "chrome"
 
 ERROR_PATTERNS: dict[str, re.Pattern[str]] = {
     "unsupported_url": re.compile(r"(unsupported\s+url|no\s+video\s+formats)", re.I),
@@ -63,6 +76,13 @@ def _env_str(name: str) -> str | None:
     raw = os.getenv(name)
     raw = raw.strip() if isinstance(raw, str) else None
     return raw or None
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _parse_cookies_from_browser(
@@ -128,6 +148,46 @@ async def _resolve_host_ips_async(host: str) -> set[str]:
     return addrs
 
 
+def _resolve_host_ips(host: str) -> set[str]:
+    addrs: set[str] = set()
+    for family, _type, _proto, _canon, sockaddr in socket.getaddrinfo(host, None):
+        if family == socket.AF_INET:
+            addrs.add(sockaddr[0])
+        elif family == socket.AF_INET6:
+            addrs.add(sockaddr[0])
+    return addrs
+
+
+def _is_safe_redirect_target(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    if _is_blocked_ip_literal(host):
+        return False
+    try:
+        ips = _resolve_host_ips(host)
+    except Exception:
+        return False
+    for ip_s in ips:
+        if _is_blocked_ip_literal(ip_s):
+            return False
+    return True
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urljoin(req.full_url, newurl)
+        if not _is_safe_redirect_target(target):
+            raise RuntimeError(f"HTML fallback redirect blocked: {target}")
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
 async def _is_safe_direct_url_async(url: str, *, dns_timeout_s: int) -> bool:
     """Allow only public http(s) targets."""
     try:
@@ -157,13 +217,109 @@ async def _is_safe_direct_url_async(url: str, *, dns_timeout_s: int) -> bool:
     return True
 
 
-def _pick_downloaded_file(download_dir: Path) -> Path | None:
+def _first_http_url(values: Sequence[object]) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return value
+    return None
+
+
+def _parse_save_cli_args(
+    raw: str,
+    *,
+    default_max_height: int | None,
+    default_audio_only: bool,
+    default_audio_focus: bool,
+    default_item: int,
+) -> tuple[SaveRequest | None, str | None]:
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return None, "Failed to parse arguments. Check quotes in the URL or flags."
+
+    url: str | None = None
+    max_height = default_max_height
+    audio_only = default_audio_only
+    audio_focus = default_audio_focus
+    item = default_item
+    unknown: list[str] = []
+
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token.startswith("--"):
+            name, value = token[2:].split("=", 1) if "=" in token else (token[2:], None)
+            name = name.strip().lower()
+
+            def _consume_value() -> str | None:
+                nonlocal idx
+                if value is not None:
+                    return value
+                if idx + 1 >= len(tokens):
+                    return None
+                idx += 1
+                return tokens[idx]
+
+            if name in {"audio", "audio-only"}:
+                audio_only = True if value is None else str(value).lower() not in {"0", "false", "no"}
+            elif name in {"audio-focus", "audio-priority", "audio-quality"}:
+                audio_focus = True if value is None else str(value).lower() not in {"0", "false", "no"}
+            elif name in {"max-height", "height", "resolution"}:
+                raw_value = _consume_value()
+                if raw_value is None:
+                    return None, "Missing value for --max-height/--height."
+                try:
+                    max_height = int(raw_value)
+                except ValueError:
+                    return None, "Height must be a number."
+                if max_height <= 0:
+                    return None, "Height must be a positive number."
+            elif name in {"item", "index"}:
+                raw_value = _consume_value()
+                if raw_value is None:
+                    return None, "Missing value for --item/--index."
+                try:
+                    item = int(raw_value)
+                except ValueError:
+                    return None, "Item index must be a number."
+                if item <= 0:
+                    return None, "Item index must be 1 or higher."
+            else:
+                unknown.append(token)
+        else:
+            if url is None:
+                url = token
+            else:
+                unknown.append(token)
+        idx += 1
+
+    if unknown:
+        return None, f"Unknown arguments: {' '.join(unknown)}"
+
+    if not url:
+        return None, "Provide a video URL to save."
+
+    return SaveRequest(
+        url=url,
+        max_height=max_height,
+        audio_only=audio_only,
+        audio_focus=audio_focus,
+        item=item,
+    ), None
+
+
+def _pick_downloaded_file(
+    download_dir: Path,
+    *,
+    prefer_exts: Iterable[str] | None = None,
+) -> Path | None:
     files = [path for path in download_dir.iterdir() if path.is_file()]
     if not files:
         return None
-    # prefer mp4 if present, else the largest file.
-    mp4s = [path for path in files if path.suffix.lower() == ".mp4"]
-    candidates = mp4s or files
+    prefer_set = {ext.lower().lstrip(".") for ext in (prefer_exts or []) if ext}
+    preferred = [path for path in files if path.suffix.lower().lstrip(".") in prefer_set]
+    # prefer preferred extensions if present, else the largest file.
+    candidates = preferred or files
     return max(candidates, key=lambda path: path.stat().st_size)
 
 
@@ -205,6 +361,8 @@ class SaveConfig:
     cookies_file: str | None
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None
     impersonate: str | None
+    cookies_auto: bool
+    cookies_auto_browser: str
 
     @staticmethod
     def from_env() -> "SaveConfig":
@@ -221,7 +379,19 @@ class SaveConfig:
                 _env_str("SAVEVIDEO_COOKIES_FROM_BROWSER")
             ),
             impersonate=_env_str("SAVEVIDEO_IMPERSONATE"),
+            cookies_auto=_env_bool("SAVEVIDEO_COOKIES_AUTO", True),
+            cookies_auto_browser=_env_str("SAVEVIDEO_COOKIES_AUTO_BROWSER")
+            or DEFAULT_COOKIES_AUTO_BROWSER,
         )
+
+
+@dataclass(frozen=True)
+class SaveRequest:
+    url: str
+    max_height: int | None
+    audio_only: bool
+    audio_focus: bool
+    item: int
 
 
 def _human_size(value: int) -> str:
@@ -270,18 +440,7 @@ def _cap_error_message(text: str, max_len: int) -> str:
     if max_len <= 0:
         return ""
 
-    tagged = tag_error_text(text)
-    if len(tagged) <= max_len:
-        return tagged
-
-    cleaned = tagged.replace(ASK_ERROR_TAG, "").rstrip()
-    suffix = f"\n{ASK_ERROR_TAG}"
-    available = max_len - len(suffix)
-    if available <= 0:
-        return ASK_ERROR_TAG[:max_len]
-
-    truncated = _truncate_text(cleaned, available)
-    return f"{truncated}{suffix}"
+    return _truncate_text(text, max_len)
 
 
 def _extra_headers(url: str, user_agent: str) -> dict[str, str]:
@@ -293,6 +452,203 @@ def _extra_headers(url: str, user_agent: str) -> dict[str, str]:
     if host.endswith("x.com") or host.endswith("twitter.com"):
         headers["Referer"] = "https://x.com/"
     return headers
+
+
+def _fetch_url_text(url: str, headers: dict[str, str], *, timeout_s: int) -> tuple[str, str]:
+    opener = build_opener(_SafeRedirectHandler())
+    req = Request(url, headers=headers)
+    with opener.open(req, timeout=timeout_s) as resp:
+        final_url = resp.geturl()
+        content_type = resp.headers.get("Content-Type", "")
+        charset = "utf-8"
+        if "charset=" in content_type:
+            charset = content_type.split("charset=")[-1].split(";")[0].strip() or "utf-8"
+        data = resp.read(DEFAULT_HTML_FALLBACK_MAX_BYTES + 1)
+    if len(data) > DEFAULT_HTML_FALLBACK_MAX_BYTES:
+        data = data[:DEFAULT_HTML_FALLBACK_MAX_BYTES]
+    return data.decode(charset, errors="replace"), final_url
+
+
+def _extract_meta_urls(html_text: str) -> list[str]:
+    html_text = html.unescape(html_text)
+    patterns = [
+        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+property=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+property=["\']og:video:url["\'][^>]+content=["\']([^"\']+)',
+        r'<video[^>]+src=["\']([^"\']+)',
+    ]
+    urls: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, html_text, re.IGNORECASE):
+            url = match.group(1).strip()
+            if url.startswith("//"):
+                url = f"https:{url}"
+            if url.startswith(("http://", "https://")):
+                urls.append(url)
+    for match in re.finditer(r'https?://[^"\'\s>]+\.(?:mp4|m3u8)(?:\?[^"\'\s>]*)?', html_text):
+        urls.append(match.group(0))
+    return urls
+
+
+def _extract_x_syndication_urls(text: str) -> list[tuple[str, int, int]]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    media = data.get("mediaDetails") or data.get("media")
+    if not isinstance(media, list):
+        return []
+    results: list[tuple[str, int, int]] = []
+    for item in media:
+        if not isinstance(item, dict):
+            continue
+        video_info = item.get("video_info")
+        if not isinstance(video_info, dict):
+            continue
+        variants = video_info.get("variants")
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            url = variant.get("url")
+            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                continue
+            bitrate = variant.get("bitrate") or 0
+            try:
+                bitrate_val = int(bitrate)
+            except (ValueError, TypeError):
+                bitrate_val = 0
+            ext_priority = 0
+            lowered = url.lower()
+            if ".mp4" in lowered:
+                ext_priority = 2
+            elif ".m3u8" in lowered:
+                ext_priority = 1
+            results.append((url, bitrate_val, ext_priority))
+    return results
+
+
+def _extract_x_fallback_urls(
+    url: str,
+    headers: dict[str, str],
+    *,
+    timeout_s: int,
+) -> list[str]:
+    match = re.search(r"/status/(\d+)", url)
+    if not match:
+        return []
+    tweet_id = match.group(1)
+    variants: list[tuple[str, int, int]] = []
+    for _ in range(DEFAULT_X_SYNDICATION_ATTEMPTS):
+        token = str(random.randint(10_000_000, 99_999_999))
+        syndication_url = (
+            f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&lang=en&token={token}"
+        )
+        try:
+            text, _ = _fetch_url_text(syndication_url, headers, timeout_s=timeout_s)
+        except Exception:
+            continue
+        variants = _extract_x_syndication_urls(text)
+        if variants:
+            break
+    variants.sort(key=lambda item: (item[2], item[1]), reverse=True)
+    return [url for url, _, _ in variants]
+
+
+def _collect_html_fallback_urls(
+    url: str,
+    headers: dict[str, str],
+    *,
+    timeout_s: int,
+) -> list[str]:
+    html_text, _ = _fetch_url_text(url, headers, timeout_s=timeout_s)
+    urls = _extract_meta_urls(html_text)
+    seen: set[str] = set()
+    unique = []
+    for candidate in urls:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+class _MetaRefreshParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.refresh_content: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.refresh_content is not None or tag.lower() != "meta":
+            return
+        attributes = {key.lower(): value for key, value in attrs if key}
+        http_equiv = attributes.get("http-equiv")
+        if not http_equiv or http_equiv.lower() != "refresh":
+            return
+        content = attributes.get("content")
+        if content:
+            self.refresh_content = content
+
+
+def _extract_meta_refresh_url(html_text: str) -> str | None:
+    parser = _MetaRefreshParser()
+    parser.feed(html_text)
+    content = parser.refresh_content
+    if not content:
+        return None
+    content = html.unescape(content)
+    for part in content.split(";"):
+        match = re.search(r"url\s*=\s*(.+)", part, re.IGNORECASE)
+        if match:
+            return match.group(1).strip().strip("'\"")
+    return None
+
+
+def _extract_js_redirect_url(html_text: str) -> str | None:
+    html_text = html.unescape(html_text)
+    patterns = [
+        r"location\\.replace\\(['\\\"]([^'\\\"]+)",
+        r"location\\.href\\s*=\\s*['\\\"]([^'\\\"]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+async def _resolve_url_for_policy(
+    url: str,
+    headers: dict[str, str],
+    *,
+    timeout_s: int,
+    dns_timeout_s: int,
+    max_hops: int = 5,
+) -> str:
+    current_url = url
+    for _ in range(max_hops):
+        html_text, final_url = await asyncio.to_thread(
+            _fetch_url_text,
+            current_url,
+            headers,
+            timeout_s=timeout_s,
+        )
+        if final_url != current_url:
+            current_url = final_url
+        meta_url = _extract_meta_refresh_url(html_text)
+        js_url = _extract_js_redirect_url(html_text)
+        next_url = meta_url or js_url
+        if not next_url:
+            return current_url
+        resolved = urljoin(current_url, next_url)
+        if not await _is_safe_direct_url_async(resolved, dns_timeout_s=dns_timeout_s):
+            return current_url
+        if resolved == current_url:
+            return current_url
+        current_url = resolved
+    return current_url
 
 
 def _base_ydl_opts(
@@ -340,6 +696,7 @@ def _probe_info(
     cookies_file: str | None,
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None,
     impersonate: str | None,
+    extra_opts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -350,6 +707,8 @@ def _probe_info(
         "skip_download": True,
         "http_headers": headers,
     }
+    if extra_opts:
+        opts.update(extra_opts)
     if cookies_file:
         opts["cookiefile"] = cookies_file
     if cookies_from_browser:
@@ -410,6 +769,10 @@ def _is_m4a_aacish_audio(fmt: dict[str, Any]) -> bool:
         return False
     acodec = (fmt.get("acodec") or "").lower()
     return acodec.startswith("mp4a") or ("aac" in acodec)
+
+
+def _is_audio_only(fmt: dict[str, Any]) -> bool:
+    return (fmt.get("vcodec") or "none") == "none" and (fmt.get("acodec") or "none") != "none"
 
 
 def _iter_mp4_candidates(
@@ -483,7 +846,13 @@ def _iter_mp4_candidates(
             yield (f"{v['format_id']}+{a['format_id']}", v, a, est)
 
 
-def _rank_candidate(vfmt: dict[str, Any], afmt: dict[str, Any] | None, est_size: int | None) -> tuple:
+def _rank_candidate(
+    vfmt: dict[str, Any],
+    afmt: dict[str, Any] | None,
+    est_size: int | None,
+    *,
+    audio_focus: bool,
+) -> tuple:
     """Higher is better."""
     height = int(vfmt.get("height") or 0)
     fps = float(vfmt.get("fps") or 0.0)
@@ -507,6 +876,12 @@ def _rank_candidate(vfmt: dict[str, Any], afmt: dict[str, Any] | None, est_size:
     if acodec.startswith("mp4a") or "aac" in acodec:
         audio_score = 1
 
+    audio_br = 0.0
+    if afmt is not None:
+        audio_br = float(afmt.get("abr") or afmt.get("tbr") or 0.0)
+    else:
+        audio_br = float(vfmt.get("abr") or vfmt.get("tbr") or 0.0)
+
     # Prefer known-under-limit sizes; unknown sizes get a penalty.
     size_known = 1 if isinstance(est_size, int) else 0
 
@@ -514,6 +889,8 @@ def _rank_candidate(vfmt: dict[str, Any], afmt: dict[str, Any] | None, est_size:
     # We'll use a small nudge rather than a main axis.
     size_nudge = int(est_size or 0)
 
+    if audio_focus:
+        return (audio_score, audio_br, codec_score, size_known, height, fps, tbr, size_nudge)
     return (codec_score, audio_score, size_known, height, fps, tbr, size_nudge)
 
 
@@ -522,6 +899,7 @@ def _pick_best_formats(
     *,
     max_bytes: int,
     max_height: int | None,
+    audio_focus: bool,
 ) -> list[tuple[str, dict[str, Any], dict[str, Any] | None, int | None]]:
     """Return candidates in best-first order.
 
@@ -545,10 +923,67 @@ def _pick_best_formats(
         else:
             unknown.append((spec, vfmt, afmt, est))
 
-    in_limit.sort(key=lambda t: _rank_candidate(t[1], t[2], t[3]), reverse=True)
-    unknown.sort(key=lambda t: _rank_candidate(t[1], t[2], t[3]), reverse=True)
+    in_limit.sort(key=lambda t: _rank_candidate(t[1], t[2], t[3], audio_focus=audio_focus), reverse=True)
+    unknown.sort(key=lambda t: _rank_candidate(t[1], t[2], t[3], audio_focus=audio_focus), reverse=True)
 
     # Try known-good candidates first, then unknown.
+    return in_limit + unknown
+
+
+def _iter_audio_candidates(
+    info: dict[str, Any],
+    *,
+    max_bytes: int,
+) -> Iterable[tuple[str, dict[str, Any], int | None]]:
+    duration = info.get("duration")
+    duration_s = float(duration) if isinstance(duration, (int, float)) and duration > 0 else None
+
+    formats: list[dict[str, Any]] = [f for f in (info.get("formats") or []) if isinstance(f, dict)]
+    audio_formats = [f for f in formats if f.get("format_id") and _is_audio_only(f)]
+
+    def _audio_key(fmt: dict[str, Any]) -> tuple[int, float]:
+        ext = (fmt.get("ext") or "").lower()
+        ext_score = 2 if ext in {"m4a", "mp4"} else 1 if ext in {"webm", "opus", "ogg"} else 0
+        abr = float(fmt.get("abr") or fmt.get("tbr") or 0.0)
+        return (ext_score, abr)
+
+    audio_formats.sort(key=_audio_key, reverse=True)
+
+    for fmt in audio_formats:
+        est = _estimate_format_size(fmt, duration_s)
+        yield (str(fmt["format_id"]), fmt, est)
+
+
+def _pick_best_audio_formats(
+    info: dict[str, Any],
+    *,
+    max_bytes: int,
+) -> list[tuple[str, dict[str, Any], int | None]]:
+    safety = int(max_bytes * 0.97)
+    in_limit: list[tuple[str, dict[str, Any], int | None]] = []
+    unknown: list[tuple[str, dict[str, Any], int | None]] = []
+    seen: set[str] = set()
+
+    for spec, fmt, est in _iter_audio_candidates(info, max_bytes=max_bytes):
+        if spec in seen:
+            continue
+        seen.add(spec)
+        if isinstance(est, int):
+            if est <= safety:
+                in_limit.append((spec, fmt, est))
+        else:
+            unknown.append((spec, fmt, est))
+
+    def _rank(fmt: dict[str, Any], est: int | None) -> tuple:
+        ext = (fmt.get("ext") or "").lower()
+        ext_score = 2 if ext in {"m4a", "mp4"} else 1 if ext in {"webm", "opus", "ogg"} else 0
+        abr = float(fmt.get("abr") or fmt.get("tbr") or 0.0)
+        size_known = 1 if isinstance(est, int) else 0
+        return (ext_score, abr, size_known, int(est or 0))
+
+    in_limit.sort(key=lambda t: _rank(t[1], t[2]), reverse=True)
+    unknown.sort(key=lambda t: _rank(t[1], t[2]), reverse=True)
+
     return in_limit + unknown
 
 
@@ -564,6 +999,8 @@ def _download_with_spec(
     cookies_from_browser: tuple[str] | tuple[str, str | None, str | None, str | None] | None,
     socket_timeout: int,
     impersonate: str | None,
+    prefer_exts: Sequence[str] | None = None,
+    extra_opts: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Path]:
     opts = _base_ydl_opts(
         logger=logger,
@@ -576,6 +1013,8 @@ def _download_with_spec(
         impersonate=impersonate,
     )
     opts["format"] = format_spec
+    if extra_opts:
+        opts.update(extra_opts)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -583,7 +1022,7 @@ def _download_with_spec(
     if not isinstance(info, dict):
         raise RuntimeError("yt-dlp returned unexpected info")
 
-    chosen = _pick_downloaded_file(work_dir)
+    chosen = _pick_downloaded_file(work_dir, prefer_exts=prefer_exts)
     if chosen is None:
         raise RuntimeError("Download completed but no files were written")
 
@@ -603,35 +1042,111 @@ class Save(commands.Cog):
         self.cfg = SaveConfig.from_env()
         self._sem = asyncio.Semaphore(self.cfg.max_concurrent)
 
-    @commands.hybrid_command(
+    @commands.command(
         name="save",
-        description="Save a video from a public URL and attach it as mp4.",
+        description="Save a video or audio from a public URL and attach it.",
         help=(
             "Download a video from a public URL (TikTok, YouTube, etc.) with yt-dlp "
             "and attach it to Discord. The bot auto-selects an mp4-compatible format "
             "that fits the guild's upload limit.\n\n"
-            "**Usage**: `/save <url>`\n\n"
-            "Optional: `/save <url> max_height:<int>`\n\n"
+            "**Usage**: `/save <url>`\n"
+            "**Optional**: `/save <url> max_height:<int> audio_only:<bool> audio_focus:<bool> item:<int>`\n"
+            "**Prefix flags**: `--audio`, `--audio-focus`, `--max-height 720`, `--item 2`\n\n"
             "Env knobs: SAVEVIDEO_MAX_BYTES, SAVEVIDEO_TIMEOUT_S, SAVEVIDEO_MAX_CONCURRENT, "
             "SAVEVIDEO_LOG_TAIL_LINES, SAVEVIDEO_WORK_DIR, SAVEVIDEO_DNS_TIMEOUT_S, "
             "SAVEVIDEO_USER_AGENT, SAVEVIDEO_COOKIES_FILE, SAVEVIDEO_COOKIES_FROM_BROWSER, "
-            "SAVEVIDEO_IMPERSONATE\n\n"
-            f"Prefix: `{BOT_PREFIX}save <url>`"
+            "SAVEVIDEO_COOKIES_AUTO, SAVEVIDEO_COOKIES_AUTO_BROWSER, SAVEVIDEO_IMPERSONATE\n\n"
+            f"Prefix: `{BOT_PREFIX}save <url> [--audio] [--audio-focus] [--max-height <h>] [--item <n>]`"
         ),
         extras={
             "category": "Tools",
             "pro": (
-                "Fetches a single video with yt-dlp, blocks private/localhost targets, "
-                "and auto-fits the result under the Discord upload limit."
+                "Fetches a single video (or audio-only) with yt-dlp, blocks private/localhost "
+                "targets, and auto-fits the result under the Discord upload limit."
+            ),
+            "destination": "Download a public video or audio-only URL and attach it to Discord.",
+            "plus": (
+                "Supports audio-only mode, audio-focused ranking, max-height caps, and item "
+                "selection for carousel/playlist-style URLs."
             ),
         },
     )
-    async def save(self, ctx: commands.Context, url: str, max_height: int | None = None) -> None:
-        url = (url or "").strip()
+    async def save(self, ctx: commands.Context, *, args: str) -> None:
+        parsed, error = _parse_save_cli_args(
+            args,
+            default_max_height=None,
+            default_audio_only=False,
+            default_audio_focus=False,
+            default_item=1,
+        )
+        if error:
+            await safe_reply(
+                ctx,
+                embed=error_embed(desc=error),
+                mention_author=False,
+                ephemeral=True,
+            )
+            return
+        if parsed is None:
+            await safe_reply(
+                ctx,
+                embed=error_embed(desc="Provide a video URL to save."),
+                mention_author=False,
+                ephemeral=True,
+            )
+            return
+        await self._save_impl(ctx, parsed)
+
+    @app_commands.command(
+        name="save",
+        description="Save a video or audio from a public URL and attach it.",
+    )
+    @app_commands.describe(
+        url="Public video URL to download.",
+        max_height="Optional max height to keep the file size down.",
+        audio_only="Download audio-only instead of video.",
+        audio_focus="Prefer higher audio bitrate when picking formats.",
+        item="Select which item to download from a carousel/playlist-like URL.",
+    )
+    async def save_slash(
+        self,
+        interaction: discord.Interaction,
+        url: str,
+        max_height: int | None = None,
+        audio_only: bool = False,
+        audio_focus: bool = False,
+        item: int = 1,
+    ) -> None:
+        ctx_factory = getattr(commands.Context, "from_interaction", None)
+        if ctx_factory is None:
+            await interaction.response.send_message(
+                "This command isn't available right now. Please try again later.", ephemeral=True
+            )
+            return
+        ctx_candidate = ctx_factory(interaction)
+        ctx = await ctx_candidate if inspect.isawaitable(ctx_candidate) else ctx_candidate
+        await self._save_impl(
+            ctx,
+            SaveRequest(
+                url=url,
+                max_height=max_height,
+                audio_only=audio_only,
+                audio_focus=audio_focus,
+                item=item,
+            ),
+        )
+
+    async def _save_impl(self, ctx: commands.Context, request: SaveRequest) -> None:
+        url = (request.url or "").strip()
+        max_height = request.max_height
+        audio_only = request.audio_only
+        audio_focus = request.audio_focus
+        item = request.item
+
         if not url:
             await safe_reply(
                 ctx,
-                tag_error_text("Provide a video URL to save."),
+                embed=error_embed(desc="Provide a video URL to save."),
                 mention_author=False,
                 ephemeral=True,
             )
@@ -643,7 +1158,7 @@ class Save(commands.Cog):
         if not ok:
             await safe_reply(
                 ctx,
-                tag_error_text("That URL is not allowed. Use a public http/https link."),
+                embed=error_embed(desc="That URL is not allowed. Use a public http/https link."),
                 mention_author=False,
                 ephemeral=True,
             )
@@ -663,12 +1178,42 @@ class Save(commands.Cog):
         async with self._sem:
             logger = YTDLLogger()
             headers = _extra_headers(url, self.cfg.user_agent)
+            resolved_url = await _resolve_url_for_policy(
+                url,
+                headers,
+                timeout_s=min(10, self.cfg.timeout_s),
+                dns_timeout_s=self.cfg.dns_timeout_s,
+            )
+            if resolved_url != url:
+                url = resolved_url
+                headers = _extra_headers(url, self.cfg.user_agent)
             host = urlparse(url).hostname or ""
             impersonate = self.cfg.impersonate
             if impersonate is None and (
                 "tiktok.com" in host or host.endswith("x.com") or host.endswith("twitter.com")
             ):
                 impersonate = "chrome"
+            cookies_file = self.cfg.cookies_file
+            cookies_from_browser = self.cfg.cookies_from_browser
+            auto_cookie_allowed = (
+                self.cfg.cookies_auto
+                and not cookies_file
+                and not cookies_from_browser
+                and (host.endswith("x.com") or host.endswith("twitter.com") or "tiktok.com" in host)
+            )
+            used_generic_extractor = False
+
+            progress_title = "⏳ Downloading audio..." if audio_only else "⏳ Downloading video..."
+            progress_embed = discord.Embed(
+                title=progress_title,
+                description=f"[{url}]({url})",
+                color=0xF1C40F,
+            )
+            progress_message: discord.Message | None = None
+            try:
+                progress_message = await safe_reply(ctx, embed=progress_embed, mention_author=False)
+            except Exception:
+                progress_message = None
 
             try:
                 self.cfg.work_root.mkdir(parents=True, exist_ok=True)
@@ -676,35 +1221,187 @@ class Save(commands.Cog):
                 with tempfile.TemporaryDirectory(prefix="savevideo_", dir=self.cfg.work_root) as tmp_dir:
                     tmp_path = Path(tmp_dir)
 
-                    info = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _probe_info,
-                            url,
-                            logger,
-                            headers,
-                            self.cfg.cookies_file,
-                            self.cfg.cookies_from_browser,
-                            impersonate,
-                        ),
-                        timeout=float(self.cfg.timeout_s),
-                    )
+                    last_probe_error: Exception | None = None
+                    probe_extra_opts: dict[str, Any] | None = None
+                    try:
+                        for attempt in range(3):
+                            try:
+                                info = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        _probe_info,
+                                        url,
+                                        logger,
+                                        headers,
+                                        cookies_file,
+                                        cookies_from_browser,
+                                        impersonate,
+                                        probe_extra_opts,
+                                    ),
+                                    timeout=float(self.cfg.timeout_s),
+                                )
+                                break
+                            except yt_dlp.utils.DownloadError as exc:
+                                last_probe_error = exc
+                                raw_error = str(exc).strip() or repr(exc)
+                                tail = logger.tail(self.cfg.log_tail_lines)
+                                kind = _classify_error(raw_error)
+                                if kind == "unknown" and tail:
+                                    kind = _classify_error(tail)
+
+                                if auto_cookie_allowed and cookies_from_browser is None and kind in {
+                                    "login_required",
+                                    "forbidden",
+                                    "rate_limited",
+                                    "private",
+                                    "unknown",
+                                }:
+                                    cookies_from_browser = (self.cfg.cookies_auto_browser,)
+                                    continue
+                                if not used_generic_extractor:
+                                    used_generic_extractor = True
+                                    probe_extra_opts = {"force_generic_extractor": True}
+                                    continue
+                                raise
+                        else:
+                            raise last_probe_error or RuntimeError("Download failed")
+                    except yt_dlp.utils.DownloadError as exc:
+                        fallback_urls: list[str] = []
+                        if host.endswith("x.com") or host.endswith("twitter.com"):
+                            fallback_urls.extend(
+                                await asyncio.to_thread(
+                                    _extract_x_fallback_urls,
+                                    url,
+                                    headers,
+                                    timeout_s=self.cfg.timeout_s,
+                                )
+                            )
+                        fallback_urls.extend(
+                            await asyncio.to_thread(
+                                _collect_html_fallback_urls,
+                                url,
+                                headers,
+                                timeout_s=self.cfg.timeout_s,
+                            )
+                        )
+                        candidate_url = None
+                        for candidate in fallback_urls:
+                            if await _is_safe_direct_url_async(
+                                candidate, dns_timeout_s=self.cfg.dns_timeout_s
+                            ):
+                                candidate_url = candidate
+                                break
+                        if candidate_url is None:
+                            raise exc
+                        url = candidate_url
+                        headers = _extra_headers(url, self.cfg.user_agent)
+                        host = urlparse(url).hostname or ""
+                        if impersonate is None and (
+                            "tiktok.com" in host or host.endswith("x.com") or host.endswith("twitter.com")
+                        ):
+                            impersonate = "chrome"
+                        if not (
+                            host.endswith("x.com") or host.endswith("twitter.com") or "tiktok.com" in host
+                        ):
+                            cookies_from_browser = None
+                        probe_extra_opts = {"force_generic_extractor": True}
+                        info = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _probe_info,
+                                url,
+                                logger,
+                                headers,
+                                cookies_file,
+                                cookies_from_browser,
+                                impersonate,
+                                probe_extra_opts,
+                            ),
+                            timeout=float(self.cfg.timeout_s),
+                        )
 
                     # yt-dlp can still return a playlist-like object in some edge cases.
-                    if isinstance(info.get("entries"), list):
-                        await safe_reply(
-                            ctx,
-                            tag_error_text(
-                                "This URL resolves to multiple items (playlist/carousel). "
-                                "This command currently supports a single video."
-                            ),
-                            mention_author=False,
-                            ephemeral=True,
+                    entries = info.get("entries")
+                    if isinstance(entries, list):
+                        if not entries:
+                            raise RuntimeError("No entries found in this URL.")
+                        if item < 1 or item > len(entries):
+                            range_message = (
+                                f"This URL contains {len(entries)} items. "
+                                "Choose one with `item` (slash) or `--item` (prefix)."
+                            )
+                            log.info("save item out of range: %s", range_message)
+                            range_embed = error_embed(desc=range_message)
+                            if progress_message is not None:
+                                try:
+                                    await progress_message.edit(
+                                        content=None, embed=range_embed, attachments=[]
+                                    )
+                                except Exception:
+                                    await safe_reply(
+                                        ctx,
+                                        embed=range_embed,
+                                        mention_author=False,
+                                        ephemeral=True,
+                                    )
+                            else:
+                                await safe_reply(
+                                    ctx,
+                                    embed=range_embed,
+                                    mention_author=False,
+                                    ephemeral=True,
+                                )
+                            return
+                        entry = entries[item - 1]
+                        if not isinstance(entry, dict):
+                            raise RuntimeError("Selected entry metadata is unavailable.")
+                        entry_url = _first_http_url(
+                            [entry.get("webpage_url"), entry.get("original_url"), entry.get("url")]
                         )
-                        return
+                        if not entry_url:
+                            raise RuntimeError(
+                                "This entry does not expose a direct URL. Try a direct link instead."
+                            )
+                        if not await _is_safe_direct_url_async(
+                            entry_url, dns_timeout_s=self.cfg.dns_timeout_s
+                        ):
+                            raise RuntimeError("That entry URL is not allowed.")
+                        url = entry_url
+                        headers = _extra_headers(url, self.cfg.user_agent)
+                        host = urlparse(url).hostname or ""
+                        if impersonate is None and (
+                            "tiktok.com" in host or host.endswith("x.com") or host.endswith("twitter.com")
+                        ):
+                            impersonate = "chrome"
+                        if auto_cookie_allowed:
+                            cookies_from_browser = (self.cfg.cookies_auto_browser,)
+                        else:
+                            cookies_from_browser = self.cfg.cookies_from_browser
+                        info = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _probe_info,
+                                url,
+                                logger,
+                                headers,
+                                cookies_file,
+                                cookies_from_browser,
+                                impersonate,
+                                probe_extra_opts,
+                            ),
+                            timeout=float(self.cfg.timeout_s),
+                        )
 
-                    candidates = _pick_best_formats(info, max_bytes=max_bytes, max_height=max_height)
-                    if not candidates:
-                        raise RuntimeError("No mp4-compatible formats found")
+                    if audio_only:
+                        candidates = _pick_best_audio_formats(info, max_bytes=max_bytes)
+                        if not candidates:
+                            raise RuntimeError("No audio-only formats found")
+                    else:
+                        candidates = _pick_best_formats(
+                            info,
+                            max_bytes=max_bytes,
+                            max_height=max_height,
+                            audio_focus=audio_focus,
+                        )
+                        if not candidates:
+                            raise RuntimeError("No mp4-compatible formats found")
 
                     last_error: Exception | None = None
                     download_info: dict[str, Any] | None = None
@@ -713,30 +1410,59 @@ class Save(commands.Cog):
                     chosen_est: int | None = None
 
                     # Try a few best candidates first.
-                    for spec, vfmt, afmt, est in candidates[:8]:
-                        try:
-                            chosen_spec = spec
-                            chosen_est = est if isinstance(est, int) else None
-                            download_info, download_path = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    _download_with_spec,
-                                    url,
-                                    format_spec=spec,
-                                    max_bytes=max_bytes,
-                                    logger=logger,
-                                    work_dir=tmp_path,
-                                    headers=headers,
-                                    cookies_file=self.cfg.cookies_file,
-                                    cookies_from_browser=self.cfg.cookies_from_browser,
-                                    socket_timeout=max(10, int(self.cfg.timeout_s)),
-                                    impersonate=impersonate,
-                                ),
-                                timeout=float(self.cfg.timeout_s),
-                            )
-                            break
-                        except Exception as exc:
-                            last_error = exc
-                            log.debug("save download failed for %s: %s", spec, exc)
+                    if audio_only:
+                        for spec, _fmt, est in candidates[:8]:
+                            try:
+                                chosen_spec = spec
+                                chosen_est = est if isinstance(est, int) else None
+                                download_info, download_path = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        _download_with_spec,
+                                        url,
+                                        format_spec=spec,
+                                        max_bytes=max_bytes,
+                                        logger=logger,
+                                        work_dir=tmp_path,
+                                        headers=headers,
+                                        cookies_file=cookies_file,
+                                        cookies_from_browser=cookies_from_browser,
+                                        socket_timeout=max(10, int(self.cfg.timeout_s)),
+                                        impersonate=impersonate,
+                                        prefer_exts=DEFAULT_AUDIO_EXTS,
+                                        extra_opts=probe_extra_opts,
+                                    ),
+                                    timeout=float(self.cfg.timeout_s),
+                                )
+                                break
+                            except Exception as exc:
+                                last_error = exc
+                                log.debug("save download failed for %s: %s", spec, exc)
+                    else:
+                        for spec, vfmt, afmt, est in candidates[:8]:
+                            try:
+                                chosen_spec = spec
+                                chosen_est = est if isinstance(est, int) else None
+                                download_info, download_path = await asyncio.wait_for(
+                                    asyncio.to_thread(
+                                        _download_with_spec,
+                                        url,
+                                        format_spec=spec,
+                                        max_bytes=max_bytes,
+                                        logger=logger,
+                                        work_dir=tmp_path,
+                                        headers=headers,
+                                        cookies_file=cookies_file,
+                                        cookies_from_browser=cookies_from_browser,
+                                        socket_timeout=max(10, int(self.cfg.timeout_s)),
+                                        impersonate=impersonate,
+                                        extra_opts=probe_extra_opts,
+                                    ),
+                                    timeout=float(self.cfg.timeout_s),
+                                )
+                                break
+                            except Exception as exc:
+                                last_error = exc
+                                log.debug("save download failed for %s: %s", spec, exc)
 
                     if download_path is None or download_info is None:
                         raise last_error or RuntimeError("Download failed")
@@ -757,13 +1483,15 @@ class Save(commands.Cog):
                     )
                     webpage_url = download_info.get("webpage_url") or info.get("webpage_url") or url
 
+                    embed_title = "💾 Audio saved" if audio_only else "💾 Video saved"
                     embed = discord.Embed(
-                        title="💾 Video saved",
+                        title=embed_title,
                         description=f"[{title}]({webpage_url})",
                         color=0x2ECC71,
                     )
                     embed.add_field(name="Duration", value=duration_text, inline=True)
-                    embed.add_field(name="Resolution", value=resolution, inline=True)
+                    if not audio_only:
+                        embed.add_field(name="Resolution", value=resolution, inline=True)
                     embed.add_field(name="Size", value=_human_size(file_size), inline=True)
                     if chosen_spec:
                         embed.add_field(name="Format", value=chosen_spec, inline=False)
@@ -771,23 +1499,58 @@ class Save(commands.Cog):
                         embed.add_field(name="Est. size", value=_human_size(chosen_est), inline=True)
                     embed.add_field(name="Discord limit", value=_human_size(max_upload_bytes), inline=True)
 
-                    file_obj = discord.File(download_path, filename="video.mp4")
-                    await safe_reply(ctx, embed=embed, file=file_obj, mention_author=False)
+                    if audio_only:
+                        abr = download_info.get("abr") or download_info.get("tbr")
+                        if isinstance(abr, (int, float)) and abr > 0:
+                            embed.add_field(name="Bitrate", value=f"{abr:.0f}kbps", inline=True)
+
+                    ext = download_path.suffix or ".mp4"
+                    filename = f"audio{ext}" if audio_only else f"video{ext}"
+                    file_obj = discord.File(download_path, filename=filename)
+                    if progress_message is not None:
+                        try:
+                            await progress_message.edit(
+                                embed=embed, attachments=[], files=[file_obj], content=None
+                            )
+                        except Exception:
+                            await safe_reply(ctx, embed=embed, file=file_obj, mention_author=False)
+                    else:
+                        await safe_reply(ctx, embed=embed, file=file_obj, mention_author=False)
 
             except yt_dlp.utils.DownloadError as exc:
-                await self._handle_error(ctx, url, exc, logger, max_upload_bytes)
-            except asyncio.TimeoutError:
-                await safe_reply(
-                    ctx,
-                    tag_error_text(
-                        f"Download timed out after {self.cfg.timeout_s}s. "
-                        "Try a shorter clip, or increase SAVEVIDEO_TIMEOUT_S."
-                    ),
-                    mention_author=False,
-                    ephemeral=True,
+                await self._handle_error(
+                    ctx, url, exc, logger, max_upload_bytes, progress_message=progress_message
                 )
+            except asyncio.TimeoutError:
+                timeout_message = (
+                    f"Download timed out after {self.cfg.timeout_s}s. "
+                    "Try a shorter clip, or increase SAVEVIDEO_TIMEOUT_S."
+                )
+                log.info("save timed out: %s", timeout_message)
+                timeout_embed = error_embed(desc=timeout_message)
+                if progress_message is not None:
+                    try:
+                        await progress_message.edit(
+                            content=None, embed=timeout_embed, attachments=[]
+                        )
+                    except Exception:
+                        await safe_reply(
+                            ctx,
+                            embed=timeout_embed,
+                            mention_author=False,
+                            ephemeral=True,
+                        )
+                else:
+                    await safe_reply(
+                        ctx,
+                        embed=timeout_embed,
+                        mention_author=False,
+                        ephemeral=True,
+                    )
             except Exception as exc:
-                await self._handle_error(ctx, url, exc, logger, max_upload_bytes)
+                await self._handle_error(
+                    ctx, url, exc, logger, max_upload_bytes, progress_message=progress_message
+                )
 
     async def _handle_error(
         self,
@@ -796,9 +1559,21 @@ class Save(commands.Cog):
         exc: Exception,
         logger: YTDLLogger,
         max_upload_bytes: int,
+        *,
+        progress_message: discord.Message | None = None,
     ) -> None:
-        raw_error = f"{exc}"
+        raw_error = str(exc).strip()
+        if not raw_error:
+            raw_error = str(getattr(exc, "msg", "") or "").strip()
+        if not raw_error and getattr(exc, "args", None):
+            raw_error = str(exc.args[0]).strip()
+        if not raw_error:
+            raw_error = repr(exc)
+
+        tail = logger.tail(self.cfg.log_tail_lines)
         kind = _classify_error(raw_error)
+        if kind == "unknown" and tail:
+            kind = _classify_error(tail)
 
         reason = {
             "unsupported_url": "Unsupported URL or no compatible formats.",
@@ -812,20 +1587,36 @@ class Save(commands.Cog):
             "unknown": "Extraction failed. The site may require cookies or a newer yt-dlp.",
         }.get(kind, "Extraction failed.")
 
-        tail = logger.tail(self.cfg.log_tail_lines)
-        base = f"{reason}\nURL: {url}\nRaw error: {_truncate_text(raw_error, 500)}"
+        host = urlparse(url).hostname or ""
+        cookies_hint = ""
+        if (
+            not self.cfg.cookies_file
+            and not self.cfg.cookies_from_browser
+            and (host.endswith("x.com") or host.endswith("twitter.com") or "tiktok.com" in host)
+        ):
+            cookies_hint = (
+                "\nThis site often requires login cookies. "
+                "Set SAVEVIDEO_COOKIES_FILE or SAVEVIDEO_COOKIES_FROM_BROWSER."
+            )
+
+        base = f"{reason}{cookies_hint}\nURL: {url}\nRaw error: {_truncate_text(raw_error, 500)}"
         message = _assemble_error_message(
             base=base,
             tail=tail,
             max_len=DEFAULT_ERROR_TEXT_MAX,
         )
 
-        await safe_reply(
-            ctx,
-            _cap_error_message(message, DISCORD_CONTENT_LIMIT),
-            mention_author=False,
-            ephemeral=True,
-        )
+        content = _cap_error_message(message, DISCORD_CONTENT_LIMIT)
+        log.info("save error: %s", content)
+        error = error_embed(desc=content)
+        if progress_message is not None:
+            try:
+                await progress_message.edit(content=None, embed=error, attachments=[])
+                return
+            except Exception:
+                pass
+
+        await safe_reply(ctx, embed=error, mention_author=False, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
