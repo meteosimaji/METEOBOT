@@ -609,8 +609,8 @@ def _extract_meta_refresh_url(html_text: str) -> str | None:
 def _extract_js_redirect_url(html_text: str) -> str | None:
     html_text = html.unescape(html_text)
     patterns = [
-        r"location\\.replace\\(['\\\"]([^'\\\"]+)",
-        r"location\\.href\\s*=\\s*['\\\"]([^'\\\"]+)",
+        r"location\\.replace\\(['\\\"]([^'\\\"]+)['\\\"]\\)",
+        r"location\\.href\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]",
     ]
     for pattern in patterns:
         match = re.search(pattern, html_text, re.IGNORECASE)
