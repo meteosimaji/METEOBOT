@@ -64,6 +64,7 @@
 - `skip` — Skip the current track.
 - `tex` — Render LaTeX to crisp PNGs with both white and transparent backgrounds plus a PDF; both preview variants are attached together. Supports up to four pages (keeps Discord attachments under the cap) and works great when invoked via `/ask` tool-calling.
 - `tune` — Set speed and pitch (`/tune 1.2 0.9`).
+- `upload` — Upload a file (attachment or `/mnt/data/...` path) to a temporary `simajilord.com/save/<token>` link for sharing or playback.
 - `uptime` — Show how long the bot has been running.
 - `userinfo` — Show a member's profile with timestamps, roles, and bot status.
 - `video` — Generate or remix short videos with Sora from a prompt, a reference image (first frame), or a `video_...` ID; best prompts describe shot type, subject, action, setting, and lighting. Attach images, HTTPS URLs, or Discord message links to use as reference. Optional tokens: `seconds:4|8|12`, `size:720x1280|1280x720`. Limits: global usage is capped at 2 videos per day across all servers; each user can run /video once per day across all servers; each server can run /video twice per week shared across users (weekly reset Sunday 00:00 UTC).
