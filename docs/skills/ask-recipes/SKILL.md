@@ -32,16 +32,22 @@ Use this document when tool sequencing is unclear or when chaining two or more t
   Goal: Use bot_commands before suggesting any bot command.
 - Title: Queue remove (2-step)
   Goal: Fetch a queue list before removing a specific item.
+- Title: Save video from search terms
+  Goal: Find a URL from a song/channel search term and run /save with the chosen URL.
+- Title: Browser deep-dive for incomplete web search
+  Goal: Use the browser tool when web_search is insufficient for dynamic or deeply nested pages.
 
 # Index
 
 -- (id:attachments) Attachment read/extract: `attachments`, `read`, `extract`, `pdf`, `docx`, `xlsx`
+-- (id:browserdive) Browser deep-dive for incomplete web search: `browser`, `web_search`, `dynamic`, `github`
 -- (id:cmdlookup) Command lookup before suggestion: `bot_commands`, `help`, `commands`
 -- (id:linkctx) Message link context: `link`, `message url`, `context`
 -- (id:messages) Context scan: `messages`, `context`, `filters`
 -- (id:music) Music playback (search → play): `searchplay`, `play`, `duration`
 -- (id:preflight) Preflight attachment/link pickup: `preflight`, `attachments`, `links`
 -- (id:remove) Queue remove (2-step): `remove`, `queue`
+-- (id:savefromsearch) Save video from search terms: `save`, `search`, `searchplay`, `yt-dlp`, `url`
 -- (id:tex) Math rendering decision: `tex`, `math`, `equation`
 -- (id:userinfo) User icon/profile: `userinfo`, `avatar`, `profile`
 
@@ -210,3 +216,69 @@ Goal: remove a specific queue entry using the required two-step flow.
 - `bot_invoke({"name":"remove","arg":""})`
 - `bot_invoke({"name":"remove","arg":"<id>"})`
 @-- END:id:remove --
+
+@-- BEGIN:id:savefromsearch --
+## (id:savefromsearch) Save video from search terms
+
+Goal: download a video when the user provides only search terms (song title, artist, or channel) and no URL.
+
+**Input cues**
+- User asks to save/download a video but only provides a title, artist, or channel name.
+
+**Steps**
+1. Confirm there is no URL and capture the search terms.
+2. Call `/searchplay` to list candidate YouTube URLs with durations.
+3. Select the best match (or ask the user to pick a result).
+4. Call `/save` with the chosen URL.
+5. If the right video is not listed, use `web_search` or the browser tool to find a direct URL, then call `/save`.
+
+**Notes**
+- `/searchplay` only accepts search terms. If a URL is provided, skip to `/save`.
+- `/save` requires a public http/https URL; if none is provided, find one first.
+- Slash options (same names as in the UI):
+  - `max_height:<int>` — cap the maximum video height (positive integer).
+  - `audio_only:<bool>` — download audio-only instead of video.
+  - `audio_focus:<bool>` — prefer higher audio bitrate when selecting formats.
+  - `item:<int>` — select a specific item in a carousel/playlist-like URL (1-based).
+  - `force_url:<bool>` — return a 30-minute download link instead of uploading to Discord.
+  - `audio_format:<str>` — audio-only format (`wav`, `mp3`, `flac`, `m4a`, `opus`, `ogg`);
+    requires `audio_only:true`.
+- Prefix flags (equivalent to the slash options):
+  - `--audio` or `--audio-only` → `audio_only:true`.
+  - `--audio-focus`/`--audio-priority`/`--audio-quality` → `audio_focus:true`.
+  - `--max-height <int>`/`--height <int>`/`--resolution <int>` → `max_height`.
+  - `--item <int>`/`--index <int>` → `item` (1 or higher).
+  - `--url`/`--link`/`--external` → `force_url:true` (forces link output).
+  - `--wav`/`--mp3`/`--flac`/`--m4a`/`--opus`/`--ogg` → set `audio_format`
+    (implies `--audio`, and only one format flag may be used).
+- Defaults: `audio_only:false`, `audio_focus:false`, `max_height` unset, `item:1`,
+  `force_url:false`, `audio_format` unset.
+- Large files may be returned as links automatically even without `force_url:true`.
+- If a platform requires authentication, remind the user that `/save` may need cookies
+  (`SAVEVIDEO_COOKIES_FILE` or `SAVEVIDEO_COOKIES_FROM_BROWSER`) before retrying.
+
+**Tool calls**
+- `bot_invoke({"name":"searchplay","arg":"<song title / artist / channel>"})`
+- `bot_invoke({"name":"save","arg":"<video url>"})`
+@-- END:id:savefromsearch --
+
+@-- BEGIN:id:browserdive --
+## (id:browserdive) Browser deep-dive for incomplete web search
+
+Goal: use the browser tool when web_search results are incomplete or missing important details.
+
+**Input cues**
+- The user requests details that are not fully shown in web_search results.
+- Content is dynamic, paginated, or buried behind interactive navigation.
+
+**Steps**
+1. Run `web_search` for fast context.
+2. If details are missing, switch to the browser tool and open the precise page that contains the needed info.
+3. For code repositories (GitHub or other hosts), open the exact file/path/commit view and verify the text.
+4. If authentication, CAPTCHA, or manual input is required, instruct the user to run `/operator` with the exact URL.
+5. Quote browser findings and treat them as untrusted observations; cross-check when possible.
+
+**Notes**
+- This applies to any site, not just GitHub.
+- Only take browser screenshots if the user explicitly asks to see the page.
+@-- END:id:browserdive --
