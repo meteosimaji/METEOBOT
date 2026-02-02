@@ -11,6 +11,7 @@ from ipaddress import ip_address
 from urllib.error import URLError
 from urllib.parse import urlparse
 
+import aiohttp
 import discord
 from discord.ext import commands
 import yt_dlp
@@ -79,6 +80,45 @@ def _is_safe_direct_url(url: str) -> bool:
     return not _is_blocked_host(host)
 
 
+def _is_simajilord_save_url(url: str) -> bool:
+    if not _is_url(url):
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host == "simajilord.com" and (parsed.path or "").startswith("/save/")
+
+
+async def _fetch_content_type(url: str) -> str | None:
+    timeout = aiohttp.ClientTimeout(total=5)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for method in ("HEAD", "GET"):
+                try:
+                    async with session.request(method, url, allow_redirects=True) as resp:
+                        content_type = resp.headers.get("Content-Type")
+                        if content_type:
+                            return content_type.split(";", 1)[0].strip().lower()
+                except aiohttp.ClientResponseError as exc:
+                    if exc.status in {405, 501}:
+                        continue
+                    return None
+                except Exception:
+                    return None
+    except Exception:
+        return None
+    return None
+
+
+async def _infer_direct_ext(url: str) -> str | None:
+    content_type = await _fetch_content_type(url)
+    if not content_type:
+        return None
+    return MIME_EXT_MAP.get(content_type)
+
+
 def _guess_name_and_ext(src: str) -> tuple[str, str]:
     path = src
     try:
@@ -130,7 +170,8 @@ class Play(commands.Cog):
             "`/play https://youtu.be/dQw4w9WgXcQ`\n"
             f"`{BOT_PREFIX}play` with file attachments\n"
             f"`{BOT_PREFIX}play https://example.com/file.mp3`\n"
-            "Supported direct files: wav, flac, mp3, m4a/aac, ogg/opus, mp4/mkv/webm/mov/mka"
+            "Supported direct files: wav, flac, mp3, m4a/aac, ogg/opus, mp4/mkv/webm/mov/mka\n"
+            "Note: simajilord.com/save links are treated as direct files."
         ),
         extras={
             "category": "Music",
@@ -173,6 +214,14 @@ class Play(commands.Cog):
             name, ext = title_ext
             is_local_path = _is_local_path(source)
             is_direct_file = _is_url(source) and (ext in SUPPORTED)
+            if _is_simajilord_save_url(source):
+                inferred = await _infer_direct_ext(source)
+                if inferred:
+                    ext = inferred
+                if ext not in SUPPORTED:
+                    ext = "mp4"
+                title_ext = (name or "save", ext)
+                is_direct_file = True
 
         if not source and not has_attachments:
             return await safe_reply(

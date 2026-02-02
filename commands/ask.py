@@ -5125,16 +5125,24 @@ class Ask(commands.Cog):
         if not text:
             return text
         link_map: dict[str, str] = {}
+
+        def add_link_key(key: Any, url: Any) -> None:
+            if isinstance(key, str) and isinstance(url, str):
+                link_map.setdefault(key, url)
+
+        def add_entry(entry: dict[str, Any]) -> None:
+            filename = entry.get("filename")
+            url = entry.get("url")
+            add_link_key(filename, url)
+            add_link_key(entry.get("path"), url)
+            add_link_key(entry.get("id"), url)
+            if isinstance(filename, str):
+                add_link_key(Path(filename).name, url)
+
         for entry in entries:
-            filename = entry.get("filename")
-            url = entry.get("url")
-            if isinstance(filename, str) and isinstance(url, str):
-                link_map.setdefault(filename, url)
+            add_entry(entry)
         for entry in files:
-            filename = entry.get("filename")
-            url = entry.get("url")
-            if isinstance(filename, str) and isinstance(url, str):
-                link_map.setdefault(filename, url)
+            add_entry(entry)
 
         def replace_single(match: re.Match[str]) -> str:
             name = match.group(1).strip()
@@ -5183,6 +5191,7 @@ class Ask(commands.Cog):
                             "container_id": str(container_id),
                             "file_id": str(file_id),
                             "filename": self._get_field_value(annotation, "filename"),
+                            "path": self._get_field_value(annotation, "path"),
                         }
                     )
         return results
@@ -5334,6 +5343,7 @@ class Ask(commands.Cog):
                             "container_id": container_id,
                             "file_id": file_id,
                             "filename": filename,
+                            "path": path,
                         }
                     )
                     if len(citations) >= ASK_CONTAINER_FILE_MAX_COUNT:
@@ -5363,6 +5373,7 @@ class Ask(commands.Cog):
             if not container_id or not file_id:
                 continue
             filename = str(citation.get("filename") or f"{file_id}.bin")
+            container_path = citation.get("path")
             safe_name = self._sanitize_workspace_name(filename)
             dest_dir = workspace_dir / "container_files"
             dest_path = dest_dir / f"{uuid.uuid4().hex[:8]}_{safe_name}"
@@ -5394,6 +5405,7 @@ class Ask(commands.Cog):
             entry = {
                 "id": link_id,
                 "filename": filename,
+                "path": container_path,
                 "size": size,
                 "content_type": content_type,
                 "url": link,
@@ -5405,6 +5417,7 @@ class Ask(commands.Cog):
                 "created_at": created_at.isoformat(),
                 "url": link,
                 "filename": filename,
+                "path": container_path,
                 "bytes": size,
                 "content_type": content_type,
                 "source": "ask_container",
@@ -5421,6 +5434,7 @@ class Ask(commands.Cog):
                     "size": size,
                     "stored_at": created_at.isoformat(),
                     "source": "container_file",
+                    "container_path": container_path,
                     "original_path": str(dest_path.relative_to(self._repo_root)),
                     "expires_at": entry["expires_at"],
                 }
@@ -9275,7 +9289,10 @@ class Ask(commands.Cog):
             f"When you create files with the python tool, the bot will mirror up to {ASK_CONTAINER_FILE_MAX_COUNT} outputs as temporary download links (about 30 minutes) and list them under \"Generated files (30 min)\". "
             "List the filenames you created and briefly describe what each contains. Do NOT invent or guess download URLs. "
             "When creating files, use clear deterministic names like output.csv, results.json, or plot.png. "
-            "To reference links in your reply, use {{link:filename}} or {{links}} placeholders; the bot replaces them with real URLs. "
+            "To reference links in your reply, use {{link:/mnt/data/filename}} (full container path) or {{links}} placeholders; the bot replaces them with real URLs. "
+            "Always use the full /mnt/data/... path in {{link:...}} to avoid collisions between files with the same name. "
+            "If you need a download URL to use in /play, /save, or browser actions, call /upload via bot_invoke with the full "
+            "/mnt/data path and use the returned url (do not guess). "
             "Do not paste full documents into the prompt; instead inspect the workspace via shell (tree/rg/lines/head/tail) and read only relevant sections. "
             "When unsure or before chaining two or more tools/bot commands, consult docs/skills/ask-recipes/SKILL.md and follow the matching recipe when available. "
             "Recipe areas (music/userinfo/messages/attachments/link context/tex/remove/cmdlookup/preflight/savefromsearch/browserdive) must use the recipe flow; do not invent new sequences. "
@@ -9542,16 +9559,21 @@ class Ask(commands.Cog):
                     color=0x5865F2,
                 )
 
+            files_embed = None
             if container_files:
                 file_lines = []
                 for entry in container_files:
                     filename = str(entry.get("filename") or "output")
                     url = str(entry.get("url") or "")
+                    path = entry.get("path")
                     size = entry.get("size")
                     size_label = f"{size:,} bytes" if isinstance(size, int) else "size unknown"
-                    file_lines.append(f"- [{filename}]({url}) ({size_label})")
+                    if isinstance(path, str) and path:
+                        file_lines.append(f"- [{filename}]({url}) ({size_label}, {path})")
+                    else:
+                        file_lines.append(f"- [{filename}]({url}) ({size_label})")
                 files_text = "\n".join(file_lines)
-                if len(files_text) > 1024:
+                if len(files_text) > 4096:
                     attached, truncated = _extend_text_files(
                         files,
                         "ask-outputs.txt",
@@ -9562,23 +9584,23 @@ class Ask(commands.Cog):
                         note = "See attached ask-outputs.txt (30 min links)."
                         if truncated:
                             note = "See attached ask-outputs.txt (truncated, 30 min links)."
-                        embed.add_field(
-                            name="Generated files (30 min)",
-                            value=note,
-                            inline=False,
+                        files_embed = discord.Embed(
+                            title="Generated files (30 min)",
+                            description=note,
+                            color=0x5865F2,
                         )
                     else:
-                        preview = _truncate_discord(files_text, 1024)
-                        embed.add_field(
-                            name="Generated files (30 min)",
-                            value=preview,
-                            inline=False,
+                        preview = _truncate_discord(files_text, 4096)
+                        files_embed = discord.Embed(
+                            title="Generated files (30 min)",
+                            description=preview,
+                            color=0x5865F2,
                         )
                 else:
-                    embed.add_field(
-                        name="Generated files (30 min)",
-                        value=files_text,
-                        inline=False,
+                    files_embed = discord.Embed(
+                        title="Generated files (30 min)",
+                        description=files_text,
+                        color=0x5865F2,
                     )
 
             trimmed = _clamp_embed_description(embed)
@@ -9596,6 +9618,8 @@ class Ask(commands.Cog):
                 if sources_files:
                     sources_kwargs["files"] = sources_files
                 await self._reply(ctx, reference=main_message, **sources_kwargs)
+            if files_embed:
+                await self._reply(ctx, reference=main_message, embed=files_embed)
             run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
             for run_id in run_ids:
                 self._start_pending_ask_auto_delete(run_id)
