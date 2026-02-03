@@ -43,6 +43,8 @@
 - `autoleave` — Toggle Auto Leave (disconnect when idle/bot-only) or view the current state.
 - `bye` — Stop playback, clear the queue, and leave voice.
 - `codex` — Owner-only: run Codex CLI in an isolated workspace and return a git diff attachment. Can also open a GitHub PR when configured (see CODEX_GITHUB_REPO and GITHUB_TOKEN). Use `/codex {"prompt":"...","github_pr":true}` to enable PR creation.
+- `finance` — Pull Yahoo Finance quotes, charts, news, and watchlist alerts via yfinance with strict symbol matching (ticker or exact registered name), plus machine-readable JSON output.
+- `financeq` — Tool-friendly finance query that accepts a single key:value string for bot_invoke calls.
 - `help` — Browse commands and events or get detailed help.
 - `image` — Generate or edit a 1024x1024 PNG with gpt-image-1.5; attach images, include public HTTPS image URLs, or paste Discord message links with attachments in the prompt to edit (first image is the base, the rest are references; up to 16 inputs, each under 50MB). HEIC/HEIF uploads are accepted and converted internally when `pillow-heif` is available.
 - `loopmode` — Set looping to off, track, or queue (or display the current mode).

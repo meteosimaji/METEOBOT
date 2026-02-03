@@ -9316,6 +9316,7 @@ class Ask(commands.Cog):
             "Search queries can still work, but they sometimes pick endurance/loop versions; when possible, prefer a direct URL with /play for accuracy. "
             "When the user provides only search terms (no URL), call /searchplay first to list candidates (with durations) before using /play. "
             "When bot_invoke /play returns play_result with MAIN/R labels, use those labeled URLs for follow-up /play calls. "
+            "For finance bot_invoke calls, prefer /financeq with a single key:value string (e.g., \"7203.T action:candle period:6mo interval:1d\"). "
             "For /remove, call it with no arg first to get a numbered list with IDs, then pass the number or ID you want removed. "
             "For clean math rendering, call /tex (single arg) only when the user wants a rendered equation or when plain text would break; keep your text response short and reference the attached image. Wrap equations with math delimiters ($...$ or \\[...\\]); single-line expressions auto-wrap by default but explicit delimiters are preferred. For multi-line equations, use \\[\\begin{aligned} ... \\end{aligned}\\] and align equals with &. Example /tex calls: bot_invoke({'name': 'tex', 'arg': '\\[E=mc^2\\]'}); for full documents: bot_invoke({'name': 'tex', 'arg': '\\documentclass[preview]{standalone}\\n\\usepackage{amsmath}\\n\\begin{document}\\n\\[a^2+b^2=c^2\\]\\n\\end{document}\\n'}). "
             "Use bot_invoke only for safe commands. bot_invoke always requires an arg field: "
