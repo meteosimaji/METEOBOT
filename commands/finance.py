@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from utils import BOT_PREFIX, defer_interaction, safe_reply, tag_error_embed, tag_error_text
@@ -40,6 +41,27 @@ TICKER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-^=]{0,31}$")
 CODE_ONLY_RE = re.compile(r"^\d{4,5}$")
 JPX_CODE_RE = re.compile(r"^[0-9][0-9A-Z]{3}$")
 INTRADAY_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
+FINANCE_ACTIONS = (
+    "summary",
+    "quote",
+    "chart",
+    "candle",
+    "ta",
+    "forecast",
+    "news",
+    "symbols",
+    "search",
+    "lookup",
+    "screener_local",
+    "watch_add",
+    "watch_remove",
+    "watch_list",
+    "data",
+)
+FINANCE_ACTION_SET = set(FINANCE_ACTIONS)
+FINANCE_ACTION_CHOICES = [
+    app_commands.Choice(name=action, value=action) for action in FINANCE_ACTIONS
+]
 
 DATA_SECTIONS: dict[str, str] = {
     "fast_info": "t.fast_info (dict)",
@@ -851,6 +873,7 @@ class Finance(commands.Cog):
         if self._monitor_task:
             self._monitor_task.cancel()
 
+    @app_commands.choices(action=FINANCE_ACTION_CHOICES)
     @commands.hybrid_command(
         name="finance",
         description="Stocks: quote/chart/news/watchlist/data (Yahoo Finance via yfinance).",
@@ -885,23 +908,7 @@ class Finance(commands.Cog):
         self,
         ctx: commands.Context,
         symbol: str | None = None,
-        action: Literal[
-            "summary",
-            "quote",
-            "chart",
-            "candle",
-            "ta",
-            "forecast",
-            "news",
-            "symbols",
-            "search",
-            "lookup",
-            "screener_local",
-            "watch_add",
-            "watch_remove",
-            "watch_list",
-            "data",
-        ] = "summary",
+        action: str = "summary",
         period: str = "1mo",
         interval: str = "1d",
         auto_adjust: bool = True,
@@ -1019,25 +1026,21 @@ class Finance(commands.Cog):
             auto_adjust = _as_bool(kv.get("auto_adjust"), auto_adjust)
             remove_all = _as_bool(kv.get("remove_all"), remove_all)
 
-        if symbol and action == "summary" and symbol in {
-            "summary",
-            "quote",
-            "chart",
-            "candle",
-            "ta",
-            "forecast",
-            "news",
-            "symbols",
-            "search",
-            "lookup",
-            "screener_local",
-            "watch_add",
-            "watch_remove",
-            "watch_list",
-            "data",
-        }:
-            action = symbol  # type: ignore[assignment]
+        action = action.strip().lower() or "summary"
+
+        if symbol and action == "summary" and symbol in FINANCE_ACTION_SET:
+            action = symbol
             symbol = None
+
+        if action not in FINANCE_ACTION_SET:
+            action_list = ", ".join(FINANCE_ACTIONS)
+            await safe_reply(
+                ctx,
+                content=tag_error_text(
+                    f"Unknown action: {action}. Choose one of: {action_list}."
+                ),
+            )
+            return
 
         if action == "symbols":
             await self._send_symbols(ctx)
