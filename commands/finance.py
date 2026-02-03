@@ -143,6 +143,9 @@ class SymbolRegistry:
     def symbols(self) -> list[ListedSymbol]:
         return list(self._symbols)
 
+    def find_by_name(self, name: str) -> ListedSymbol | None:
+        return self._by_name.get(name)
+
     def resolve_strict(self, raw: str) -> tuple[str, str]:
         """
         仕様:
@@ -869,6 +872,70 @@ class Finance(commands.Cog):
             return display
         return _display_name_from_quote(ticker, display, quote)
 
+    @staticmethod
+    def _normalize_symbol_input(raw: str) -> str:
+        s = (raw or "").strip()
+        if not s:
+            return s
+        return s.rstrip(" ,，、")
+
+    async def _resolve_symbol(self, raw: str) -> tuple[str, str]:
+        s = self._normalize_symbol_input(raw)
+        if not s:
+            raise ValueError("symbol_empty")
+
+        if CODE_ONLY_RE.match(s) or JPX_CODE_RE.match(s):
+            return await self._resolve_via_search(s, prefer_code=True)
+
+        if TICKER_RE.match(s):
+            return s, s
+
+        hit = self.reg.find_by_name(s)
+        if hit:
+            return hit.ticker, hit.name
+
+        return await self._resolve_via_search(s, prefer_code=False)
+
+    @staticmethod
+    def _pick_search_candidate(
+        results: list[dict[str, Any]], query: str, *, prefer_code: bool
+    ) -> tuple[str | None, str | None]:
+        candidates = [r for r in results if r.get("symbol")]
+        if not candidates:
+            return None, None
+
+        if prefer_code:
+            for row in candidates:
+                symbol = str(row.get("symbol") or "")
+                if symbol.startswith(f"{query}."):
+                    name = row.get("name") or row.get("shortname") or row.get("longname")
+                    return symbol, str(name) if name else symbol
+            for row in candidates:
+                symbol = str(row.get("symbol") or "")
+                if symbol == query:
+                    name = row.get("name") or row.get("shortname") or row.get("longname")
+                    return symbol, str(name) if name else symbol
+
+        row = candidates[0]
+        symbol = str(row.get("symbol") or "")
+        name = row.get("name") or row.get("shortname") or row.get("longname")
+        return symbol or None, str(name) if name else symbol or None
+
+    async def _resolve_via_search(
+        self, query: str, *, prefer_code: bool
+    ) -> tuple[str, str]:
+        results = await self._search_candidates(query, limit=10)
+        if not results:
+            raise LookupError("symbol_unknown")
+
+        ticker, display = self._pick_search_candidate(
+            results, query, prefer_code=prefer_code
+        )
+        if not ticker:
+            raise LookupError("symbol_unknown")
+
+        return ticker, display or ticker
+
     def cog_unload(self) -> None:
         if self._monitor_task:
             self._monitor_task.cancel()
@@ -899,7 +966,7 @@ class Finance(commands.Cog):
         extras={
             "category": "Tools",
             "pro": (
-                "Strict symbol matching (exact registry name or ticker) plus "
+                "Flexible symbol matching (tickers or Yahoo search resolution) plus "
                 "best-effort data pulls from Yahoo Finance via yfinance, "
                 "including chart output. Use action:search if you only know the company name."),
         },
@@ -1122,8 +1189,12 @@ class Finance(commands.Cog):
             err_code = "symbol_unknown"
             names = [n.strip() for n in msg.split(":", 1)[1].split(",") if n.strip()]
             suggestions = [{"name": n} for n in names]
-            desc = "Unknown symbol. Exact-match name required.\nSuggestions:\n" + "\n".join(
-                names
+            desc = (
+                "Unknown symbol. Try a ticker (e.g. 7203.T) or "
+                "use /finance action:search query:<name>.\n"
+                "If search returns no results, try the English name or ticker, "
+                "or check via browser/web search.\nSuggestions:\n"
+                + "\n".join(names)
             )
         elif isinstance(exc, LookupError) and msg.startswith("ticker_missing_suffix:"):
             err_code = "ticker_missing_suffix"
@@ -1146,8 +1217,9 @@ class Finance(commands.Cog):
         elif isinstance(exc, LookupError):
             err_code = "symbol_unknown"
             desc = (
-                "Unknown symbol. Use ticker (e.g. 7203.T) or exact registry "
-                "name (e.g. トヨタ自動車(株))."
+                "Unknown symbol. Use a ticker (e.g. 7203.T) or "
+                "run /finance action:search query:<name/code> to find one. "
+                "If search fails, try the English name or use browser/web search."
             )
         elif isinstance(exc, ValueError) and msg == "symbol_empty":
             err_code = "symbol_empty"
@@ -1301,7 +1373,7 @@ class Finance(commands.Cog):
 
     async def _send_quote_only(self, ctx: commands.Context, symbol: str) -> None:
         try:
-            ticker, display = self.reg.resolve_strict(symbol)
+            ticker, display = await self._resolve_symbol(symbol)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1380,7 +1452,7 @@ class Finance(commands.Cog):
         auto_adjust: bool,
     ) -> None:
         try:
-            ticker, display = self.reg.resolve_strict(symbol)
+            ticker, display = await self._resolve_symbol(symbol)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1497,7 +1569,7 @@ class Finance(commands.Cog):
         self, ctx: commands.Context, *, symbol: str, period: str, interval: str
     ) -> None:
         try:
-            ticker, display = self.reg.resolve_strict(symbol)
+            ticker, display = await self._resolve_symbol(symbol)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1557,7 +1629,7 @@ class Finance(commands.Cog):
         self, ctx: commands.Context, *, symbol: str, period: str, interval: str
     ) -> None:
         try:
-            ticker, display = self.reg.resolve_strict(symbol)
+            ticker, display = await self._resolve_symbol(symbol)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1661,7 +1733,7 @@ class Finance(commands.Cog):
         paths: int,
     ) -> None:
         try:
-            ticker, display = self.reg.resolve_strict(symbol)
+            ticker, display = await self._resolve_symbol(symbol)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1932,7 +2004,7 @@ class Finance(commands.Cog):
 
     async def _send_news(self, ctx: commands.Context, symbol: str, limit: int) -> None:
         try:
-            ticker, display = self.reg.resolve_strict(symbol)
+            ticker, display = await self._resolve_symbol(symbol)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2004,7 +2076,7 @@ class Finance(commands.Cog):
         self, ctx: commands.Context, symbol: str, *, section: str, max_rows: int
     ) -> None:
         try:
-            ticker, display = self.reg.resolve_strict(symbol)
+            ticker, display = await self._resolve_symbol(symbol)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2075,7 +2147,7 @@ class Finance(commands.Cog):
         check_every_s: int,
     ) -> None:
         try:
-            ticker, display = self.reg.resolve_strict(symbol)
+            ticker, display = await self._resolve_symbol(symbol)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2138,7 +2210,7 @@ class Finance(commands.Cog):
         remove_all: bool,
     ) -> None:
         try:
-            ticker, display = self.reg.resolve_strict(symbol)
+            ticker, display = await self._resolve_symbol(symbol)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
