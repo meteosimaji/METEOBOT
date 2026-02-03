@@ -387,7 +387,7 @@ def _plot_line_chart(df: pd.DataFrame, title: str) -> BytesIO:
 
 
 def _json_compact(obj: Any, max_len: int = 800) -> str:
-    s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
     if len(s) <= max_len:
         return s
     truncated = s[: max_len - 3] + "..."
@@ -395,6 +395,7 @@ def _json_compact(obj: Any, max_len: int = 800) -> str:
         {"truncated": True, "preview": truncated},
         ensure_ascii=False,
         separators=(",", ":"),
+        default=str,
     )
 
 
@@ -416,6 +417,110 @@ def _make_json_file(obj: Any, filename: str) -> discord.File:
     return discord.File(fp=BytesIO(data), filename=filename)
 
 
+def _compact_dict(source: dict[str, Any], keys: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in keys:
+        if key in source:
+            out[key] = source.get(key)
+    return out
+
+
+def _summarize_finance_payload(payload: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
+    action = (meta.get("action") or payload.get("action") or "").strip().lower()
+    summary: dict[str, Any] = {
+        "action": action or None,
+        "ticker": payload.get("ticker"),
+        "display": payload.get("display"),
+    }
+    if payload.get("asof_jst"):
+        summary["asof_jst"] = payload.get("asof_jst")
+    if payload.get("params"):
+        summary["params"] = payload.get("params")
+
+    if action in {"summary", "quote"}:
+        quote = payload.get("quote") or {}
+        if isinstance(quote, dict):
+            summary["quote"] = _compact_dict(
+                quote,
+                [
+                    "price",
+                    "prev_close",
+                    "open",
+                    "day_low",
+                    "day_high",
+                    "52w_low",
+                    "52w_high",
+                    "volume",
+                    "market_cap",
+                    "currency",
+                    "change",
+                    "change_pct",
+                ],
+            )
+    elif action == "ta":
+        latest = payload.get("latest")
+        if isinstance(latest, dict):
+            summary["latest_indicators"] = _compact_dict(
+                latest,
+                [
+                    "rsi",
+                    "macd",
+                    "macd_signal",
+                    "macd_hist",
+                    "bb_mid",
+                    "bb_upper",
+                    "bb_lower",
+                ],
+            )
+    elif action == "forecast":
+        forecast = payload.get("forecast")
+        if isinstance(forecast, dict):
+            summary["forecast"] = _compact_dict(
+                forecast,
+                ["s0", "mu", "sigma", "horizon_days", "paths", "end_quantiles", "var95"],
+            )
+    elif action == "news":
+        items = payload.get("items")
+        if isinstance(items, list):
+            summary["news_items"] = items[:5]
+    elif action == "symbols":
+        summary["count"] = payload.get("count")
+        symbols = payload.get("symbols")
+        if isinstance(symbols, list):
+            summary["symbols_preview"] = symbols[:10]
+    elif action == "search":
+        summary["query"] = payload.get("query")
+        summary["region"] = payload.get("region")
+        results = payload.get("results")
+        if isinstance(results, list):
+            summary["results_preview"] = results[:10]
+            summary["result_count"] = len(results)
+    elif action == "lookup":
+        summary["query"] = payload.get("query")
+        summary["kind"] = payload.get("kind")
+        summary["rows"] = payload.get("rows")
+    elif action == "screener_local":
+        summary["min_market_cap"] = payload.get("min_market_cap")
+        summary["max_pe"] = payload.get("max_pe")
+        summary["rows"] = payload.get("rows")
+    elif action == "data":
+        summary["section"] = payload.get("section")
+    elif action == "watch_add":
+        summary["entry"] = payload.get("entry")
+    elif action == "watch_remove":
+        summary["remove"] = _compact_dict(
+            payload,
+            ["ticker", "display", "channel_id", "remove_all"],
+        )
+    elif action == "watch_list":
+        entries = payload.get("entries")
+        if isinstance(entries, list):
+            summary["entries_preview"] = entries[:10]
+            summary["entries_count"] = len(entries)
+
+    return summary
+
+
 async def _send_with_json(
     ctx: commands.Context,
     *,
@@ -430,11 +535,21 @@ async def _send_with_json(
     json_file = _make_json_file(payload, filename=filename)
     out_files = list(files or [])
     out_files.append(json_file)
-    prefix = "FINANCE_ERROR_JSON_FILE=" if error else "FINANCE_JSON_FILE="
-    content = (
-        f"{prefix}attachment://{filename}\nFINANCE_META="
-        + _json_compact(meta, max_len=800)
-    )
+    content = None
+    if ctx is not None:
+        summary = _summarize_finance_payload(payload, meta)
+        compact_payload = _json_compact(payload, max_len=4000)
+        record = {
+            "meta": meta,
+            "summary": summary,
+            "payload_compact": compact_payload,
+            "filename": filename,
+        }
+        history = getattr(ctx, "finance_results", None)
+        if not isinstance(history, list):
+            history = []
+        history.append(record)
+        setattr(ctx, "finance_results", history)
     await safe_reply(
         ctx,
         content=content,
@@ -745,7 +860,8 @@ class Finance(commands.Cog):
             "  /finance symbol:7203.T action:news limit:5\n"
             "  /finance symbol:7203.T action:watch_add threshold_pct:2 check_every_s:300\n"
             "  /finance symbol:7203.T action:data section:financials\n"
-            f"  {BOT_PREFIX}finance 7203.T summary"
+            f"  {BOT_PREFIX}finance 7203.T summary\n"
+            f"  {BOT_PREFIX}finance 7203.T action:candle period:6mo interval:1d"
         ),
         extras={
             "category": "Tools",
@@ -794,6 +910,90 @@ class Finance(commands.Cog):
         screener_min_mcap: float | None = None,
         screener_max_pe: float | None = None,
     ) -> None:
+        if symbol:
+            kv_keys = (
+                "action",
+                "period",
+                "interval",
+                "query",
+                "symbol",
+                "kind",
+                "limit",
+                "region",
+                "section",
+                "horizon_days",
+                "paths",
+                "min_mcap",
+                "max_pe",
+                "threshold_pct",
+                "check_every_s",
+                "channel_id",
+                "auto_adjust",
+                "remove_all",
+                "max_rows",
+            )
+            has_kv = any(f"{key}:" in symbol or f"{key}=" in symbol for key in kv_keys)
+        else:
+            has_kv = False
+
+        if symbol and has_kv:
+            kv = _parse_kv_query(symbol)
+            symbol = str(kv.get("symbol") or "").strip() or None
+            action = str(kv.get("action") or action).strip().lower()
+            period = str(kv.get("period") or period).strip()
+            interval = str(kv.get("interval") or interval).strip()
+            query = str(kv.get("query") or query or "").strip() or None
+            region = str(kv.get("region") or region).strip()
+            lookup_kind = str(kv.get("kind") or lookup_kind).strip().lower()
+            section = str(kv.get("section") or section).strip()
+
+            def _as_int(val: Any, default: int) -> int:
+                try:
+                    return int(val)
+                except Exception:
+                    return default
+
+            def _as_float(val: Any) -> float | None:
+                try:
+                    return float(val)
+                except Exception:
+                    return None
+
+            def _as_bool(val: Any, default: bool) -> bool:
+                if isinstance(val, bool):
+                    return val
+                if isinstance(val, str):
+                    lowered = val.strip().lower()
+                    if lowered in {"true", "1", "yes", "y"}:
+                        return True
+                    if lowered in {"false", "0", "no", "n"}:
+                        return False
+                return default
+
+            limit = _as_int(kv.get("limit"), limit)
+            horizon_days = _as_int(kv.get("horizon_days"), horizon_days)
+            paths = _as_int(kv.get("paths"), paths)
+            max_rows = _as_int(kv.get("max_rows"), max_rows)
+            if kv.get("channel_id") is not None:
+                try:
+                    channel_id = int(kv.get("channel_id"))
+                except Exception:
+                    channel_id = None
+            threshold_pct_value = _as_float(kv.get("threshold_pct"))
+            if threshold_pct_value is not None:
+                threshold_pct = threshold_pct_value
+            check_every_s = _as_int(kv.get("check_every_s"), check_every_s)
+            screener_min_mcap_raw = kv.get("min_market_cap", kv.get("min_mcap"))
+            screener_max_pe_raw = kv.get("max_pe")
+            screener_min_mcap_value = _as_float(screener_min_mcap_raw)
+            screener_max_pe_value = _as_float(screener_max_pe_raw)
+            if screener_min_mcap_value is not None:
+                screener_min_mcap = screener_min_mcap_value
+            if screener_max_pe_value is not None:
+                screener_max_pe = screener_max_pe_value
+            auto_adjust = _as_bool(kv.get("auto_adjust"), auto_adjust)
+            remove_all = _as_bool(kv.get("remove_all"), remove_all)
+
         if symbol and action == "summary" and symbol in {
             "summary",
             "quote",
@@ -883,68 +1083,6 @@ class Finance(commands.Cog):
             return
 
         await safe_reply(ctx, content=tag_error_text(f"Unknown action: {action}"))
-
-    @commands.hybrid_command(
-        name="financeq",
-        description="Finance query (single-arg, tool-friendly).",
-        help=(
-            "Examples:\n"
-            "  /financeq 7203.T action:candle period:6mo interval:1d\n"
-            "  /financeq トヨタ自動車(株) action:ta\n"
-            "  /financeq 7203 action:search\n"
-            f"  {BOT_PREFIX}financeq 7203.T action:forecast horizon_days:20\n"
-        ),
-        extras={
-            "category": "Tools",
-            "pro": (
-                "Single-argument finance query for bot_invoke: "
-                "use key:value tokens to control action, period, interval, and more."
-            ),
-        },
-    )
-    async def financeq(self, ctx: commands.Context, *, q: str) -> None:
-        kv = _parse_kv_query(q)
-        symbol = str(kv.get("symbol") or "").strip() or None
-        action = str(kv.get("action") or "summary").strip().lower()
-        period = str(kv.get("period") or "6mo").strip()
-        interval = str(kv.get("interval") or "1d").strip()
-        query = str(kv.get("query") or "").strip() or None
-        region = str(kv.get("region") or "JP").strip()
-
-        def _as_int(val: Any, default: int) -> int:
-            try:
-                return int(val)
-            except Exception:
-                return default
-
-        def _as_float(val: Any) -> float | None:
-            try:
-                return float(val)
-            except Exception:
-                return None
-
-        limit = _as_int(kv.get("limit"), 5)
-        horizon_days = _as_int(kv.get("horizon_days"), 20)
-        paths = _as_int(kv.get("paths"), 2000)
-        lookup_kind = str(kv.get("kind") or "all").strip().lower()
-        min_mcap = _as_float(kv.get("min_mcap"))
-        max_pe = _as_float(kv.get("max_pe"))
-
-        await self.finance(
-            ctx,
-            symbol=symbol,
-            action=action,  # type: ignore[arg-type]
-            period=period,
-            interval=interval,
-            limit=limit,
-            query=query,
-            region=region,
-            horizon_days=horizon_days,
-            paths=paths,
-            lookup_kind=lookup_kind,
-            screener_min_mcap=min_mcap,
-            screener_max_pe=max_pe,
-        )
 
     async def _send_symbol_error(
         self, ctx: commands.Context, raw: str, exc: Exception
