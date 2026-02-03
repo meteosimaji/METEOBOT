@@ -357,6 +357,16 @@ def _build_quote_view(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _display_name_from_quote(ticker: str, display: str, data: dict[str, Any]) -> str:
+    if display != ticker:
+        return display
+    info = data.get("info") or {}
+    name = _pick(info, "shortName", "longName", "name", "displayName")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return display
+
+
 def _plot_line_chart(df: pd.DataFrame, title: str) -> BytesIO:
     if df is None or df.empty:
         raise ValueError("empty_history")
@@ -408,13 +418,6 @@ def _to_csv_bytes(df: Any, max_rows: int = 50) -> bytes:
         df2 = df.head(max_rows)
         return df2.to_csv(index=True).encode("utf-8")
     return str(df).encode("utf-8")
-
-
-def _make_json_file(obj: Any, filename: str) -> discord.File:
-    data = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str).encode(
-        "utf-8"
-    )
-    return discord.File(fp=BytesIO(data), filename=filename)
 
 
 def _compact_dict(source: dict[str, Any], keys: list[str]) -> dict[str, Any]:
@@ -531,10 +534,7 @@ async def _send_with_json(
     ephemeral: bool = False,
     error: bool = False,
 ) -> None:
-    filename = "finance_error.json" if error else "finance.json"
-    json_file = _make_json_file(payload, filename=filename)
     out_files = list(files or [])
-    out_files.append(json_file)
     content = None
     if ctx is not None:
         summary = _summarize_finance_payload(payload, meta)
@@ -543,7 +543,7 @@ async def _send_with_json(
             "meta": meta,
             "summary": summary,
             "payload_compact": compact_payload,
-            "filename": filename,
+            "filename": None,
         }
         history = getattr(ctx, "finance_results", None)
         if not isinstance(history, list):
@@ -838,6 +838,15 @@ class Finance(commands.Cog):
             json.dumps(self._watch, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    async def _resolve_display_name(self, ticker: str, display: str) -> str:
+        if display != ticker:
+            return display
+        try:
+            quote = await self.yf.get_quote(ticker)
+        except Exception:
+            return display
+        return _display_name_from_quote(ticker, display, quote)
+
     def cog_unload(self) -> None:
         if self._monitor_task:
             self._monitor_task.cancel()
@@ -855,20 +864,21 @@ class Finance(commands.Cog):
             "  /finance symbol:7203.T action:forecast horizon_days:20\n"
             "  /finance action:symbols\n"
             "  /finance action:search query:7203\n"
+            "  /finance action:search query:マイクロアド\n"
             "  /finance action:lookup query:Toyota kind:stock\n"
             "  /finance action:screener_local min_mcap:1e11 max_pe:20\n"
             "  /finance symbol:7203.T action:news limit:5\n"
             "  /finance symbol:7203.T action:watch_add threshold_pct:2 check_every_s:300\n"
             "  /finance symbol:7203.T action:data section:financials\n"
             f"  {BOT_PREFIX}finance 7203.T summary\n"
-            f"  {BOT_PREFIX}finance 7203.T action:candle period:6mo interval:1d"
+            f"  {BOT_PREFIX}finance \"symbol:7203.T action:candle period:6mo interval:1d\""
         ),
         extras={
             "category": "Tools",
             "pro": (
                 "Strict symbol matching (exact registry name or ticker) plus "
                 "best-effort data pulls from Yahoo Finance via yfinance, "
-                "including chart output and machine-readable JSON."),
+                "including chart output. Use action:search if you only know the company name."),
         },
     )
     async def finance(
@@ -932,12 +942,27 @@ class Finance(commands.Cog):
                 "remove_all",
                 "max_rows",
             )
-            has_kv = any(f"{key}:" in symbol or f"{key}=" in symbol for key in kv_keys)
+            raw_kv_parts = [
+                val
+                for val in (
+                    symbol,
+                    action,
+                    period,
+                    interval,
+                    query,
+                    region,
+                    lookup_kind,
+                    section,
+                )
+                if isinstance(val, str) and val
+            ]
+            raw_kv = " ".join(raw_kv_parts)
+            has_kv = any(f"{key}:" in raw_kv or f"{key}=" in raw_kv for key in kv_keys)
         else:
             has_kv = False
 
         if symbol and has_kv:
-            kv = _parse_kv_query(symbol)
+            kv = _parse_kv_query(raw_kv)
             symbol = str(kv.get("symbol") or "").strip() or None
             action = str(kv.get("action") or action).strip().lower()
             period = str(kv.get("period") or period).strip()
@@ -1280,6 +1305,7 @@ class Finance(commands.Cog):
 
         await defer_interaction(ctx)
         data = await self.yf.get_quote(ticker)
+        display = _display_name_from_quote(ticker, display, data)
         view = _build_quote_view(data)
 
         now_jst = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9)))
@@ -1360,6 +1386,7 @@ class Finance(commands.Cog):
 
         try:
             quote = await self.yf.get_quote(ticker)
+            display = _display_name_from_quote(ticker, display, quote)
             view = _build_quote_view(quote)
             hist = await self.yf.get_history(
                 ticker, period=period, interval=interval, auto_adjust=auto_adjust
@@ -1492,6 +1519,8 @@ class Finance(commands.Cog):
             await safe_reply(ctx, content=tag_error_text(f"Finance error: {repr(e)}"))
             return
 
+        display = await self._resolve_display_name(ticker, display)
+
         try:
             buf = _plot_candles(hist, title=f"{display} ({ticker}) candle {period}/{interval}")
             file = discord.File(buf, filename="candle.png")
@@ -1549,6 +1578,8 @@ class Finance(commands.Cog):
         except Exception as e:
             await safe_reply(ctx, content=tag_error_text(f"Finance error: {repr(e)}"))
             return
+
+        display = await self._resolve_display_name(ticker, display)
 
         if hist.empty or "Close" not in hist.columns:
             await safe_reply(ctx, content=tag_error_text("No data for indicators."))
@@ -1651,6 +1682,8 @@ class Finance(commands.Cog):
         except Exception as e:
             await safe_reply(ctx, content=tag_error_text(f"Finance error: {repr(e)}"))
             return
+
+        display = await self._resolve_display_name(ticker, display)
 
         if hist.empty or "Close" not in hist.columns:
             await safe_reply(ctx, content=tag_error_text("No data for forecast."))
@@ -1912,6 +1945,7 @@ class Finance(commands.Cog):
 
         items = await _to_thread(_sync)
         limit = max(1, min(int(limit), 10))
+        display = await self._resolve_display_name(ticker, display)
 
         lines: list[str] = []
         for it in items[:limit]:
@@ -1986,6 +2020,8 @@ class Finance(commands.Cog):
             await safe_reply(ctx, content=tag_error_text(f"data error: {repr(e)}"))
             return
 
+        display = await self._resolve_display_name(ticker, display)
+
         preview = ""
         file = None
 
@@ -2047,6 +2083,9 @@ class Finance(commands.Cog):
             await safe_reply(ctx, content=tag_error_text("Could not determine channel_id."))
             return
 
+        await defer_interaction(ctx)
+        display = await self._resolve_display_name(ticker, display)
+
         entry = {
             "ticker": ticker,
             "display": display,
@@ -2103,6 +2142,9 @@ class Finance(commands.Cog):
 
         if channel_id is None:
             channel_id = ctx.channel.id if getattr(ctx, "channel", None) else None
+
+        await defer_interaction(ctx)
+        display = await self._resolve_display_name(ticker, display)
 
         async with self._watch_lock:
             entries: list[dict[str, Any]] = list(self._watch.get("entries", []))
