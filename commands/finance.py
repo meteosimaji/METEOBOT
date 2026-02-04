@@ -588,10 +588,10 @@ async def _send_with_json(
     )
 
 
-def _parse_kv_query(q: str) -> dict[str, str | list[str]]:
+def _parse_kv_query(q: str) -> tuple[dict[str, str | list[str]], list[str]]:
     parts = shlex.split(q)
     out: dict[str, str | list[str]] = {}
-    symbol: str | None = None
+    extras: list[str] = []
     last_key: str | None = None
     for part in parts:
         if ":" in part or "=" in part:
@@ -607,18 +607,11 @@ def _parse_kv_query(q: str) -> dict[str, str | list[str]]:
                 out[key] = value
             last_key = key
         else:
-            if last_key in {"query", "symbol", "ticker"} and isinstance(
-                out.get(last_key), str
-            ):
-                out[last_key] = f"{out[last_key]} {part}".strip()
-                continue
-            if symbol is None:
-                symbol = part
+            if last_key == "query" and isinstance(out.get("query"), str):
+                out["query"] = f"{out['query']} {part}".strip()
             else:
-                symbol = symbol + " " + part
-    if symbol is not None:
-        out["symbol"] = symbol
-    return out
+                extras.append(part)
+    return out, extras
 
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
@@ -853,6 +846,7 @@ class Finance(commands.Cog):
                 async with session.get(url, params=params) as resp:
                     data = await resp.json(content_type=None)
         except Exception:
+            log.exception("Yahoo search HTTP failed query=%s params=%s", query, params)
             return []
         quotes = data.get("quotes") or []
         return [q for q in quotes if isinstance(q, dict)]
@@ -890,13 +884,23 @@ class Finance(commands.Cog):
             return s
         return s.rstrip(" ,，、")
 
-    async def _resolve_symbol(self, raw: str, *, region: str) -> tuple[str, str]:
+    async def _resolve_symbol(
+        self, raw: str, *, region: str, lookup_kind: str
+    ) -> tuple[str, str]:
         s = self._normalize_symbol_input(raw)
         if not s:
             raise ValueError("symbol_empty")
 
         if CODE_ONLY_RE.match(s) or JPX_CODE_RE.match(s):
-            return await self._resolve_via_search(s, prefer_code=True, region=region)
+            log.info(
+                "resolve_symbol: code-only search query=%s region=%s kind=%s",
+                s,
+                region,
+                lookup_kind,
+            )
+            return await self._resolve_via_search(
+                s, prefer_code=True, region=region, lookup_kind=lookup_kind
+            )
 
         if TICKER_RE.match(s):
             s_norm = s.strip()
@@ -913,50 +917,121 @@ class Finance(commands.Cog):
                     if str(row.get("symbol") or "").strip()
                 ]
                 raise LookupError("symbol_mismatch:" + ", ".join(mismatches))
+            log.info(
+                "resolve_symbol: ticker regex matched, no search results symbol=%s",
+                s_norm,
+            )
             return s_norm, s_norm
 
         hit = self.reg.find_by_name(s)
         if hit:
+            log.info("resolve_symbol: registry hit symbol=%s", s)
             return hit.ticker, hit.name
 
-        return await self._resolve_via_search(s, prefer_code=False, region=region)
+        log.info(
+            "resolve_symbol: fallback search query=%s region=%s kind=%s",
+            s,
+            region,
+            lookup_kind,
+        )
+        return await self._resolve_via_search(
+            s, prefer_code=False, region=region, lookup_kind=lookup_kind
+        )
 
     @staticmethod
     def _pick_search_candidate(
-        results: list[dict[str, Any]], query: str, *, prefer_code: bool
-    ) -> tuple[str | None, str | None]:
+        results: list[dict[str, Any]],
+        query: str,
+        *,
+        prefer_code: bool,
+        lookup_kind: str,
+        region: str,
+    ) -> tuple[str | None, str | None, list[dict[str, Any]]]:
         candidates = [r for r in results if r.get("symbol")]
         if not candidates:
-            return None, None
+            return None, None, []
 
         if prefer_code:
             for row in candidates:
                 symbol = str(row.get("symbol") or "")
                 if symbol.startswith(f"{query}."):
                     name = row.get("name") or row.get("shortname") or row.get("longname")
-                    return symbol, str(name) if name else symbol
+                    return symbol, str(name) if name else symbol, []
             for row in candidates:
                 symbol = str(row.get("symbol") or "")
                 if symbol == query:
                     name = row.get("name") or row.get("shortname") or row.get("longname")
-                    return symbol, str(name) if name else symbol
+                    return symbol, str(name) if name else symbol, []
 
-        row = candidates[0]
-        symbol = str(row.get("symbol") or "")
-        name = row.get("name") or row.get("shortname") or row.get("longname")
-        return symbol or None, str(name) if name else symbol or None
+        normalized_kind = (lookup_kind or "all").strip().lower()
+        allowed_types = {
+            "equity": {"EQUITY"},
+            "stock": {"EQUITY"},
+            "etf": {"ETF"},
+            "index": {"INDEX"},
+            "fx": {"CURRENCY", "FX"},
+            "future": {"FUTURE"},
+            "crypto": {"CRYPTO", "CRYPTOCURRENCY"},
+        }.get(normalized_kind)
+
+        def _score(row: dict[str, Any]) -> int:
+            symbol = str(row.get("symbol") or "")
+            quote_type = str(row.get("type") or row.get("quoteType") or "")
+            score = 0
+            if allowed_types:
+                if quote_type in allowed_types:
+                    score += 6
+                elif quote_type:
+                    score -= 4
+            else:
+                if quote_type in {"EQUITY", "ETF"}:
+                    score += 2
+            if symbol.endswith("=F"):
+                score += 3 if normalized_kind == "future" else -2
+            if symbol.endswith("=X"):
+                score += 3 if normalized_kind == "fx" else -2
+            if region == "JP" and symbol.endswith(".T"):
+                score += 2
+            if CODE_ONLY_RE.match(query) and symbol.startswith(f"{query}."):
+                score += 5
+            if symbol and symbol.upper() == query.upper():
+                score += 6
+            return score
+
+        scored = [(row, _score(row)) for row in candidates]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        if not scored:
+            return None, None, []
+        best_row, best_score = scored[0]
+        if len(scored) > 1 and (best_score - scored[1][1]) < 2:
+            return None, None, [row for row, _score in scored[:5]]
+        symbol = str(best_row.get("symbol") or "")
+        name = best_row.get("name") or best_row.get("shortname") or best_row.get("longname")
+        return symbol or None, str(name) if name else symbol or None, []
 
     async def _resolve_via_search(
-        self, query: str, *, prefer_code: bool, region: str
+        self, query: str, *, prefer_code: bool, region: str, lookup_kind: str
     ) -> tuple[str, str]:
         results = await self._search_candidates(query, limit=10, region=region)
         if not results:
             raise LookupError("symbol_unknown")
 
-        ticker, display = self._pick_search_candidate(
-            results, query, prefer_code=prefer_code
+        ticker, display, candidates = self._pick_search_candidate(
+            results,
+            query,
+            prefer_code=prefer_code,
+            lookup_kind=lookup_kind,
+            region=region,
         )
         if not ticker:
+            if candidates:
+                symbols = [
+                    str(row.get("symbol") or "").strip()
+                    for row in candidates
+                    if row.get("symbol")
+                ]
+                if symbols:
+                    raise LookupError("symbol_ambiguous:" + ", ".join(symbols))
             raise LookupError("symbol_unknown")
 
         return ticker, display or ticker
@@ -1019,73 +1094,90 @@ class Finance(commands.Cog):
         screener_min_mcap: float | None = None,
         screener_max_pe: float | None = None,
     ) -> None:
-        if symbol:
-            kv_keys = (
-                "action",
-                "period",
-                "interval",
-                "query",
-                "symbol",
-                "kind",
-                "limit",
-                "region",
-                "section",
-                "horizon_days",
-                "paths",
-                "min_mcap",
-                "max_pe",
-                "threshold_pct",
-                "check_every_s",
-                "channel_id",
-                "auto_adjust",
-                "remove_all",
-                "max_rows",
-            )
-            raw_kv_parts = [
-                val
-                for val in (
-                    symbol,
-                    action,
-                    period,
-                    interval,
-                    query,
-                    region,
-                    lookup_kind,
-                    section,
-                )
-                if isinstance(val, str) and val
-            ]
-            raw_kv = " ".join(raw_kv_parts)
-            has_kv = any(f"{key}:" in raw_kv or f"{key}=" in raw_kv for key in kv_keys)
-        else:
-            has_kv = False
+        is_prefix = isinstance(ctx, commands.Context) and ctx.interaction is None
+        raw_args = ""
+        if is_prefix and getattr(ctx, "message", None):
+            content = ctx.message.content or ""
+            prefix = ctx.prefix or ""
+            invoked = ctx.invoked_with or (ctx.command.name if ctx.command else "")
+            lead = f"{prefix}{invoked}".strip()
+            if lead and content.startswith(lead):
+                raw_args = content[len(lead) :].lstrip()
+            else:
+                parts = content.split(maxsplit=1)
+                if len(parts) > 1:
+                    raw_args = parts[1]
+        kv_keys = (
+            "action",
+            "period",
+            "interval",
+            "query",
+            "symbol",
+            "ticker",
+            "kind",
+            "limit",
+            "region",
+            "section",
+            "horizon_days",
+            "paths",
+            "min_mcap",
+            "max_pe",
+            "threshold_pct",
+            "check_every_s",
+            "channel_id",
+            "auto_adjust",
+            "remove_all",
+            "max_rows",
+        )
+        has_kv = bool(raw_args) and any(
+            f"{key}:" in raw_args or f"{key}=" in raw_args for key in kv_keys
+        )
+        log.info(
+            "finance invocation type=%s raw_args=%s has_kv=%s",
+            "prefix" if is_prefix else "slash",
+            raw_args if is_prefix else "",
+            has_kv if is_prefix else False,
+        )
 
-        if symbol and has_kv:
-            kv = _parse_kv_query(raw_kv)
+        if is_prefix and has_kv:
+            kv, extras = _parse_kv_query(raw_args)
+            if extras:
+                log.warning(
+                    "finance kv parse extras=%s raw_args=%s", extras, raw_args
+                )
+                await safe_reply(
+                    ctx,
+                    content=tag_error_text(
+                        "Unrecognized tokens in key/value input: "
+                        + " ".join(extras)
+                        + ". Use key:value pairs; wrap multi-word query values in quotes."
+                    ),
+                )
+                return
             if "symbol" not in kv and "ticker" in kv:
                 kv["symbol"] = kv.get("ticker")
             symbol = str(kv.get("symbol") or "").strip() or None
-            action = str(kv.get("action") or action).strip().lower()
-            period = str(kv.get("period") or period).strip()
-            interval = str(kv.get("interval") or interval).strip()
-            query = str(kv.get("query") or query or "").strip() or None
-            region = str(kv.get("region") or region).strip()
-            lookup_kind = str(kv.get("kind") or lookup_kind).strip().lower()
-            section = str(kv.get("section") or section).strip()
+            action = str(kv.get("action") or "summary").strip().lower()
+            period = str(kv.get("period") or "1mo").strip()
+            interval = str(kv.get("interval") or "1d").strip()
+            query = str(kv.get("query") or "").strip() or None
+            region = str(kv.get("region") or "JP").strip()
+            lookup_kind = str(kv.get("kind") or "all").strip().lower()
+            section = str(kv.get("section") or "fast_info").strip()
 
-            def _as_int(val: Any, default: int) -> int:
+            def _as_int(val: object, default: int) -> int:
                 try:
                     return int(val)
                 except Exception:
                     return default
 
-            def _as_float(val: Any) -> float | None:
+            def _as_float(val: object) -> float | None:
                 try:
                     return float(val)
                 except Exception:
                     return None
 
-            def _as_bool(val: Any, default: bool) -> bool:
+            def _as_bool(val: object, default: bool) -> bool:
                 if isinstance(val, bool):
                     return val
                 if isinstance(val, str):
@@ -1119,7 +1211,17 @@ class Finance(commands.Cog):
                 screener_max_pe = screener_max_pe_value
             auto_adjust = _as_bool(kv.get("auto_adjust"), auto_adjust)
             remove_all = _as_bool(kv.get("remove_all"), remove_all)
-
+            log.info(
+                "finance parsed kv action=%s symbol=%s query=%s period=%s interval=%s region=%s kind=%s section=%s",
+                action,
+                symbol,
+                query,
+                period,
+                interval,
+                region,
+                lookup_kind,
+                section,
+            )
         region = (region or "JP").strip().upper()
         action = action.strip().lower() or "summary"
 
@@ -1133,6 +1235,15 @@ class Finance(commands.Cog):
                 ctx,
                 content=tag_error_text(
                     f"Unknown action: {action}. Choose one of: {action_list}."
+                ),
+            )
+            return
+
+        if query and action not in {"search", "lookup"}:
+            await safe_reply(
+                ctx,
+                content=tag_error_text(
+                    "query is only valid with action:search or action:lookup. Use symbol: for other actions."
                 ),
             )
             return
@@ -1152,7 +1263,9 @@ class Finance(commands.Cog):
             return
 
         if action == "quote":
-            await self._send_quote_only(ctx, symbol, region=region)
+            await self._send_quote_only(
+                ctx, symbol, region=region, lookup_kind=lookup_kind
+            )
             return
         if action in {"summary", "chart"}:
             await self._send_summary(
@@ -1162,18 +1275,33 @@ class Finance(commands.Cog):
                 interval=interval,
                 auto_adjust=auto_adjust,
                 region=region,
+                lookup_kind=lookup_kind,
             )
             return
         if action == "news":
-            await self._send_news(ctx, symbol, limit=limit, region=region)
+            await self._send_news(
+                ctx, symbol, limit=limit, region=region, lookup_kind=lookup_kind
+            )
             return
         if action == "candle":
             await self._send_candle(
-                ctx, symbol=symbol, period=period, interval=interval, region=region
+                ctx,
+                symbol=symbol,
+                period=period,
+                interval=interval,
+                region=region,
+                lookup_kind=lookup_kind,
             )
             return
         if action == "ta":
-            await self._send_ta(ctx, symbol=symbol, period=period, interval=interval, region=region)
+            await self._send_ta(
+                ctx,
+                symbol=symbol,
+                period=period,
+                interval=interval,
+                region=region,
+                lookup_kind=lookup_kind,
+            )
             return
         if action == "forecast":
             await self._send_forecast(
@@ -1184,6 +1312,7 @@ class Finance(commands.Cog):
                 horizon_days=horizon_days,
                 paths=paths,
                 region=region,
+                lookup_kind=lookup_kind,
             )
             return
         if action == "lookup":
@@ -1198,7 +1327,14 @@ class Finance(commands.Cog):
             )
             return
         if action == "data":
-            await self._send_data(ctx, symbol, section=section, max_rows=max_rows, region=region)
+            await self._send_data(
+                ctx,
+                symbol,
+                section=section,
+                max_rows=max_rows,
+                region=region,
+                lookup_kind=lookup_kind,
+            )
             return
         if action == "watch_add":
             await self._watch_add(
@@ -1208,11 +1344,17 @@ class Finance(commands.Cog):
                 threshold_pct=threshold_pct,
                 check_every_s=check_every_s,
                 region=region,
+                lookup_kind=lookup_kind,
             )
             return
         if action == "watch_remove":
             await self._watch_remove(
-                ctx, symbol, channel_id=channel_id, remove_all=remove_all, region=region
+                ctx,
+                symbol,
+                channel_id=channel_id,
+                remove_all=remove_all,
+                region=region,
+                lookup_kind=lookup_kind,
             )
             return
         if action == "watch_list":
@@ -1237,6 +1379,17 @@ class Finance(commands.Cog):
                 "If search returns no results, try the English name or ticker, "
                 "or check via browser/web search.\nSuggestions:\n"
                 + "\n".join(names)
+            )
+        elif isinstance(exc, LookupError) and msg.startswith("symbol_ambiguous:"):
+            err_code = "symbol_ambiguous"
+            raw_symbols = msg.split(":", 1)[1].strip()
+            symbols = [s.strip() for s in raw_symbols.split(",") if s.strip()]
+            suggestions = [{"symbol": s} for s in symbols[:10]]
+            desc_lines = [s["symbol"] for s in suggestions]
+            desc = (
+                "Symbol is ambiguous. Please specify the exact ticker.\n"
+                "Candidates:\n"
+                + ("\n".join(desc_lines) if desc_lines else "(no candidates)")
             )
         elif isinstance(exc, LookupError) and msg.startswith("ticker_missing_suffix:"):
             err_code = "ticker_missing_suffix"
@@ -1332,6 +1485,11 @@ class Finance(commands.Cog):
             )
         if results:
             return results
+        log.info(
+            "Yahoo HTTP search returned no results, falling back to yfinance.Search query=%s region=%s",
+            query,
+            region,
+        )
 
         def _sync():
             s = Search(query, max_results=limit, news_count=0, enable_fuzzy_query=True)
@@ -1340,6 +1498,7 @@ class Finance(commands.Cog):
         try:
             quotes = await _to_thread(_sync)
         except Exception:
+            log.exception("yfinance.Search failed query=%s", query)
             return []
         for q in quotes[:limit]:
             if isinstance(q, dict):
@@ -1426,10 +1585,12 @@ class Finance(commands.Cog):
         )
 
     async def _send_quote_only(
-        self, ctx: commands.Context, symbol: str, *, region: str
+        self, ctx: commands.Context, symbol: str, *, region: str, lookup_kind: str
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol, region=region)
+            ticker, display = await self._resolve_symbol(
+                symbol, region=region, lookup_kind=lookup_kind
+            )
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1513,9 +1674,12 @@ class Finance(commands.Cog):
         interval: str,
         auto_adjust: bool,
         region: str,
+        lookup_kind: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol, region=region)
+            ticker, display = await self._resolve_symbol(
+                symbol, region=region, lookup_kind=lookup_kind
+            )
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1638,9 +1802,12 @@ class Finance(commands.Cog):
         period: str,
         interval: str,
         region: str,
+        lookup_kind: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol, region=region)
+            ticker, display = await self._resolve_symbol(
+                symbol, region=region, lookup_kind=lookup_kind
+            )
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1704,9 +1871,12 @@ class Finance(commands.Cog):
         period: str,
         interval: str,
         region: str,
+        lookup_kind: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol, region=region)
+            ticker, display = await self._resolve_symbol(
+                symbol, region=region, lookup_kind=lookup_kind
+            )
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1809,9 +1979,12 @@ class Finance(commands.Cog):
         horizon_days: int,
         paths: int,
         region: str,
+        lookup_kind: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol, region=region)
+            ticker, display = await self._resolve_symbol(
+                symbol, region=region, lookup_kind=lookup_kind
+            )
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2081,10 +2254,18 @@ class Finance(commands.Cog):
             )
 
     async def _send_news(
-        self, ctx: commands.Context, symbol: str, limit: int, *, region: str
+        self,
+        ctx: commands.Context,
+        symbol: str,
+        limit: int,
+        *,
+        region: str,
+        lookup_kind: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol, region=region)
+            ticker, display = await self._resolve_symbol(
+                symbol, region=region, lookup_kind=lookup_kind
+            )
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2160,9 +2341,12 @@ class Finance(commands.Cog):
         section: str,
         max_rows: int,
         region: str,
+        lookup_kind: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol, region=region)
+            ticker, display = await self._resolve_symbol(
+                symbol, region=region, lookup_kind=lookup_kind
+            )
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2232,9 +2416,12 @@ class Finance(commands.Cog):
         threshold_pct: float,
         check_every_s: int,
         region: str,
+        lookup_kind: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol, region=region)
+            ticker, display = await self._resolve_symbol(
+                symbol, region=region, lookup_kind=lookup_kind
+            )
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2296,9 +2483,12 @@ class Finance(commands.Cog):
         channel_id: int | None,
         remove_all: bool,
         region: str,
+        lookup_kind: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol, region=region)
+            ticker, display = await self._resolve_symbol(
+                symbol, region=region, lookup_kind=lookup_kind
+            )
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
