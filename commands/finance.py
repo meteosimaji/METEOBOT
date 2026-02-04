@@ -460,6 +460,10 @@ def _summarize_finance_payload(payload: dict[str, Any], meta: dict[str, Any]) ->
         "ticker": payload.get("ticker"),
         "display": payload.get("display"),
     }
+    if payload.get("symbol_input"):
+        summary["symbol_input"] = payload.get("symbol_input")
+    if payload.get("yahoo_symbol"):
+        summary["yahoo_symbol"] = payload.get("yahoo_symbol")
     if payload.get("asof_jst"):
         summary["asof_jst"] = payload.get("asof_jst")
     if payload.get("params"):
@@ -588,6 +592,7 @@ def _parse_kv_query(q: str) -> dict[str, str | list[str]]:
     parts = shlex.split(q)
     out: dict[str, str | list[str]] = {}
     symbol: str | None = None
+    last_key: str | None = None
     for part in parts:
         if ":" in part or "=" in part:
             if ":" in part:
@@ -600,7 +605,13 @@ def _parse_kv_query(q: str) -> dict[str, str | list[str]]:
                 out[key] = [v.strip() for v in value.split(",") if v.strip()]
             else:
                 out[key] = value
+            last_key = key
         else:
+            if last_key in {"query", "symbol", "ticker"} and isinstance(
+                out.get(last_key), str
+            ):
+                out[last_key] = f"{out[last_key]} {part}".strip()
+                continue
             if symbol is None:
                 symbol = part
             else:
@@ -879,22 +890,36 @@ class Finance(commands.Cog):
             return s
         return s.rstrip(" ,，、")
 
-    async def _resolve_symbol(self, raw: str) -> tuple[str, str]:
+    async def _resolve_symbol(self, raw: str, *, region: str) -> tuple[str, str]:
         s = self._normalize_symbol_input(raw)
         if not s:
             raise ValueError("symbol_empty")
 
         if CODE_ONLY_RE.match(s) or JPX_CODE_RE.match(s):
-            return await self._resolve_via_search(s, prefer_code=True)
+            return await self._resolve_via_search(s, prefer_code=True, region=region)
 
         if TICKER_RE.match(s):
-            return s, s
+            s_norm = s.strip()
+            s_cmp = s_norm.upper()
+            results = await self._search_candidates(s_norm, limit=10, region=region)
+            if results:
+                for row in results:
+                    symbol = str(row.get("symbol") or "").strip()
+                    if symbol and symbol.upper() == s_cmp:
+                        return symbol, symbol
+                mismatches = [
+                    str(row.get("symbol") or "").strip()
+                    for row in results
+                    if str(row.get("symbol") or "").strip()
+                ]
+                raise LookupError("symbol_mismatch:" + ", ".join(mismatches))
+            return s_norm, s_norm
 
         hit = self.reg.find_by_name(s)
         if hit:
             return hit.ticker, hit.name
 
-        return await self._resolve_via_search(s, prefer_code=False)
+        return await self._resolve_via_search(s, prefer_code=False, region=region)
 
     @staticmethod
     def _pick_search_candidate(
@@ -922,9 +947,9 @@ class Finance(commands.Cog):
         return symbol or None, str(name) if name else symbol or None
 
     async def _resolve_via_search(
-        self, query: str, *, prefer_code: bool
+        self, query: str, *, prefer_code: bool, region: str
     ) -> tuple[str, str]:
-        results = await self._search_candidates(query, limit=10)
+        results = await self._search_candidates(query, limit=10, region=region)
         if not results:
             raise LookupError("symbol_unknown")
 
@@ -1037,6 +1062,8 @@ class Finance(commands.Cog):
 
         if symbol and has_kv:
             kv = _parse_kv_query(raw_kv)
+            if "symbol" not in kv and "ticker" in kv:
+                kv["symbol"] = kv.get("ticker")
             symbol = str(kv.get("symbol") or "").strip() or None
             action = str(kv.get("action") or action).strip().lower()
             period = str(kv.get("period") or period).strip()
@@ -1093,6 +1120,7 @@ class Finance(commands.Cog):
             auto_adjust = _as_bool(kv.get("auto_adjust"), auto_adjust)
             remove_all = _as_bool(kv.get("remove_all"), remove_all)
 
+        region = (region or "JP").strip().upper()
         action = action.strip().lower() or "summary"
 
         if symbol and action == "summary" and symbol in FINANCE_ACTION_SET:
@@ -1124,25 +1152,38 @@ class Finance(commands.Cog):
             return
 
         if action == "quote":
-            await self._send_quote_only(ctx, symbol)
+            await self._send_quote_only(ctx, symbol, region=region)
             return
         if action in {"summary", "chart"}:
             await self._send_summary(
-                ctx, symbol=symbol, period=period, interval=interval, auto_adjust=auto_adjust
+                ctx,
+                symbol=symbol,
+                period=period,
+                interval=interval,
+                auto_adjust=auto_adjust,
+                region=region,
             )
             return
         if action == "news":
-            await self._send_news(ctx, symbol, limit=limit)
+            await self._send_news(ctx, symbol, limit=limit, region=region)
             return
         if action == "candle":
-            await self._send_candle(ctx, symbol=symbol, period=period, interval=interval)
+            await self._send_candle(
+                ctx, symbol=symbol, period=period, interval=interval, region=region
+            )
             return
         if action == "ta":
-            await self._send_ta(ctx, symbol=symbol, period=period, interval=interval)
+            await self._send_ta(ctx, symbol=symbol, period=period, interval=interval, region=region)
             return
         if action == "forecast":
             await self._send_forecast(
-                ctx, symbol=symbol, period=period, interval=interval, horizon_days=horizon_days, paths=paths
+                ctx,
+                symbol=symbol,
+                period=period,
+                interval=interval,
+                horizon_days=horizon_days,
+                paths=paths,
+                region=region,
             )
             return
         if action == "lookup":
@@ -1157,7 +1198,7 @@ class Finance(commands.Cog):
             )
             return
         if action == "data":
-            await self._send_data(ctx, symbol, section=section, max_rows=max_rows)
+            await self._send_data(ctx, symbol, section=section, max_rows=max_rows, region=region)
             return
         if action == "watch_add":
             await self._watch_add(
@@ -1166,11 +1207,12 @@ class Finance(commands.Cog):
                 channel_id=channel_id,
                 threshold_pct=threshold_pct,
                 check_every_s=check_every_s,
+                region=region,
             )
             return
         if action == "watch_remove":
             await self._watch_remove(
-                ctx, symbol, channel_id=channel_id, remove_all=remove_all
+                ctx, symbol, channel_id=channel_id, remove_all=remove_all, region=region
             )
             return
         if action == "watch_list":
@@ -1207,6 +1249,18 @@ class Finance(commands.Cog):
             desc = (
                 "Ticker needs exchange suffix.\nCandidates:\n"
                 + ("\n".join(desc_lines) if desc_lines else "(no registry matches)")
+            )
+        elif isinstance(exc, LookupError) and msg.startswith("symbol_mismatch:"):
+            err_code = "symbol_mismatch"
+            raw_symbols = msg.split(":", 1)[1].strip()
+            symbols = [s.strip() for s in raw_symbols.split(",") if s.strip()]
+            suggestions = [{"symbol": s} for s in symbols[:10]]
+            desc_lines = [s["symbol"] for s in suggestions]
+            desc = (
+                "Symbol mismatch from Yahoo search results. "
+                "Check the ticker or run /finance action:search query:<code>.\n"
+                "Candidates:\n"
+                + ("\n".join(desc_lines) if desc_lines else "(no candidates)")
             )
         elif isinstance(exc, LookupError) and msg == "ticker_missing_suffix":
             err_code = "ticker_missing_suffix"
@@ -1371,15 +1425,21 @@ class Finance(commands.Cog):
             embed=embed,
         )
 
-    async def _send_quote_only(self, ctx: commands.Context, symbol: str) -> None:
+    async def _send_quote_only(
+        self, ctx: commands.Context, symbol: str, *, region: str
+    ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol)
+            ticker, display = await self._resolve_symbol(symbol, region=region)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
 
         await defer_interaction(ctx)
-        data = await self.yf.get_quote(ticker)
+        try:
+            data = await self.yf.get_quote(ticker)
+        except Exception as e:
+            await safe_reply(ctx, content=tag_error_text(f"Finance error: {repr(e)}"))
+            return
         display = _display_name_from_quote(ticker, display, data)
         view = _build_quote_view(data)
 
@@ -1414,7 +1474,9 @@ class Finance(commands.Cog):
         )
 
         payload = {
+            "symbol_input": symbol,
             "ticker": ticker,
+            "yahoo_symbol": ticker,
             "display": display,
             "asof_jst": now_jst.isoformat(),
             "quote": {
@@ -1450,9 +1512,10 @@ class Finance(commands.Cog):
         period: str,
         interval: str,
         auto_adjust: bool,
+        region: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol)
+            ticker, display = await self._resolve_symbol(symbol, region=region)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1520,7 +1583,9 @@ class Finance(commands.Cog):
         embed.add_field(name="Auto adjust", value=str(bool(auto_adjust)), inline=True)
 
         payload = {
+            "symbol_input": symbol,
             "ticker": ticker,
+            "yahoo_symbol": ticker,
             "display": display,
             "asof_jst": now_jst.isoformat(),
             "params": {
@@ -1566,10 +1631,16 @@ class Finance(commands.Cog):
             )
 
     async def _send_candle(
-        self, ctx: commands.Context, *, symbol: str, period: str, interval: str
+        self,
+        ctx: commands.Context,
+        *,
+        symbol: str,
+        period: str,
+        interval: str,
+        region: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol)
+            ticker, display = await self._resolve_symbol(symbol, region=region)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1626,10 +1697,16 @@ class Finance(commands.Cog):
         )
 
     async def _send_ta(
-        self, ctx: commands.Context, *, symbol: str, period: str, interval: str
+        self,
+        ctx: commands.Context,
+        *,
+        symbol: str,
+        period: str,
+        interval: str,
+        region: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol)
+            ticker, display = await self._resolve_symbol(symbol, region=region)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -1731,9 +1808,10 @@ class Finance(commands.Cog):
         interval: str,
         horizon_days: int,
         paths: int,
+        region: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol)
+            ticker, display = await self._resolve_symbol(symbol, region=region)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2002,9 +2080,11 @@ class Finance(commands.Cog):
                 embed=embed,
             )
 
-    async def _send_news(self, ctx: commands.Context, symbol: str, limit: int) -> None:
+    async def _send_news(
+        self, ctx: commands.Context, symbol: str, limit: int, *, region: str
+    ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol)
+            ticker, display = await self._resolve_symbol(symbol, region=region)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2073,10 +2153,16 @@ class Finance(commands.Cog):
         )
 
     async def _send_data(
-        self, ctx: commands.Context, symbol: str, *, section: str, max_rows: int
+        self,
+        ctx: commands.Context,
+        symbol: str,
+        *,
+        section: str,
+        max_rows: int,
+        region: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol)
+            ticker, display = await self._resolve_symbol(symbol, region=region)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2145,9 +2231,10 @@ class Finance(commands.Cog):
         channel_id: int | None,
         threshold_pct: float,
         check_every_s: int,
+        region: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol)
+            ticker, display = await self._resolve_symbol(symbol, region=region)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
@@ -2208,9 +2295,10 @@ class Finance(commands.Cog):
         *,
         channel_id: int | None,
         remove_all: bool,
+        region: str,
     ) -> None:
         try:
-            ticker, display = await self._resolve_symbol(symbol)
+            ticker, display = await self._resolve_symbol(symbol, region=region)
         except Exception as e:
             await self._send_symbol_error(ctx, symbol, e)
             return
