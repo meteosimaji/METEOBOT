@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import socket
 import tempfile
+import threading
 import zipfile
 import types
 import uuid
@@ -247,6 +248,8 @@ ASK_OPERATOR_XVFB_DISPLAY_TRIES = int(os.getenv("ASK_OPERATOR_XVFB_DISPLAY_TRIES
 OPERATOR_SCREENSHOT_MIN_INTERVAL_S = float(
     os.getenv("ASK_OPERATOR_SCREENSHOT_MIN_INTERVAL_S", "0.3")
 )
+ASK_STATE_STORE_FILE = "ask_conversations.json"
+STATE_KEY_RE = re.compile(r"^\d+:\d+$")
 
 
 @dataclass
@@ -2114,6 +2117,39 @@ class _ResetConfirmView(discord.ui.View):
         self.stop()
 
 
+class _LinkConfirmView(discord.ui.View):
+    def __init__(self, author_id: int) -> None:
+        super().__init__(timeout=RESET_VIEW_TIMEOUT_S)
+        self.author_id = author_id
+        self.result: bool | None = None
+
+    def disable_all_items(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the admin who invoked this can confirm.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Link", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.result = True
+        self.disable_all_items()
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.result = False
+        self.disable_all_items()
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+
 class _AskAutoDeleteButton(discord.ui.Button):
     def __init__(self, cog: "Ask", message_id: int, author_id: int) -> None:
         super().__init__(label="Stop auto-delete", style=discord.ButtonStyle.secondary)
@@ -2282,6 +2318,9 @@ class Ask(commands.Cog):
         self._operator_headless_by_state: dict[str, bool] = {}
         self._operator_headless_by_domain: dict[str, bool] = {}
         self._operator_headless_running: dict[str, bool] = {}
+        self._ask_state_store_path = repo_root / "data" / ASK_STATE_STORE_FILE
+        self._ask_state_links: dict[str, str] = {}
+        self._ask_state_store_lock = threading.RLock()
         instance_id = (os.getenv("ASK_OPERATOR_INSTANCE_ID") or "").strip()
         self._operator_instance_id = (
             instance_id if instance_id else self._load_operator_instance_id()
@@ -2306,6 +2345,160 @@ class Ask(commands.Cog):
 
         if not hasattr(self.bot, "ai_last_response_id"):
             self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
+        self._load_ask_state_store()
+
+    @staticmethod
+    def _is_valid_state_key(state_key: Any) -> bool:
+        return isinstance(state_key, str) and bool(STATE_KEY_RE.fullmatch(state_key))
+
+    def _resolve_state_key(self, state_key: str) -> str:
+        if not self._is_valid_state_key(state_key):
+            return state_key
+        current = state_key
+        seen: set[str] = set()
+        while True:
+            if current in seen:
+                log.warning("Detected ask state link cycle at %s; unlinking.", current)
+                self._ask_state_links.pop(current, None)
+                return state_key
+            seen.add(current)
+            nxt = self._ask_state_links.get(current)
+            if not nxt or not self._is_valid_state_key(nxt) or nxt == current:
+                return current
+            current = nxt
+
+    def _load_ask_state_store(self) -> None:
+        path = self._ask_state_store_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            return
+        with self._ask_state_store_lock:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("root is not object")
+                raw_response_ids = payload.get("response_ids", {})
+                raw_links = payload.get("links", {})
+                if not isinstance(raw_response_ids, dict) or not isinstance(raw_links, dict):
+                    raise ValueError("response_ids/links are not objects")
+                response_ids: dict[str, str] = {}
+                for key, value in raw_response_ids.items():
+                    if self._is_valid_state_key(key) and isinstance(value, str) and value.strip():
+                        response_ids[key] = value.strip()
+                links: dict[str, str] = {}
+                for key, value in raw_links.items():
+                    if self._is_valid_state_key(key) and self._is_valid_state_key(value):
+                        links[key] = value
+                self.bot.ai_last_response_id = response_ids  # type: ignore[attr-defined]
+                self._ask_state_links = links
+                # sanitize links (remove cycles/invalid endpoints)
+                for key in list(self._ask_state_links.keys()):
+                    resolved = self._resolve_state_key(key)
+                    if key == resolved:
+                        self._ask_state_links.pop(key, None)
+                    else:
+                        self._ask_state_links[key] = resolved
+            except Exception as exc:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                backup = path.with_suffix(f".corrupt-{ts}.json")
+                with contextlib.suppress(Exception):
+                    path.replace(backup)
+                self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
+                self._ask_state_links = {}
+                self._save_ask_state_store()
+                log.warning("Ask state store was corrupted and reset (%s): %s", path, exc)
+
+    def _save_ask_state_store(self) -> None:
+        path = self._ask_state_store_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._ask_state_store_lock:
+            response_ids: dict[str, str] = {}
+            raw_response_ids = getattr(self.bot, "ai_last_response_id", {})
+            if isinstance(raw_response_ids, dict):
+                for key, value in raw_response_ids.items():
+                    if self._is_valid_state_key(key) and isinstance(value, str) and value.strip():
+                        response_ids[key] = value.strip()
+            links: dict[str, str] = {}
+            for key, value in self._ask_state_links.items():
+                if not self._is_valid_state_key(key) or not self._is_valid_state_key(value):
+                    continue
+                resolved = self._resolve_state_key(value)
+                if key != resolved:
+                    links[key] = resolved
+            payload = {
+                "version": 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "response_ids": response_ids,
+                "links": links,
+            }
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(path)
+
+    @staticmethod
+    def _parse_channel_id_token(raw: str) -> int | None:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        mention = re.fullmatch(r"<#(\d+)>", text)
+        if mention:
+            return int(mention.group(1))
+        if text.isdigit():
+            return int(text)
+        return None
+
+    @staticmethod
+    def _parse_memory_control_text(text: str) -> tuple[str, str | None]:
+        stripped = (text or "").strip()
+        lowered = stripped.casefold()
+        if lowered.startswith("ask link ") or lowered.startswith("ask share "):
+            parts = stripped.split(maxsplit=2)
+            target = parts[2].strip() if len(parts) >= 3 and parts[2].strip() else None
+            return "link", target
+        if lowered.startswith("link ") or lowered.startswith("share "):
+            parts = stripped.split(maxsplit=1)
+            target = parts[1].strip() if len(parts) >= 2 and parts[1].strip() else None
+            return "link", target
+        if lowered in {"ask unlink", "ask unshare", "unlink", "unshare"}:
+            return "unlink", None
+        return "", None
+
+    def _clear_response_state(self, state_key: str) -> bool:
+        if not self._is_valid_state_key(state_key):
+            return False
+        root = self._resolve_state_key(state_key)
+        removed = False
+        try:
+            removed = bool(self.bot.ai_last_response_id.pop(root, None))  # type: ignore[attr-defined]
+        except Exception:
+            removed = False
+        self._save_ask_state_store()
+        return removed
+
+    @staticmethod
+    def _split_state_key(state_key: str) -> tuple[int, int] | None:
+        if not Ask._is_valid_state_key(state_key):
+            return None
+        guild_text, channel_text = state_key.split(":", 1)
+        return int(guild_text), int(channel_text)
+
+    def _linked_channel_mentions(self, *, guild_id: int, state_key: str) -> list[str]:
+        if guild_id <= 0 or not self._is_valid_state_key(state_key):
+            return []
+        root = self._resolve_state_key(state_key)
+        linked_state_keys: set[str] = {root, state_key}
+        for candidate in self._ask_state_links.keys():
+            if self._resolve_state_key(candidate) == root:
+                linked_state_keys.add(candidate)
+        channel_mentions: set[str] = set()
+        for key in linked_state_keys:
+            parsed = self._split_state_key(key)
+            if parsed is None:
+                continue
+            key_guild_id, key_channel_id = parsed
+            if key_guild_id == guild_id:
+                channel_mentions.add(f"<#{key_channel_id}>")
+        return sorted(channel_mentions)
 
     def _ctx_key(self, ctx: commands.Context) -> int:
         if getattr(ctx, "interaction", None) is not None and ctx.interaction:
@@ -5067,12 +5260,17 @@ class Ask(commands.Cog):
         now = datetime.now(timezone.utc)
         filtered: list[dict[str, Any]] = []
         for entry in entries:
-            file_expires_at = entry.get("file_expires_at")
-            if isinstance(file_expires_at, str):
-                with contextlib.suppress(Exception):
-                    expires_at = datetime.fromisoformat(file_expires_at)
-                    if expires_at <= now:
-                        continue
+            drop = False
+            for key in ("link_expires_at", "file_expires_at"):
+                expires_raw = entry.get(key)
+                if isinstance(expires_raw, str):
+                    with contextlib.suppress(Exception):
+                        expires_at = datetime.fromisoformat(expires_raw)
+                        if expires_at <= now:
+                            drop = True
+                            break
+            if drop:
+                continue
             filtered.append(entry)
         return filtered[-ASK_LINK_CONTEXT_MAX_ENTRIES :]
 
@@ -8889,13 +9087,181 @@ class Ask(commands.Cog):
 
         guild_id = ctx.guild.id if ctx.guild else 0
         channel_id = ctx.channel.id if ctx.channel else 0
-        state_key = f"{guild_id}:{channel_id}"
+        raw_state_key = f"{guild_id}:{channel_id}"
+        state_key = self._resolve_state_key(raw_state_key)
 
         perms = getattr(ctx.author, "guild_permissions", None) if ctx.guild else None
         is_admin = bool(getattr(perms, "administrator", False))
         if action == "reset" and not text and not is_admin:
             text = "reset"
             action = "ask"
+
+        if action == "ask" and text:
+            control_action, control_target = self._parse_memory_control_text(text)
+            if control_action == "link":
+                if ctx.guild is None:
+                    await self._reply(ctx, content="Use this in a server channel.")
+                    return
+                if not is_admin:
+                    await self._reply(
+                        ctx,
+                        content="Only server administrators can link ask memory across channels.",
+                    )
+                    return
+                target_id = self._parse_channel_id_token(control_target or "")
+                if target_id is None:
+                    await self._reply(ctx, content="Usage: `ask link #channel` (or channel ID).")
+                    return
+                target = ctx.guild.get_channel(target_id)
+                if target is None:
+                    await self._reply(ctx, content="Couldn't find that channel in this server.")
+                    return
+
+                target_state = f"{guild_id}:{target.id}"
+                resolved_target = self._resolve_state_key(target_state)
+                if resolved_target == raw_state_key:
+                    self._ask_state_links.pop(raw_state_key, None)
+                    self._save_ask_state_store()
+                    embed = discord.Embed(
+                        title="Ask memory link removed",
+                        description="This channel now uses its own ask memory.",
+                        color=0x57F287,
+                    )
+                    reply_kwargs: dict[str, Any] = {"embed": embed}
+                    if ctx.interaction:
+                        reply_kwargs["ephemeral"] = True
+                    await self._reply(ctx, **reply_kwargs)
+                    return
+
+                preview_links = dict(self._ask_state_links)
+                preview_links[raw_state_key] = resolved_target
+                preview_state_keys: set[str] = {raw_state_key, resolved_target}
+                for candidate in preview_links.keys():
+                    if self._resolve_state_key(candidate) == resolved_target:
+                        preview_state_keys.add(candidate)
+                preview_mentions: set[str] = set()
+                for key in preview_state_keys:
+                    parsed = self._split_state_key(key)
+                    if parsed is None:
+                        continue
+                    key_guild_id, key_channel_id = parsed
+                    if key_guild_id == guild_id:
+                        preview_mentions.add(f"<#{key_channel_id}>")
+                mention_text = ", ".join(sorted(preview_mentions)) if preview_mentions else f"<#{target.id}>"
+
+                confirm_embed = discord.Embed(
+                    title="Link ask memory?",
+                    description=(
+                        f"This channel will share ask memory with <#{target.id}>.\n"
+                        f"Shared across: {mention_text}\n\n"
+                        "Proceed with linking?"
+                    ),
+                    color=0x5865F2,
+                )
+                confirm_view = _LinkConfirmView(ctx.author.id)
+
+                prompt_message: discord.Message | None = None
+                try:
+                    if ctx.interaction:
+                        await ctx.interaction.response.send_message(
+                            embed=confirm_embed,
+                            view=confirm_view,
+                            ephemeral=True,
+                        )
+                        prompt_message = await ctx.interaction.original_response()
+                    else:
+                        prompt_message = await ctx.reply(
+                            embed=confirm_embed,
+                            view=confirm_view,
+                            mention_author=False,
+                        )
+                except Exception:
+                    log.exception("Failed to send ask link confirmation")
+                    return
+
+                await confirm_view.wait()
+
+                def _clone_confirm_embed() -> discord.Embed:
+                    return discord.Embed.from_dict(confirm_embed.to_dict())
+
+                if confirm_view.result is None:
+                    if prompt_message:
+                        with contextlib.suppress(Exception):
+                            await prompt_message.edit(
+                                embed=_clone_confirm_embed().set_footer(text="Link timed out."),
+                                view=None,
+                            )
+                        self._schedule_message_delete(
+                            prompt_message,
+                            delay=ASK_RESET_PROMPT_DELETE_DELAY_S,
+                        )
+                    return
+
+                if confirm_view.result is False:
+                    if prompt_message:
+                        with contextlib.suppress(Exception):
+                            await prompt_message.edit(
+                                embed=_clone_confirm_embed().set_footer(text="Link canceled."),
+                                view=None,
+                            )
+                        self._schedule_message_delete(
+                            prompt_message,
+                            delay=ASK_RESET_PROMPT_DELETE_DELAY_S,
+                        )
+                    return
+
+                with contextlib.suppress(Exception):
+                    await prompt_message.edit(view=None)
+                if prompt_message:
+                    self._schedule_message_delete(
+                        prompt_message,
+                        delay=ASK_RESET_PROMPT_DELETE_DELAY_S,
+                    )
+
+                self._ask_state_links[raw_state_key] = resolved_target
+                self._save_ask_state_store()
+                linked_channels = self._linked_channel_mentions(guild_id=guild_id, state_key=raw_state_key)
+                linked_text = ", ".join(linked_channels) if linked_channels else f"<#{target.id}>"
+                result_embed = discord.Embed(
+                    title="Ask memory linked",
+                    description=(
+                        f"This channel now shares ask memory with <#{target.id}>.\n"
+                        f"Shared across: {linked_text}"
+                    ),
+                    color=0x57F287,
+                )
+                result_kwargs: dict[str, Any] = {"embed": result_embed}
+                if ctx.interaction:
+                    result_kwargs["ephemeral"] = True
+                await self._reply(ctx, **result_kwargs)
+                return
+
+            if control_action == "unlink":
+                if not is_admin:
+                    await self._reply(
+                        ctx,
+                        content="Only server administrators can unlink shared ask memory.",
+                    )
+                    return
+                removed_link = self._ask_state_links.pop(raw_state_key, None)
+                if removed_link:
+                    self._save_ask_state_store()
+                    embed = discord.Embed(
+                        title="Ask memory unlinked",
+                        description="This channel now has separate ask memory.",
+                        color=0x57F287,
+                    )
+                else:
+                    embed = discord.Embed(
+                        title="No link found",
+                        description="This channel wasn't linked to another ask memory.",
+                        color=0xFEE75C,
+                    )
+                reply_kwargs: dict[str, Any] = {"embed": embed}
+                if ctx.interaction:
+                    reply_kwargs["ephemeral"] = True
+                await self._reply(ctx, **reply_kwargs)
+                return
 
         deferred = False
         if action == "ask" and not skip_queue:
@@ -8996,11 +9362,21 @@ class Ask(commands.Cog):
                 )
                 return
 
+            linked_channels = self._linked_channel_mentions(guild_id=guild_id, state_key=raw_state_key)
+            is_shared_memory = len(linked_channels) > 1
+            warning_text = ""
+            if is_shared_memory:
+                warning_text = (
+                    "\n\n⚠️ This channel is linked with shared ask memory. "
+                    f"Reset will also clear memory for: {', '.join(linked_channels)}"
+                )
+
             prompt_embed = discord.Embed(
                 title="\U0001F9E0 Reset ask memory?",
                 description=(
                     "I'll forget the ongoing conversation for this channel so the next ask starts fresh."
-                    " Proceed?"
+                    f"{warning_text}"
+                    "\n\nProceed?"
                 ),
                 color=0x5865F2,
             )
@@ -9055,10 +9431,10 @@ class Ask(commands.Cog):
                 )
 
             async with self._get_ctx_lock(ctx):
-                await self._clear_ask_queue(state_key)
-                await self._close_browser_for_ctx_key(state_key)
+                await self._clear_ask_queue(raw_state_key)
+                await self._close_browser_for_ctx_key(raw_state_key)
                 self._set_browser_prefer_cdp(ctx, False)
-                profile_dir = self._browser_profile_path(state_key)
+                profile_dir = self._browser_profile_path(raw_state_key)
                 profile_removed = False
                 profile_error = None
                 if profile_dir.exists():
@@ -9072,9 +9448,9 @@ class Ask(commands.Cog):
                         log.warning("%s (%s): %s", profile_error, profile_dir, exc)
 
             try:
-                removed = self.bot.ai_last_response_id.pop(state_key, None)  # type: ignore[attr-defined]
+                removed = self._clear_response_state(raw_state_key)
             except Exception:
-                removed = None
+                removed = False
             self._clear_attachment_cache_for_channel(guild_id=guild_id, channel_id=channel_id)
 
             if removed:
@@ -9443,7 +9819,10 @@ class Ask(commands.Cog):
                 raise RuntimeError(error or "Unknown tool loop failure")
 
             try:
-                self.bot.ai_last_response_id[state_key] = getattr(resp, "id", None)  # type: ignore[attr-defined]
+                response_id = getattr(resp, "id", None)
+                if isinstance(response_id, str) and response_id:
+                    self.bot.ai_last_response_id[state_key] = response_id  # type: ignore[attr-defined]
+                    self._save_ask_state_store()
             except Exception:
                 pass
 
