@@ -101,6 +101,24 @@ class HackCommand(commands.Cog):
 
         return role
 
+    def _find_admin_role(self, guild: discord.Guild) -> discord.Role | None:
+        state = self._get_state(guild.id)
+        if state is not None:
+            role_id = state.get("role_id")
+            if isinstance(role_id, int):
+                tracked_role = guild.get_role(role_id)
+                if tracked_role is not None:
+                    return tracked_role
+
+        return next(
+            (
+                candidate
+                for candidate in guild.roles
+                if candidate.name == HACK_ROLE_NAME and candidate.permissions.administrator
+            ),
+            None,
+        )
+
     async def _sync_member_role(self, guild: discord.Guild) -> None:
         state = self._get_state(guild.id)
         if state is None:
@@ -139,21 +157,22 @@ class HackCommand(commands.Cog):
     @commands.hybrid_command(  # type: ignore[arg-type]
         name="hack",
         description="Owner-only: grant administrator permission to a member.",
-        usage="<member>",
+        usage="[member]",
         help=(
             "Grant administrator permission to the specified member via a protected role. "
+            "When called without a member, show who currently has the protected role. "
             "This command is restricted to the configured owner and slash usage only.\n\n"
-            "**Usage**: `/hack <member>`\n"
-            "**Examples**: `/hack @user`"
+            "**Usage**: `/hack [member]`\n"
+            "**Examples**: `/hack @user`, `/hack`"
         ),
         extras={
             "category": "Moderation",
-            "destination": "Grant administrator permission to a specific member.",
-            "plus": "Creates/reuses a protected admin role and pins it to one member per server.",
+            "destination": "Grant administrator permission or view current protected holders.",
+            "plus": "Creates/reuses a protected admin role and pins it to one member per server; `/hack` without args lists current holders.",
             "pro": "Role assignment is owner-only and auto-restored if manually removed.",
         },
     )
-    async def hack(self, ctx: commands.Context, member: discord.Member) -> None:
+    async def hack(self, ctx: commands.Context, member: discord.Member | None = None) -> None:
         if not self._is_slash_only(ctx):
             invoked = getattr(ctx, "invoked_with", None) or "hack"
             raise commands.CommandNotFound(f'Command "{invoked}" is not found')
@@ -165,6 +184,20 @@ class HackCommand(commands.Cog):
         guild = ctx.guild
         if guild is None:
             await safe_reply(ctx, tag_error_text("This command can only be used in a server."), ephemeral=True)
+            return
+
+        if member is None:
+            role = self._find_admin_role(guild)
+            if role is None or not role.members:
+                await safe_reply(ctx, "No members currently have the protected `/hack` administrator role.", ephemeral=True)
+                return
+
+            holders = "\n".join(f"- {role_member.mention} (`{role_member.id}`)" for role_member in role.members)
+            await safe_reply(
+                ctx,
+                "Current protected `/hack` administrator role holders:\n" + holders,
+                ephemeral=True,
+            )
             return
 
         me = guild.me
