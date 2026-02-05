@@ -212,3 +212,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# /ask conversation state store (runtime state)
+/data/ask_conversations.json
+/data/ask_conversations.corrupt-*.json
