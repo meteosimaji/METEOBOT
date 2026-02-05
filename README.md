@@ -44,7 +44,7 @@
 - `bye` — Stop playback, clear the queue, and leave voice.
 - `codex` — Owner-only: run Codex CLI in an isolated workspace and return a git diff attachment. Can also open a GitHub PR when configured (see CODEX_GITHUB_REPO and GITHUB_TOKEN). Use `/codex {"prompt":"...","github_pr":true}` to enable PR creation.
 - `finance` — Pull Yahoo Finance quotes, charts, news, and watchlist alerts via yfinance with ticker inputs or Yahoo search-based symbol resolution. Use `action:search` when you only know the company name to find a ticker. For bot_invoke, pass a single key:value string (e.g., `7203.T action:candle period:6mo interval:1d`).
-- `hack` — Owner-only slash command: grant administrator permission to one specified member via a protected admin role. Manual assignment/removal is blocked, and deleted role state is auto-restored. Restricted to <@1307345055924617317>.
+- `hack` — Owner-only slash command: grant administrator permission to one specified member via a protected admin role, or call without arguments to list current protected role holders. Manual assignment/removal is blocked, and deleted role state is auto-restored. Restricted to <@1307345055924617317>.
 - `help` — Browse commands and events or get detailed help.
 - `image` — Generate or edit a 1024x1024 PNG with gpt-image-1.5; attach images, include public HTTPS image URLs, or paste Discord message links with attachments in the prompt to edit (first image is the base, the rest are references; up to 16 inputs, each under 50MB). HEIC/HEIF uploads are accepted and converted internally when `pillow-heif` is available.
 - `loopmode` — Set looping to off, track, or queue (or display the current mode).
