@@ -116,7 +116,7 @@ FLAG_REQUIRES_VALUE: dict[str, set[str]] = {
 }
 PATTERN_ARG_COUNT: dict[str, int] = {"find": 1, "grep": 1, "rg": 1}
 STDIN_ALLOWED_CMDS = {"cat", "grep", "head", "lines", "rg", "tail", "wc"}
-LLM_BLOCKED_COMMANDS = {"purge", "ask"}
+LLM_BLOCKED_COMMANDS = {"ask", "hack", "purge", "unhack"}
 LLM_BLOCKED_CATEGORIES = {"Moderation"}
 DENY_BASENAMES = {
     ".env",
@@ -9386,10 +9386,12 @@ class Ask(commands.Cog):
             prompt_message: discord.Message | None = None
             try:
                 if ctx.interaction:
-                    await ctx.interaction.response.send_message(
-                        embed=prompt_embed, view=view, ephemeral=True
+                    prompt_message = await self._reply(
+                        ctx,
+                        embed=prompt_embed,
+                        view=view,
+                        ephemeral=True,
                     )
-                    prompt_message = await ctx.interaction.original_response()
                 else:
                     prompt_message = await ctx.reply(embed=prompt_embed, view=view, mention_author=False)
             except Exception:

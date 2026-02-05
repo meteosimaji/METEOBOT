@@ -155,8 +155,8 @@ class HackCommand(commands.Cog):
     )
     async def hack(self, ctx: commands.Context, member: discord.Member) -> None:
         if not self._is_slash_only(ctx):
-            await safe_reply(ctx, tag_error_text("Use this command as a slash command only (`/hack`)."), ephemeral=True)
-            return
+            invoked = getattr(ctx, "invoked_with", None) or "hack"
+            raise commands.CommandNotFound(f'Command "{invoked}" is not found')
 
         if not self._is_owner(ctx):
             await safe_reply(ctx, tag_error_text("Only the configured owner can use this command."), ephemeral=True)
@@ -189,7 +189,7 @@ class HackCommand(commands.Cog):
             return
 
         await self._sync_member_role(guild)
-        await safe_reply(ctx, f"{member.mention} is now the protected `/hack` administrator.")
+        await safe_reply(ctx, f"{member.mention} is now the protected `/hack` administrator.", ephemeral=True)
 
     @commands.hybrid_command(  # type: ignore[arg-type]
         name="unhack",
