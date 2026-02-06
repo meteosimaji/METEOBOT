@@ -189,6 +189,85 @@ def test_observe_reuses_last_good_refs_when_current_ref_extraction_fails() -> No
     assert observation.last_good_used is True
     assert observation.ref_generation == 5
     assert observation.refs == last_good.refs
+    assert agent._ref_generation_by_tab["tab1"] == 5
+    assert agent._refs_by_tab["tab1"]["e1"].ref == "e1"
+
+
+def test_round_bbox_uses_half_up_rounding_for_ties() -> None:
+    rounded = BrowserAgent._round_bbox(
+        {"x": 10.25, "y": 10.85, "width": 10.15, "height": 10.05}
+    )
+
+    assert rounded == (10.3, 10.9, 10.2, 10.1)
+
+
+def test_round_bbox_returns_none_for_invalid_bbox_values() -> None:
+    invalid_bbox: dict[str, Any] = {"x": "bad", "y": 1, "width": 1, "height": 1}
+    rounded = BrowserAgent._round_bbox(cast(dict[str, float], invalid_bbox))
+
+    assert rounded is None
+
+
+def test_ref_entries_materially_changed_ignores_small_bbox_jitter() -> None:
+    previous = {
+        "e1": RefEntry(
+            ref="e1",
+            role="button",
+            name="Run",
+            nth=None,
+            mode="aria",
+            selector="#run",
+            bbox={"x": 10.04, "y": 20.04, "width": 30.04, "height": 40.04},
+            frame_name=None,
+            frame_url="https://example.com",
+        )
+    }
+    current = [
+        RefEntry(
+            ref="e1",
+            role="button",
+            name="Run",
+            nth=None,
+            mode="aria",
+            selector="#run",
+            bbox={"x": 10.03, "y": 20.03, "width": 30.03, "height": 40.03},
+            frame_name=None,
+            frame_url="https://example.com",
+        )
+    ]
+
+    assert BrowserAgent._ref_entries_materially_changed(previous, current) is False
+
+
+def test_ref_entries_materially_changed_detects_field_change() -> None:
+    previous = {
+        "e1": RefEntry(
+            ref="e1",
+            role="button",
+            name="Run",
+            nth=None,
+            mode="aria",
+            selector="#run",
+            bbox={"x": 10.0, "y": 20.0, "width": 30.0, "height": 40.0},
+            frame_name=None,
+            frame_url="https://example.com",
+        )
+    }
+    current = [
+        RefEntry(
+            ref="e1",
+            role="button",
+            name="Run now",
+            nth=None,
+            mode="aria",
+            selector="#run",
+            bbox={"x": 10.0, "y": 20.0, "width": 30.0, "height": 40.0},
+            frame_name=None,
+            frame_url="https://example.com",
+        )
+    ]
+
+    assert BrowserAgent._ref_entries_materially_changed(previous, current) is True
 
 
 def test_detect_playwright_version_falls_back_to_unknown_when_missing() -> None:

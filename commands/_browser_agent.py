@@ -3,6 +3,7 @@ from __future__ import annotations
 # mypy: ignore-errors
 from dataclasses import dataclass, replace
 from collections import deque
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import asyncio
 import contextlib
 import importlib.metadata
@@ -475,6 +476,43 @@ class BrowserAgent:
             and (observation.ref_error is not None or observation.ref_degraded)
             and last_good.refs
         ):
+            self._ref_generation_by_tab[tab_id] = last_good.ref_generation
+            restored_refs: dict[str, RefEntry] = {}
+            for ref_obj in last_good.refs:
+                if not isinstance(ref_obj, dict):
+                    continue
+                ref_id = str(ref_obj.get("ref") or "").strip()
+                if not ref_id:
+                    continue
+                mode_raw = str(ref_obj.get("mode") or "role").lower()
+                mode: RefMode = "role"
+                if mode_raw in {"aria", "role", "css"}:
+                    mode = mode_raw
+                bbox_raw = ref_obj.get("bbox")
+                bbox: dict[str, float] | None = None
+                if isinstance(bbox_raw, dict):
+                    try:
+                        bbox = {
+                            "x": float(bbox_raw.get("x", 0.0)),
+                            "y": float(bbox_raw.get("y", 0.0)),
+                            "width": float(bbox_raw.get("width", 0.0)),
+                            "height": float(bbox_raw.get("height", 0.0)),
+                        }
+                    except (TypeError, ValueError):
+                        bbox = None
+                restored_refs[ref_id] = RefEntry(
+                    ref=ref_id,
+                    role=str(ref_obj.get("role") or "") or None,
+                    name=str(ref_obj.get("name") or "") or None,
+                    nth=int(ref_obj["nth"]) if isinstance(ref_obj.get("nth"), int) else None,
+                    mode=mode,
+                    selector=str(ref_obj.get("selector") or "") or None,
+                    bbox=bbox,
+                    frame_name=str(ref_obj.get("frame_name") or "") or None,
+                    frame_url=str(ref_obj.get("frame_url") or "") or None,
+                )
+            if restored_refs:
+                self._refs_by_tab[tab_id] = restored_refs
             observation = replace(
                 observation,
                 refs=last_good.refs,
@@ -569,6 +607,7 @@ class BrowserAgent:
         ref_degraded = False
         if tab_id:
             previous_generation = self._ref_generation_by_tab.get(tab_id, 0)
+            previous_entries = self._refs_by_tab.get(tab_id)
             entries, ref_error, ref_error_raw, ref_degraded, ref_retry_count, ref_nav_race = (
                 await self._build_ref_entries_with_fallback(
                     page,
@@ -578,7 +617,8 @@ class BrowserAgent:
             retry_count += ref_retry_count
             nav_race = nav_race or ref_nav_race
             if entries:
-                ref_generation = previous_generation + 1
+                changed = self._ref_entries_materially_changed(previous_entries, entries)
+                ref_generation = previous_generation + 1 if changed else previous_generation
                 self._refs_by_tab[tab_id] = {entry.ref: entry for entry in entries}
                 self._ref_generation_by_tab[tab_id] = ref_generation
                 if aria_ref_snapshot and any(entry.mode == "aria" for entry in entries):
@@ -1083,6 +1123,58 @@ class BrowserAgent:
         if not tab_id:
             return False
         return self._ref_generation_by_tab.get(tab_id, 0) == ref_generation
+
+    @staticmethod
+    def _round_bbox(bbox: dict[str, float] | None) -> tuple[float, float, float, float] | None:
+        if not bbox:
+            return None
+
+        def _half_up(value: Any) -> float:
+            if not isinstance(value, (int, float)):
+                raise TypeError
+            decimal_value = Decimal(str(float(value))).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+            return float(decimal_value)
+
+        x = bbox.get("x")
+        y = bbox.get("y")
+        width = bbox.get("width")
+        height = bbox.get("height")
+        try:
+            return (_half_up(x), _half_up(y), _half_up(width), _half_up(height))
+        except (TypeError, ValueError, InvalidOperation):
+            return None
+
+    @classmethod
+    def _entry_signature(cls, entry: RefEntry) -> tuple[Any, ...]:
+        return (
+            entry.ref,
+            entry.role,
+            entry.name,
+            entry.nth,
+            entry.mode,
+            entry.selector,
+            cls._round_bbox(entry.bbox),
+            entry.frame_name,
+            entry.frame_url,
+        )
+
+    @classmethod
+    def _ref_entries_materially_changed(
+        cls,
+        previous: dict[str, RefEntry] | None,
+        current: list[RefEntry],
+    ) -> bool:
+        if previous is None:
+            return bool(current)
+        if len(previous) != len(current):
+            return True
+        for entry in current:
+            prev_entry = previous.get(entry.ref)
+            if prev_entry is None:
+                return True
+            if cls._entry_signature(prev_entry) != cls._entry_signature(entry):
+                return True
+        return False
 
     def _resolve_ref_frame(self, page: Page, entry: RefEntry) -> Page | Frame:
         if entry.frame_url and entry.frame_url == page.url:
