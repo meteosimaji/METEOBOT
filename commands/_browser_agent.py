@@ -865,6 +865,7 @@ class BrowserAgent:
         )
         entries: list[RefEntry] = []
         handle_by_entry: dict[int, Any] = {}
+        tag_name_by_entry: dict[int, str] = {}
         max_scan = max(max_items * 6, max_items + 120)
         viewport = page.viewport_size or {}
         viewport_w = viewport.get("width")
@@ -907,14 +908,11 @@ class BrowserAgent:
                 except Exception:
                     input_type = None
                 role = self._infer_role(role_attr, tag_name, input_type)
-                name = await self._infer_accessible_name(handle, tag_name)
                 mode: RefMode = "css"
-                if role and name:
-                    mode = "role"
                 entry = RefEntry(
                     ref="",
                     role=role,
-                    name=name,
+                    name=None,
                     nth=None,
                     mode=mode,
                     selector=None,
@@ -929,6 +927,7 @@ class BrowserAgent:
                 )
                 entries.append(entry)
                 handle_by_entry[id(entry)] = handle
+                tag_name_by_entry[id(entry)] = tag_name
             if len(entries) >= max_scan:
                 break
         viewport_area = None
@@ -968,7 +967,6 @@ class BrowserAgent:
                 y_key = float((entry.bbox or {}).get("y", 0.0))
                 x_key = float((entry.bbox or {}).get("x", 0.0))
             return (
-                0 if (entry.name and str(entry.name).strip()) else 1,
                 role_priority(entry.role),
                 y_key,
                 x_key,
@@ -1018,6 +1016,14 @@ class BrowserAgent:
                 if handle is not None:
                     with contextlib.suppress(Exception):
                         entry.selector = await handle.evaluate(CSS_PATH_SCRIPT)
+            if entry.name is None:
+                handle = handle_by_entry.get(id(entry))
+                tag_name = tag_name_by_entry.get(id(entry), "")
+                if handle is not None:
+                    with contextlib.suppress(Exception):
+                        entry.name = await self._infer_accessible_name(handle, tag_name)
+                if entry.role and entry.name:
+                    entry.mode = "role"
         return selected
 
     @staticmethod

@@ -49,7 +49,7 @@ from PIL.Image import Image as PILImageType
 from pptx import Presentation
 from pypdf import PdfReader
 
-from commands._browser_agent import BrowserAgent, BrowserObservation
+from commands._browser_agent import BrowserAgent, BrowserObservation, MAX_REF_ENTRIES
 from utils import (
     ASK_ERROR_TAG,
     BOT_PREFIX,
@@ -92,6 +92,7 @@ MAX_BROWSER_SCREENSHOT_BYTES = int(
     os.getenv("ASK_MAX_BROWSER_SCREENSHOT_BYTES", str(8 * 1024 * 1024))
 )
 BROWSER_SCREENSHOT_MAX_DIM = int(os.getenv("ASK_BROWSER_SCREENSHOT_MAX_DIM", "1600"))
+ASK_SCREENSHOT_MARKED_MAX_ITEMS = MAX_REF_ENTRIES
 ALLOWED_FLAGS: dict[str, set[str]] = {
     "cat": {"-n"},
     "diff": {"-u"},
@@ -8933,7 +8934,7 @@ class Ask(commands.Cog):
                         max_items = int(max_items_raw) if max_items_raw is not None else 20
                     except (TypeError, ValueError):
                         max_items = 20
-                    max_items = max(1, min(max_items, 50))
+                    max_items = max(1, min(max_items, ASK_SCREENSHOT_MARKED_MAX_ITEMS))
                     observation = await agent.observe()
                     try:
                         shot = await agent.page.screenshot(type="png")
@@ -8945,10 +8946,26 @@ class Ask(commands.Cog):
                             "observation": observation.to_dict(),
                         }
                     targets = self._build_ref_targets(observation, max_items)
-                    viewport = agent.page.viewport_size if agent.page else None
                     viewport_size = None
-                    if viewport and viewport.get("width") and viewport.get("height"):
-                        viewport_size = (int(viewport["width"]), int(viewport["height"]))
+                    if agent.page:
+                        viewport = agent.page.viewport_size or {}
+                        if viewport.get("width") and viewport.get("height"):
+                            viewport_size = (int(viewport["width"]), int(viewport["height"]))
+                        else:
+                            with contextlib.suppress(Exception):
+                                viewport_metrics = await agent.page.evaluate(
+                                    """
+                                    () => ({
+                                        width: Math.max(0, window.innerWidth || 0),
+                                        height: Math.max(0, window.innerHeight || 0),
+                                    })
+                                    """
+                                )
+                                if viewport_metrics:
+                                    width = int(viewport_metrics.get("width", 0))
+                                    height = int(viewport_metrics.get("height", 0))
+                                    if width and height:
+                                        viewport_size = (width, height)
                     annotated = self._annotate_screenshot(
                         shot, targets, viewport_size=viewport_size
                     )
