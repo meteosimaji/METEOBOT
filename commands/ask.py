@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import secrets
+import signal
 import shlex
 import shutil
 import subprocess
@@ -241,6 +242,22 @@ ASK_OPERATOR_START_COOLDOWN_S = float(
 ASK_BROWSER_CDP_CONNECT_TIMEOUT_S = float(
     os.getenv("ASK_BROWSER_CDP_CONNECT_TIMEOUT_S", "8")
 )
+ASK_BROWSER_CDP_AUTO_CONFIG = (
+    (os.getenv("ASK_BROWSER_CDP_AUTO_CONFIG", "false") or "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+ASK_BROWSER_CDP_AUTO_LAUNCH = (
+    (os.getenv("ASK_BROWSER_CDP_AUTO_LAUNCH", "true") or "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+ASK_BROWSER_CDP_AUTO_HOST = (os.getenv("ASK_BROWSER_CDP_AUTO_HOST", "127.0.0.1") or "").strip()
+ASK_BROWSER_CDP_AUTO_PORT = max(0, int(os.getenv("ASK_BROWSER_CDP_AUTO_PORT", "0")))
+ASK_BROWSER_CDP_AUTO_LAUNCH_TIMEOUT_S = float(
+    os.getenv("ASK_BROWSER_CDP_AUTO_LAUNCH_TIMEOUT_S", "6")
+)
+OPERATOR_ROLE_MAX_CHARS = 64
+OPERATOR_NAME_MAX_CHARS = 256
+OPERATOR_TEXT_MAX_CHARS = 4000
 ASK_BROWSER_CDP_ALLOW_REMOTE = (
     (os.getenv("ASK_BROWSER_CDP_ALLOW_REMOTE") or "").strip().lower() in {"1", "true", "yes"}
 )
@@ -1599,6 +1616,29 @@ def _is_remote_cdp_url_allowed(cdp_url: str | None) -> bool:
     return scheme in {"wss", "https"}
 
 
+def _build_local_cdp_url(*, host: str, port: int) -> str:
+    host_value = (host or "").strip() or "127.0.0.1"
+    if ":" in host_value and not host_value.startswith("["):
+        host_value = f"[{host_value}]"
+    return f"http://{host_value}:{int(port)}"
+
+
+def _is_loopback_host(host: str) -> bool:
+    raw_host = (host or "").strip().strip("[]")
+    if raw_host.lower() in {"localhost"}:
+        return True
+    with contextlib.suppress(ValueError):
+        return ipaddress.ip_address(raw_host).is_loopback
+    return False
+
+
+def _pick_free_tcp_port(host: str) -> int:
+    bind_host = "::1" if ":" in host else "127.0.0.1"
+    with socket.socket(socket.AF_INET6 if bind_host == "::1" else socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((bind_host, 0))
+        return int(sock.getsockname()[1])
+
+
 MAX_TOOL_TURNS = _env_int("ASK_MAX_TOOL_TURNS", 50, minimum=1)
 TOOL_WARNING_TURN = min(MAX_TOOL_TURNS, _env_int("ASK_TOOL_WARNING_TURN", 40, minimum=1))
 ASK_CONTAINER_FILE_LINK_TTL_S = _env_int("ASK_CONTAINER_FILE_LINK_TTL_S", 30 * 60, minimum=60)
@@ -2599,6 +2639,10 @@ class Ask(commands.Cog):
         self._operator_xvfb_proc: subprocess.Popen | None = None
         self._operator_xvfb_display: str | None = None
         self._operator_xvfb_original_display: str | None = None
+        self._operator_cdp_proc_by_state: dict[str, subprocess.Popen] = {}
+        self._operator_cdp_url_by_state: dict[str, str] = {}
+        self._operator_cdp_auto_managed_states: set[str] = set()
+        self._operator_cdp_lock = asyncio.Lock()
         self._operator_app: web.Application | None = None
         self._operator_runner: web.AppRunner | None = None
         self._operator_site: web.TCPSite | None = None
@@ -3155,11 +3199,15 @@ class Ask(commands.Cog):
         agent = self._browser_by_channel.pop(key, None)
         self._browser_lock_by_channel.pop(key, None)
         self._browser_owner_by_channel.pop(key, None)
+        self._browser_prefer_cdp_by_channel.pop(key, None)
+        self._operator_start_warnings.pop(key, None)
+        self._operator_screenshot_cache.pop(key, None)
         self._operator_sessions_by_state.pop(key, None)
         self._operator_headless_running.pop(key, None)
         for token, session in list(self._operator_sessions.items()):
             if session.state_key == key:
                 self._operator_sessions.pop(token, None)
+        await self._operator_stop_cdp_for_state(key)
         if agent is not None:
             await agent.close()
 
@@ -3291,11 +3339,13 @@ class Ask(commands.Cog):
             with contextlib.suppress(Exception):
                 await runner.cleanup()
         self._operator_stop_xvfb()
+        await self._operator_stop_all_cdp()
 
-    def cog_unload(self) -> None:
+    def _cleanup_operator_runtime(self) -> None:
         if self._operator_runner is not None:
             asyncio.create_task(self._shutdown_operator_server())
         self._operator_stop_xvfb()
+        self._operator_stop_all_cdp_sync()
         for task in self._download_cleanup_tasks.values():
             task.cancel()
         self._download_cleanup_tasks.clear()
@@ -3323,6 +3373,104 @@ class Ask(commands.Cog):
                 os.environ.pop("DISPLAY", None)
             else:
                 os.environ["DISPLAY"] = original_display
+
+    @staticmethod
+    def _operator_find_cdp_browser_executable() -> str | None:
+        for candidate in (
+            os.getenv("ASK_BROWSER_CDP_EXECUTABLE"),
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "chrome",
+        ):
+            if not candidate:
+                continue
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+        return None
+
+    async def _operator_ensure_local_cdp(self, *, state_key: str) -> tuple[str | None, str | None]:
+        async with self._operator_cdp_lock:
+            env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
+            if env_cdp_url:
+                self._operator_cdp_url_by_state[state_key] = env_cdp_url
+                self._operator_cdp_auto_managed_states.discard(state_key)
+                return env_cdp_url, None
+            if not ASK_BROWSER_CDP_AUTO_CONFIG:
+                return None, "cdp_auto_config_disabled"
+            proc = self._operator_cdp_proc_by_state.get(state_key)
+            cached_url = self._operator_cdp_url_by_state.get(state_key)
+            if proc is not None and proc.poll() is None and cached_url:
+                return cached_url, None
+            if not ASK_BROWSER_CDP_AUTO_LAUNCH:
+                return None, "cdp_auto_launch_disabled"
+            host = ASK_BROWSER_CDP_AUTO_HOST or "127.0.0.1"
+            if not _is_loopback_host(host):
+                return None, "cdp_auto_host_unsafe"
+            browser_exe = self._operator_find_cdp_browser_executable()
+            if not browser_exe:
+                return None, "cdp_auto_launch_browser_missing"
+            port = ASK_BROWSER_CDP_AUTO_PORT or _pick_free_tcp_port(host)
+            profile_dir = self._browser_profile_dir(f"{state_key}:cdp")
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            command = [
+                browser_exe,
+                f"--remote-debugging-address={host}",
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+            try:
+                proc = subprocess.Popen(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                return None, f"cdp_auto_launch_failed: {type(exc).__name__}"
+            self._operator_cdp_proc_by_state[state_key] = proc
+            self._operator_cdp_auto_managed_states.add(state_key)
+            local_url = _build_local_cdp_url(host=host, port=port)
+            self._operator_cdp_url_by_state[state_key] = local_url
+            await asyncio.sleep(max(0.1, ASK_BROWSER_CDP_AUTO_LAUNCH_TIMEOUT_S / 20))
+            if proc.poll() is not None:
+                self._operator_cdp_proc_by_state.pop(state_key, None)
+                self._operator_cdp_url_by_state.pop(state_key, None)
+                self._operator_cdp_auto_managed_states.discard(state_key)
+                return None, "cdp_auto_launch_failed"
+            return local_url, None
+
+    def _stop_cdp_proc(self, state_key: str, proc: subprocess.Popen | None) -> None:
+        self._operator_cdp_proc_by_state.pop(state_key, None)
+        self._operator_cdp_url_by_state.pop(state_key, None)
+        self._operator_cdp_auto_managed_states.discard(state_key)
+        if proc is None or proc.poll() is not None:
+            return
+        with contextlib.suppress(Exception):
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=1)
+        if proc.poll() is None:
+            with contextlib.suppress(Exception):
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGKILL)
+
+    def _operator_stop_all_cdp_sync(self) -> None:
+        for state_key, proc in list(self._operator_cdp_proc_by_state.items()):
+            self._stop_cdp_proc(state_key, proc)
+
+    async def _operator_stop_all_cdp(self) -> None:
+        async with self._operator_cdp_lock:
+            self._operator_stop_all_cdp_sync()
+
+    async def _operator_stop_cdp_for_state(self, state_key: str) -> None:
+        async with self._operator_cdp_lock:
+            self._stop_cdp_proc(state_key, self._operator_cdp_proc_by_state.get(state_key))
 
     def _operator_pick_free_display(self) -> str:
         for display_id in range(
@@ -3422,17 +3570,24 @@ class Ask(commands.Cog):
             return agent, None
         warning: str | None = None
         mode: Literal["launch", "cdp"] = "cdp" if prefer_cdp else "launch"
-        cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
+        cdp_warning: str | None = None
+        cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or self._operator_cdp_url_by_state.get(state_key) or None
+        if mode == "cdp":
+            auto_cdp_url, auto_cdp_error = await self._operator_ensure_local_cdp(state_key=state_key)
+            if auto_cdp_url:
+                cdp_url = auto_cdp_url
+            elif auto_cdp_error and not cdp_url:
+                cdp_warning = auto_cdp_error
         cdp_headers = self._cdp_headers if cdp_url else None
         cdp_timeout_ms = int(max(1.0, ASK_BROWSER_CDP_CONNECT_TIMEOUT_S) * 1000)
         headless = self._operator_headless_preference(state_key=state_key)
         if mode == "cdp" and not cdp_url:
             log.warning(
-                "CDP preferred but ASK_BROWSER_CDP_URL missing; falling back to launch."
+                "CDP preferred but URL missing; falling back to launch."
             )
             mode = "launch"
             self._browser_prefer_cdp_by_channel.pop(state_key, None)
-            warning = "cdp_fallback_missing_url"
+            warning = cdp_warning or "cdp_fallback_missing_url"
         if mode == "cdp" and not _is_remote_cdp_url_allowed(cdp_url):
             log.warning("CDP URL rejected by policy; falling back to launch.")
             mode = "launch"
@@ -3555,6 +3710,9 @@ class Ask(commands.Cog):
             "title": observation.title,
             "ref_generation": observation.ref_generation,
             "refs": observation.refs,
+            "ref_error": getattr(observation, "ref_error", None),
+            "ref_error_raw": getattr(observation, "ref_error_raw", None),
+            "ref_degraded": bool(getattr(observation, "ref_degraded", False)),
             "viewport_css": {
                 "width": viewport_width,
                 "height": viewport_height,
@@ -3613,7 +3771,7 @@ class Ask(commands.Cog):
         running_headless = self._operator_headless_running.get(state_key)
         session_headless = self._operator_headless_by_state.get(state_key)
         domain_headless = self._operator_headless_by_domain.get(domain) if domain else None
-        cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
+        cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or self._operator_cdp_url_by_state.get(state_key) or None
         cdp_connected = bool(
             cdp_url
             and bool(self._browser_prefer_cdp_by_channel.get(state_key))
@@ -3628,6 +3786,7 @@ class Ask(commands.Cog):
                 "warning": warning,
                 "cdp_url": cdp_url,
                 "cdp_connected": cdp_connected,
+                "cdp_auto_managed": (state_key in self._operator_cdp_auto_managed_states),
                 "server_host": server_host,
                 "headless": {
                     "running": running_headless,
@@ -3742,8 +3901,10 @@ class Ask(commands.Cog):
         allowed_actions = {
             "goto",
             "click_ref",
+            "click_role",
             "click_xy",
             "fill_ref",
+            "fill_role",
             "hover_ref",
             "scroll_ref",
             "scroll_into_view_ref",
@@ -3762,6 +3923,22 @@ class Ask(commands.Cog):
             url = str(action.get("url") or "")
             if not url or not await self._is_safe_browser_url(url):
                 return web.json_response({"ok": False, "error": "unsafe_url"}, status=400)
+        if action_type in {"click_role", "fill_role"}:
+            role = str(action.get("role") or "").strip()
+            if not role:
+                return web.json_response({"ok": False, "error": "missing_role"}, status=400)
+            if len(role) > OPERATOR_ROLE_MAX_CHARS:
+                return web.json_response({"ok": False, "error": "role_too_long"}, status=400)
+            if action.get("name") is not None:
+                name = str(action.get("name") or "")
+                if len(name) > OPERATOR_NAME_MAX_CHARS:
+                    return web.json_response({"ok": False, "error": "name_too_long"}, status=400)
+            if action_type == "fill_role":
+                text = action.get("text")
+                if not isinstance(text, str):
+                    return web.json_response({"ok": False, "error": "missing_text"}, status=400)
+                if len(text) > OPERATOR_TEXT_MAX_CHARS:
+                    return web.json_response({"ok": False, "error": "text_too_long"}, status=400)
         if action_type in {
             "click_ref",
             "fill_ref",
@@ -4091,6 +4268,20 @@ class Ask(commands.Cog):
           </div>
         </div>
         <div>
+          <label>Role actions</label>
+          <div class="row">
+            <input id="roleInput" placeholder="Role (e.g. button)" />
+            <input id="roleNameInput" placeholder="Name (optional)" />
+          </div>
+          <div class="row" style="margin-top: 6px;">
+            <input id="roleTextInput" placeholder="Text for fill_role" />
+          </div>
+          <div class="row" style="margin-top: 6px;">
+            <button class="secondary" id="clickRoleBtn">Click role</button>
+            <button class="secondary" id="fillRoleBtn">Fill role</button>
+          </div>
+        </div>
+        <div>
           <label>Keys</label>
           <div class="row">
             <button class="secondary" data-key="Enter">Enter</button>
@@ -4379,10 +4570,10 @@ class Ask(commands.Cog):
           if (data.ok && data.observation) {{
             currentObservation = data.observation;
             metaEl.textContent = `${{data.observation.title || "Untitled"}} — ${{data.observation.url || ""}}`;
-            if (data.warning === "cdp_fallback_missing_url") {{
+            if (data.warning === "cdp_fallback_missing_url" || data.warning === "cdp_auto_launch_disabled") {{
               showBanner("CDP URL is not set. Using a server-launched browser.");
-            }} else if (data.warning === "cdp_fallback_remote_not_allowed") {{
-              showBanner("CDP URL was blocked by policy. Using a server-launched browser.");
+            }} else if (data.warning === "cdp_fallback_remote_not_allowed" || data.warning === "cdp_auto_host_unsafe") {{
+              showBanner("CDP URL/host was blocked by policy. Using a server-launched browser.");
             }} else if (
               [
                 "cdp_connect_timeout",
@@ -4391,6 +4582,8 @@ class Ask(commands.Cog):
                 "cdp_connection_refused",
                 "cdp_handshake_failed",
                 "cdp_connect_failed",
+                "cdp_auto_launch_browser_missing",
+                "cdp_auto_launch_failed",
               ].includes(data.warning)
             ) {{
               showBanner("CDP connection failed. Using a server-launched browser.");
@@ -4545,6 +4738,9 @@ class Ask(commands.Cog):
           const data = await api("action", {{ action }});
           if (data?.observation) {{
             currentObservation = data.observation;
+            if ((currentObservation?.ref_degraded || currentObservation?.ref_error) && (!Array.isArray(currentObservation?.refs) || currentObservation.refs.length === 0)) {{
+              showBanner("Ref extraction degraded; use Role actions or direct typing/keys.");
+            }}
           }}
           const errorDetail = data.error || data?.result?.error || data?.result?.reason;
           statusEl.textContent = data.ok ? "Action complete." : `Action failed: ${{errorDetail || "unknown"}}`;
@@ -4636,6 +4832,41 @@ class Ask(commands.Cog):
         }} catch (err) {{
           statusEl.textContent = `Clipboard error: ${{err.message}}`;
         }}
+      }});
+
+      document.getElementById("clickRoleBtn").addEventListener("click", () => {{
+        const role = document.getElementById("roleInput").value.trim();
+        const nameRaw = document.getElementById("roleNameInput").value;
+        if (!role) {{
+          statusEl.textContent = "Role is required for click_role.";
+          return;
+        }}
+        const payload = {{ type: "click_role", role }};
+        const name = nameRaw.trim();
+        if (name) {{
+          payload.name = name;
+        }}
+        sendAction(payload);
+      }});
+
+      document.getElementById("fillRoleBtn").addEventListener("click", () => {{
+        const role = document.getElementById("roleInput").value.trim();
+        const nameRaw = document.getElementById("roleNameInput").value;
+        const text = document.getElementById("roleTextInput").value;
+        if (!role) {{
+          statusEl.textContent = "Role is required for fill_role.";
+          return;
+        }}
+        if (!text) {{
+          statusEl.textContent = "Text is required for fill_role.";
+          return;
+        }}
+        const payload = {{ type: "fill_role", role, text }};
+        const name = nameRaw.trim();
+        if (name) {{
+          payload.name = name;
+        }}
+        sendAction(payload);
       }});
 
       document.querySelectorAll("[data-key]").forEach((button) => {{
@@ -6512,6 +6743,7 @@ class Ask(commands.Cog):
             log.exception("Failed to register /ask slash command")
 
     async def cog_unload(self) -> None:
+        self._cleanup_operator_runtime()
         cmd = self.bot.tree.get_command("ask", type=AppCommandType.chat_input)
         if cmd is not self.ask_slash:
             return
@@ -8685,6 +8917,9 @@ class Ask(commands.Cog):
                         "attachment_url": attachment_url,
                         "message_url": message_url,
                         "targets": targets,
+                        "ref_degraded": observation.ref_degraded,
+                        "ref_error": observation.ref_error,
+                        "ref_error_raw": observation.ref_error_raw,
                         "observation": observation.to_dict(),
                     }
                 sanitized_action = action.copy()
@@ -9493,7 +9728,7 @@ class Ask(commands.Cog):
             owner_id = self._get_browser_owner(ctx)
             is_admin = self._is_admin(ctx)
             env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip()
-            prefer_cdp = bool(env_cdp_url)
+            prefer_cdp = bool(env_cdp_url) or ASK_BROWSER_CDP_AUTO_CONFIG
             if owner_id is None:
                 owner_id = ctx.author.id
                 self._set_browser_owner(ctx, owner_id)

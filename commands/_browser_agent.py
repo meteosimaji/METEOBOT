@@ -6,6 +6,7 @@ from collections import deque
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from typing import Any, Awaitable, Callable, Literal
 import uuid
@@ -74,6 +75,8 @@ ARIA_TREE_LINE_RE = re.compile(
 MAX_REF_ENTRIES = 200
 MIN_BBOX_ENTRIES = 5
 MAX_SELECTOR_CHARS = 200
+REF_FALLBACK_MAX_ITEMS = int(os.getenv("ASK_BROWSER_REF_FALLBACK_MAX_ITEMS", "30"))
+REF_FALLBACK_READ_TIMEOUT_S = float(os.getenv("ASK_BROWSER_REF_FALLBACK_TIMEOUT_S", "2.0"))
 
 CSS_PATH_SCRIPT = """
 el => {
@@ -148,6 +151,8 @@ class BrowserObservation:
     title_error: str | None = None
     aria_error: str | None = None
     ref_error: str | None = None
+    ref_error_raw: str | None = None
+    ref_degraded: bool = False
     nav_race: bool = False
     last_good_used: bool = False
     retry_count: int = 0
@@ -166,6 +171,8 @@ class BrowserObservation:
             "title_error": self.title_error,
             "aria_error": self.aria_error,
             "ref_error": self.ref_error,
+            "ref_error_raw": self.ref_error_raw,
+            "ref_degraded": self.ref_degraded,
             "nav_race": self.nav_race,
             "last_good_used": self.last_good_used,
             "retry_count": self.retry_count,
@@ -512,19 +519,21 @@ class BrowserAgent:
         ref_snapshot = ""
         refs: list[dict[str, Any]] = []
         ref_error = None
+        ref_error_raw = None
+        ref_degraded = False
         if tab_id:
             ref_generation = self._ref_generation_by_tab.get(tab_id, 0) + 1
-            entries, ref_retry_count, ref_error, ref_nav_race = await self._safe_page_read(
-                page,
-                "ref_entries",
-                lambda: self._build_ref_entries(page, aria_ref_snapshot),
-                default=[],
+            entries, ref_error, ref_error_raw, ref_degraded, ref_retry_count, ref_nav_race = (
+                await self._build_ref_entries_with_fallback(
+                    page,
+                    aria_ref_snapshot=aria_ref_snapshot,
+                )
             )
             retry_count += ref_retry_count
             nav_race = nav_race or ref_nav_race
             self._refs_by_tab[tab_id] = {entry.ref: entry for entry in entries}
             self._ref_generation_by_tab[tab_id] = ref_generation
-            if aria_ref_snapshot:
+            if aria_ref_snapshot and any(entry.mode == "aria" for entry in entries):
                 ref_snapshot = self._format_ref_snapshot_tree(aria_ref_snapshot, entries)
             else:
                 ref_snapshot = self._format_ref_snapshot(entries)
@@ -544,6 +553,8 @@ class BrowserAgent:
             title_error=title_error,
             aria_error=aria_error,
             ref_error=ref_error,
+            ref_error_raw=ref_error_raw,
+            ref_degraded=ref_degraded,
             nav_race=nav_race,
             retry_count=retry_count,
             error=error,
@@ -603,6 +614,67 @@ class BrowserAgent:
     def _is_navigation_error(self, exc: Exception) -> bool:
         message = str(exc)
         return any(marker in message for marker in self._NAVIGATION_ERROR_MARKERS)
+
+    @staticmethod
+    def _classify_ref_error(error: str | None) -> str | None:
+        if not error:
+            return None
+        if error.startswith("TimeoutError"):
+            return "ref_entries_timeout"
+        if "Execution context was destroyed" in error:
+            return "ref_entries_navigation_race"
+        if "Frame was detached" in error:
+            return "ref_entries_frame_detached"
+        if "Target closed" in error or "has been closed" in error:
+            return "ref_entries_target_closed"
+        return "ref_entries_failed"
+
+    async def _build_ref_entries_with_fallback(
+        self,
+        page: Page,
+        *,
+        aria_ref_snapshot: str | None,
+    ) -> tuple[list[RefEntry], str | None, str | None, bool, int, bool]:
+        entries, ref_retry_count, ref_error, ref_nav_race = await self._safe_page_read(
+            page,
+            "ref_entries",
+            lambda: self._build_ref_entries(page, aria_ref_snapshot),
+            default=[],
+        )
+        ref_degraded = False
+        raw_ref_error = ref_error
+        classified_ref_error = self._classify_ref_error(ref_error)
+        if not entries:
+            fallback_entries, fb_retry_count, fallback_error, fb_nav_race = await self._safe_page_read(
+                page,
+                "ref_entries_fallback",
+                lambda: self._refs_from_clickable_targets(
+                    page,
+                    ref_prefix="c",
+                    max_items=max(1, REF_FALLBACK_MAX_ITEMS),
+                ),
+                default=[],
+                timeout_s=max(0.2, REF_FALLBACK_READ_TIMEOUT_S),
+            )
+            ref_retry_count += fb_retry_count
+            ref_nav_race = ref_nav_race or fb_nav_race
+            if fallback_entries:
+                entries = self._apply_nth_to_duplicates(fallback_entries[:MAX_REF_ENTRIES])
+                classified_ref_error = "ref_entries_degraded_fallback_clickable"
+                ref_degraded = True
+            elif fallback_error and classified_ref_error is None:
+                classified_ref_error = self._classify_ref_error(fallback_error)
+                raw_ref_error = fallback_error
+        if raw_ref_error:
+            log.debug("Ref extraction raw error: %s", raw_ref_error)
+        return (
+            entries,
+            classified_ref_error,
+            raw_ref_error,
+            ref_degraded,
+            ref_retry_count,
+            ref_nav_race,
+        )
 
     async def _post_action_sync(self, page: Page, action_type: str, action: dict[str, Any]) -> None:
         navigation_prone = {"click", "click_ref", "click_role", "click_xy", "goto"}
