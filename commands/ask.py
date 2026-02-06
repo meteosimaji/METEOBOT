@@ -5040,21 +5040,39 @@ class Ask(commands.Cog):
     def _annotate_screenshot(
         image_bytes: bytes,
         targets: list[dict[str, Any]],
+        viewport_size: tuple[int, int] | None = None,
     ) -> bytes:
         image = PILImage.open(BytesIO(image_bytes)).convert("RGB")
         draw = ImageDraw.Draw(image)
         font = ImageFont.load_default()
+        scale_x = 1.0
+        scale_y = 1.0
+        if viewport_size:
+            viewport_w, viewport_h = viewport_size
+            if viewport_w and viewport_h:
+                scale_x = image.width / float(viewport_w)
+                scale_y = image.height / float(viewport_h)
         for target in targets:
-            x = float(target.get("x", 0))
-            y = float(target.get("y", 0))
-            width = float(target.get("width", 0))
-            height = float(target.get("height", 0))
+            x = float(target.get("x", 0)) * scale_x
+            y = float(target.get("y", 0)) * scale_y
+            width = float(target.get("width", 0)) * scale_x
+            height = float(target.get("height", 0)) * scale_y
             if width <= 0 or height <= 0:
                 continue
             x2 = x + width
             y2 = y + height
             draw.rectangle((x, y, x2, y2), outline=(255, 0, 0), width=2)
-            label = str(target.get("ref", "?"))
+            ref = str(target.get("ref", "?"))
+            role = str(target.get("role") or "").strip()
+            name = str(target.get("name") or "").strip()
+            label_parts = [ref]
+            if role:
+                label_parts.append(role)
+            if name:
+                label_parts.append(name)
+            label = " ".join(label_parts)
+            if len(label) > 60:
+                label = f"{label[:57]}..."
             text_bbox = draw.textbbox((0, 0), label, font=font)
             text_w = text_bbox[2] - text_bbox[0]
             text_h = text_bbox[3] - text_bbox[1]
@@ -8927,33 +8945,17 @@ class Ask(commands.Cog):
                             "observation": observation.to_dict(),
                         }
                     targets = self._build_ref_targets(observation, max_items)
-                    annotated = self._annotate_screenshot(shot, targets)
+                    viewport = agent.page.viewport_size if agent.page else None
+                    viewport_size = None
+                    if viewport and viewport.get("width") and viewport.get("height"):
+                        viewport_size = (int(viewport["width"]), int(viewport["height"]))
+                    annotated = self._annotate_screenshot(
+                        shot, targets, viewport_size=viewport_size
+                    )
                     data, out_ext = self._compress_browser_screenshot(annotated, "png")
                     filename = "browser_screenshot_marked.png" if out_ext == "png" else "browser_screenshot_marked.jpg"
-                    legend_lines = []
-                    for target in targets:
-                        ref = str(target.get("ref") or "")
-                        role = str(target.get("role") or "")
-                        name = str(target.get("name") or "")
-                        name = " ".join(name.split())[:60]
-                        legend_lines.append(f"{ref}  {role}  {name}".rstrip())
-                    legend = "\n".join(legend_lines)
                     content = "📸 Browser screenshot (ref labels)"
                     files = [discord.File(fp=BytesIO(data), filename=filename)]
-                    if legend:
-                        legend_prefix = "```text\n"
-                        legend_suffix = "\n```"
-                        inline_budget = 1800
-                        inline_length = len(legend) + len(legend_prefix) + len(legend_suffix)
-                        if inline_length <= inline_budget and "```" not in legend:
-                            content = f"{content}\n{legend_prefix}{legend}{legend_suffix}"
-                        else:
-                            files.append(
-                                discord.File(
-                                    fp=BytesIO(legend.encode("utf-8")),
-                                    filename="browser_refs.txt",
-                                )
-                            )
                     msg = await self._reply(
                         ctx,
                         content=content,
@@ -10488,6 +10490,7 @@ class Ask(commands.Cog):
             "--wav/--mp3/--flac/--m4a/--opus/--ogg, --item N, --max-height N, or --url when needed. "
             "For /codex: owner-only command that runs Codex CLI in an isolated workspace and returns a diff (or opens a PR when configured). Only suggest /codex when the requester is the bot owner. "
             "For music playback, use /play (single arg). "
+            "Use /vc to join, move, or leave a voice channel; repeating /vc on the same channel leaves while holding the queue for 30 seconds, and /play with an empty arg just joins the caller's channel. "
             "Search queries can still work, but they sometimes pick endurance/loop versions; when possible, prefer a direct URL with /play for accuracy. "
             "When the user provides only search terms (no URL), call /searchplay first to list candidates (with durations) before using /play. "
             "When bot_invoke /play returns play_result with MAIN/R labels, use those labeled URLs for follow-up /play calls. "

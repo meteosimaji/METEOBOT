@@ -65,7 +65,7 @@
 - `operator` — Open the operator panel link for manual browser control (use when the AI hits logins or CAPTCHA). The panel prioritizes ref-based clicks from observation bboxes and falls back to XY click only when no ref target is available.
 - `pause` / `resume` — Pause or resume playback.
 - `ping` — Check the bot's responsiveness with style and speed!
-- `play` — Queue music by URL or search phrase (YouTube/Spotify/Niconico). Prefix usage also supports file attachments.
+- `play` — Queue music by URL or search phrase (YouTube/Spotify/Niconico), or run with no args to join your voice channel. Prefix usage also supports file attachments.
 - `purge` — Bulk delete messages using flexible filters.
 - `queue` — Show interactive queue panel (pause/resume, loop, skip, bye, remove, speed/pitch, toggle Auto Leave).
 - `remove` — Show recent additions when called without a number; pass a number or ID (e.g., `A12`) to remove by addition order (1=latest, 2=previous, etc.) or a comma-separated list like `A12,3,A14`.
@@ -82,6 +82,7 @@
 - `upload` — Upload a file (attachment or `/mnt/data/...` path) to a temporary `simajilord.com/save/<token>` link for sharing or playback.
 - `uptime` — Show how long the bot has been running.
 - `userinfo` — Show a member's profile with timestamps, roles, and bot status.
+- `vc` — Join, move, or leave a voice channel (repeat the same channel to leave; leaves pause playback and keep the queue for 30 seconds).
 - `video` — Generate or remix short videos with Sora from a prompt, a reference image (first frame), or a `video_...` ID; best prompts describe shot type, subject, action, setting, and lighting. Attach images, HTTPS URLs, or Discord message links to use as reference. Optional tokens: `seconds:4|8|12`, `size:720x1280|1280x720`. Limits: global usage is capped at 2 videos per day across all servers; each user can run /video once per day across all servers; each server can run /video twice per week shared across users (weekly reset Sunday 00:00 UTC).
 
 ### Save command notes

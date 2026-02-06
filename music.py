@@ -218,6 +218,7 @@ class MusicPlayer:
         self.last_channel_id: int | None = None
         self._connect_lock = asyncio.Lock()
         self._auto_leave_task: asyncio.Task | None = None
+        self._vc_hold_task: asyncio.Task | None = None
 
     def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
         task = asyncio.create_task(coro)
@@ -634,6 +635,7 @@ class MusicPlayer:
             return False
 
     async def cleanup(self, *, reset_ignore_after: bool = True) -> None:
+        self._cancel_vc_hold_task()
         self._cancel_auto_leave_task()
         if self.voice:
             try:
@@ -659,6 +661,75 @@ class MusicPlayer:
         if self._auto_leave_task:
             self._auto_leave_task.cancel()
             self._auto_leave_task = None
+
+    def _cancel_vc_hold_task(self) -> None:
+        if self._vc_hold_task:
+            self._vc_hold_task.cancel()
+            self._vc_hold_task = None
+
+    async def hold_disconnect(self, *, delay: float = 30.0) -> None:
+        """Disconnect from voice but keep queue/current for a short grace window."""
+        self.sync_voice_client()
+        if not self.voice or not self.voice.is_connected():
+            return
+        self._cancel_auto_leave_task()
+        self._cancel_vc_hold_task()
+        self.offset = self.get_position()
+        if self.voice.is_playing() or self.voice.is_paused():
+            self.ignore_after = True
+            try:
+                self.voice.stop()
+            except Exception:
+                pass
+        try:
+            await self.voice.disconnect()
+        except Exception:
+            pass
+        self.voice = None
+
+        async def _hold_cleanup() -> None:
+            me = asyncio.current_task()
+            try:
+                await asyncio.sleep(delay)
+                if self._vc_hold_task is not me:
+                    return
+                if self.voice and self.voice.is_connected():
+                    return
+                await self.cleanup(reset_ignore_after=False)
+            finally:
+                if self._vc_hold_task is me:
+                    self._vc_hold_task = None
+
+        self._vc_hold_task = asyncio.create_task(_hold_cleanup())
+
+    async def resume_after_hold(self) -> bool:
+        """Reconnect and resume the current track after a hold disconnect."""
+        self._cancel_vc_hold_task()
+        self._cancel_auto_leave_task()
+        if not self.voice or not self.voice.is_connected():
+            if not await self.ensure_connected():
+                return False
+        if not self.current:
+            return True
+        if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+            return True
+        try:
+            source = self.create_source(self.current, seek=self.offset)
+        except RuntimeError:
+            log.error("Failed to recreate source for %s", self.current.page_url)
+            return False
+
+        def _after_resume(e: Exception | None) -> None:
+            loop = self.bot.loop
+            loop.call_soon_threadsafe(self._spawn, self.after_play(e))
+
+        self.ignore_after = False
+        try:
+            await self._safe_voice_play(source, after=_after_resume)
+        except VoiceConnectionError:
+            log.error("Failed to resume playback after hold disconnect")
+            return False
+        return True
 
     @staticmethod
     def _discard_by_identity(dq: deque[Track], target: Track) -> bool:

@@ -166,6 +166,7 @@ class Play(commands.Cog):
             "Queue music from a link (YouTube, Spotify, Niconico) or a search phrase. "
             "You can also attach media files (prefix command) or pass a direct file URL.\n\n"
             "**Usage**: `/play <query or url>`\n"
+            "**Usage (join only)**: `/play` (joins your voice channel without playing)\n"
             "**Examples**: `/play never gonna give you up`\n"
             "`/play https://youtu.be/dQw4w9WgXcQ`\n"
             f"`{BOT_PREFIX}play` with file attachments\n"
@@ -224,12 +225,20 @@ class Play(commands.Cog):
                 is_direct_file = True
 
         if not source and not has_attachments:
-            return await safe_reply(
+            ok, res = await _ensure_joined(ctx)
+            if not ok:
+                return await safe_reply(
+                    ctx,
+                    tag_error_text(str(res)),
+                    ephemeral=True,
+                    mention_author=False,
+                )
+            await safe_reply(
                 ctx,
-                tag_error_text("Provide a song name, URL or attach a file."),
-                ephemeral=True,
+                "Joined your voice channel. Add a song name, URL, or attachment to start playback.",
                 mention_author=False,
             )
+            return
 
         # File-mode: attachments, direct file URLs, or (admin-only) local paths.
         if has_attachments or is_local_path or is_direct_file:
