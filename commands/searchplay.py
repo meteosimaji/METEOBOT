@@ -50,7 +50,7 @@ class SearchPlay(commands.Cog):
             "Search YouTube with yt-dlp and list candidates without queuing anything. "
             "Use this when you want to compare results before deciding what to play.\n\n"
             "**Usage**: `/searchplay <query>`\n"
-            "**Examples**: `/searchplay Escort もっぴーさうんど`\n"
+            "**Examples**: `/searchplay Escort Moppy Sound`\n"
             f"`{BOT_PREFIX}searchplay Escort`"
         ),
         extras={

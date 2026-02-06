@@ -1,6 +1,6 @@
 {
   "symbols": [
-    { "name": "トヨタ自動車(株)", "ticker": "7203.T" },
-    { "name": "ソニーグループ(株)", "ticker": "6758.T" }
+    { "name": "Toyota Motor Corporation", "ticker": "7203.T" },
+    { "name": "Sony Group Corporation", "ticker": "6758.T" }
   ]
 }

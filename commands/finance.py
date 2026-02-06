@@ -164,7 +164,9 @@ class SymbolRegistry:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
         if not SYMBOLS_FILE.exists():
-            starter = {"symbols": [{"name": "トヨタ自動車(株)", "ticker": "7203.T"}]}
+            starter = {
+                "symbols": [{"name": "Toyota Motor Corporation", "ticker": "7203.T"}]
+            }
             SYMBOLS_FILE.write_text(
                 json.dumps(starter, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -188,10 +190,10 @@ class SymbolRegistry:
 
     def resolve_strict(self, raw: str) -> tuple[str, str]:
         """
-        仕様:
-        - raw が ticker っぽいなら ticker としてそのまま通す
-        - それ以外は registry の name と完全一致のみ通す
-        - /finance トヨタ みたいな曖昧入力は必ずエラー
+        Rules:
+        - If raw looks like a ticker, pass it through as-is.
+        - Otherwise, only allow an exact match on registry names.
+        - Ambiguous inputs like `/finance Toyota` must error.
         """
         s = (raw or "").strip()
         if not s:
@@ -318,8 +320,8 @@ async def _to_thread(func, *args, **kwargs):
 
 class YFinanceClient:
     """
-    yfinance は同期I/Oなので to_thread で包む。
-    .info は壊れやすいので fast_info 優先、info は best-effort。
+    yfinance uses synchronous I/O, so wrap it with to_thread.
+    .info is fragile, so prefer fast_info and treat info as best-effort.
     """
 
     def __init__(self) -> None:
@@ -1753,7 +1755,7 @@ class Finance(commands.Cog):
         help=(
             "Examples:\n"
             "  /finance symbol:7203.T action:summary\n"
-            "  /finance symbol:トヨタ自動車(株) action:summary\n"
+            "  /finance symbol:Toyota Motor Corporation action:summary\n"
             "  /finance symbol:7203.T action:chart period:6mo interval:1d\n"
             "  /finance symbol:7203.T action:candle period:3mo interval:1d\n"
             "  /finance symbol:7203.T action:ta period:6mo interval:1d\n"
@@ -1762,7 +1764,7 @@ class Finance(commands.Cog):
             "  /finance symbol:7203.T action:forecast horizon_days:20 forecast_model:gbm_analytic\n"
             "  /finance action:symbols\n"
             "  /finance action:search query:7203\n"
-            "  /finance action:search query:マイクロアド\n"
+            "  /finance action:search query:MicroAd\n"
             "  /finance action:lookup query:Toyota kind:stock\n"
             "  /finance action:screener_local min_mcap:1e11 max_pe:20\n"
             "  /finance symbol:7203.T action:news limit:5\n"

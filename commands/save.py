@@ -608,7 +608,7 @@ def _extra_headers(url: str, user_agent: str) -> dict[str, str]:
     headers = {"User-Agent": user_agent}
     host = urlparse(url).hostname or ""
     if "tiktok.com" in host:
-        # cobaltもここを強めにやってる。Refererが無いと弾かれることがある。
+        # Cobalt also enforces this strongly; missing Referer can cause rejection.
         headers["Referer"] = "https://www.tiktok.com/"
     if host.endswith("x.com") or host.endswith("twitter.com") or host.endswith("twimg.com"):
         headers["Referer"] = "https://x.com/"
@@ -834,7 +834,8 @@ def _base_ydl_opts(
         "merge_output_format": "mp4",
         "http_headers": headers,
         "outtmpl": {"default": str(work_dir / "%(title).200B-%(id)s.%(ext)s")},
-        # ffmpegがあるなら勝手に良い感じにマルチスレ化されるが、断片DLの並列数を少し上げる。
+        # If ffmpeg is available it will thread nicely, but we slightly raise the
+        # parallelism for fragment downloads.
         "concurrent_fragment_downloads": 4,
         "socket_timeout": socket_timeout,
         "retries": 3,
@@ -843,7 +844,7 @@ def _base_ydl_opts(
     if cookies_file:
         opts["cookiefile"] = cookies_file
     if cookies_from_browser:
-        # e.g. "chrome", "firefox" (yt-dlpの仕様)
+        # e.g. "chrome", "firefox" (yt-dlp convention)
         opts["cookiesfrombrowser"] = cookies_from_browser
     norm_impersonate = _normalize_impersonate_opt(impersonate, logger)
     if norm_impersonate is not None:
@@ -938,7 +939,7 @@ def _is_mp4_h264ish_video(fmt: dict[str, Any]) -> bool:
     if not vcodec:
         return True
     vcodec = str(vcodec).lower()
-    # avc1 (H.264) が最強に互換性高い。hevc (hvc1/hev1) も一応OK。
+    # avc1 (H.264) has the broadest compatibility; hevc (hvc1/hev1) is also OK.
     return (
         vcodec.startswith("avc1")
         or ("h264" in vcodec)
@@ -953,7 +954,7 @@ def _is_hls_video(fmt: dict[str, Any]) -> bool:
         return False
     ext = (fmt.get("ext") or "").lower()
     protocol = (fmt.get("protocol") or "").lower()
-    # ts を雑に拾うと関係ない ts を掴む可能性があるので、m3u8 系に寄せる
+    # Avoid grabbing unrelated TS segments; prefer m3u8-based selection.
     return ext == "m3u8" or protocol.startswith("m3u8")
 
 
