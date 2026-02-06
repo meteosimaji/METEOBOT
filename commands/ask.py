@@ -8930,10 +8930,34 @@ class Ask(commands.Cog):
                     annotated = self._annotate_screenshot(shot, targets)
                     data, out_ext = self._compress_browser_screenshot(annotated, "png")
                     filename = "browser_screenshot_marked.png" if out_ext == "png" else "browser_screenshot_marked.jpg"
+                    legend_lines = []
+                    for target in targets:
+                        ref = str(target.get("ref") or "")
+                        role = str(target.get("role") or "")
+                        name = str(target.get("name") or "")
+                        name = " ".join(name.split())[:60]
+                        legend_lines.append(f"{ref}  {role}  {name}".rstrip())
+                    legend = "\n".join(legend_lines)
+                    content = "📸 Browser screenshot (ref labels)"
+                    files = [discord.File(fp=BytesIO(data), filename=filename)]
+                    if legend:
+                        legend_prefix = "```text\n"
+                        legend_suffix = "\n```"
+                        inline_budget = 1800
+                        inline_length = len(legend) + len(legend_prefix) + len(legend_suffix)
+                        if inline_length <= inline_budget and "```" not in legend:
+                            content = f"{content}\n{legend_prefix}{legend}{legend_suffix}"
+                        else:
+                            files.append(
+                                discord.File(
+                                    fp=BytesIO(legend.encode("utf-8")),
+                                    filename="browser_refs.txt",
+                                )
+                            )
                     msg = await self._reply(
                         ctx,
-                        content="📸 Browser screenshot (ref labels)",
-                        files=[discord.File(fp=BytesIO(data), filename=filename)],
+                        content=content,
+                        files=files,
                     )
                     attachment_url = ""
                     message_url = ""
