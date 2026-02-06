@@ -3507,15 +3507,15 @@ class Ask(commands.Cog):
             os.environ.pop("DISPLAY", None)
         if not ASK_OPERATOR_AUTOSTART_XVFB:
             return (
-                "xserver_missing: $DISPLAY が無いので headed ブラウザを起動できない。"
-                " 対処: (1) ASK_OPERATOR_HEADLESS=1 にする か、"
-                " (2) Xvfb を用意して bot を xvfb-run 配下で起動する か、"
-                " (3) ASK_OPERATOR_AUTOSTART_XVFB=1 で自動起動する。"
+                "xserver_missing: $DISPLAY is missing, so a headed browser cannot start. "
+                "Fix: (1) set ASK_OPERATOR_HEADLESS=1, "
+                "or (2) provide Xvfb and run the bot under xvfb-run, "
+                "or (3) set ASK_OPERATOR_AUTOSTART_XVFB=1 to auto-start."
             )
         if shutil.which("Xvfb") is None:
             return (
-                "xvfb_not_installed: Xvfb が見つからない。"
-                " Ubuntuなら `sudo apt-get update && sudo apt-get install -y xvfb`。"
+                "xvfb_not_installed: Xvfb was not found. "
+                "On Ubuntu: `sudo apt-get update && sudo apt-get install -y xvfb`."
             )
         if self._operator_xvfb_proc is not None and self._operator_xvfb_proc.poll() is None:
             if not os.getenv("DISPLAY"):
@@ -3539,8 +3539,8 @@ class Ask(commands.Cog):
         await asyncio.sleep(0.08)
         if self._operator_xvfb_proc.poll() is not None:
             return (
-                "xvfb_start_failed: Xvfb が即終了した。"
-                " screen指定や権限/依存関係を確認して。"
+                "xvfb_start_failed: Xvfb exited immediately. "
+                "Check screen settings, permissions, or dependencies."
             )
         os.environ["DISPLAY"] = display
         log.info(
@@ -3558,8 +3558,8 @@ class Ask(commands.Cog):
             or ("headed browser" in msg and "XServer" in msg)
         ):
             return (
-                "xserver_missing: headed ブラウザ起動に XServer($DISPLAY) が必要。"
-                " 対処: ASK_OPERATOR_HEADLESS=1 か、Xvfb (xvfb-run) を使う。"
+                "xserver_missing: A headed browser requires XServer ($DISPLAY). "
+                "Fix: set ASK_OPERATOR_HEADLESS=1, or use Xvfb (xvfb-run)."
             )
         first_line = msg.splitlines()[0].strip() if msg else repr(exc)
         return f"browser_start_failed: {first_line}"
@@ -10512,7 +10512,7 @@ class Ask(commands.Cog):
             "When the user provides only search terms (no URL), call /searchplay first to list candidates (with durations) before using /play. "
             "When bot_invoke /play returns play_result with MAIN/R labels, use those labeled URLs for follow-up /play calls. "
             "For finance bot_invoke calls, use /finance with a single key:value string (e.g., \"symbol:7203.T action:summary period:6mo interval:1d preset:swing theme:dark ui:none\"). "
-            "If the user only knows a company name (e.g., マイクロアド), call /finance action:search query:<name> first to find tickers. "
+            "If the user only knows a company name (e.g., MicroAd), call /finance action:search query:<name> first to find tickers. "
             "For /remove, call it with no arg first to get a numbered list with IDs, then pass the number or ID you want removed. "
             "For clean math rendering, call /tex (single arg) only when the user wants a rendered equation or when plain text would break; keep your text response short and reference the attached image. Wrap equations with math delimiters ($...$ or \\[...\\]); single-line expressions auto-wrap by default but explicit delimiters are preferred. For multi-line equations, use \\[\\begin{aligned} ... \\end{aligned}\\] and align equals with &. Example /tex calls: bot_invoke({'name': 'tex', 'arg': '\\[E=mc^2\\]'}); for full documents: bot_invoke({'name': 'tex', 'arg': '\\documentclass[preview]{standalone}\\n\\usepackage{amsmath}\\n\\begin{document}\\n\\[a^2+b^2=c^2\\]\\n\\end{document}\\n'}). "
             "Use bot_invoke only for safe commands. bot_invoke always requires an arg field: "
@@ -10678,8 +10678,8 @@ class Ask(commands.Cog):
                 getattr(getattr(ctx, "guild", None), "filesize_limit", None)
                 or MAX_TEXT_ATTACHMENT_BYTES
             )
-            answer_note = "（全文は添付のテキストをご確認ください）"
-            answer_truncated_note = "（本文が長いため一部省略されました）"
+            answer_note = "(See the attached text file for the full response.)"
+            answer_truncated_note = "(The response was truncated due to length.)"
             answer_attached = False
             answer_note_text = ""
             if len(answer) > 4096:

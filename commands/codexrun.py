@@ -400,7 +400,7 @@ class CodexRun(commands.Cog):
                 return True
         except Exception:
             pass
-        await safe_reply(ctx, "Owner専用コマンドだよ。", ephemeral=True)
+        await safe_reply(ctx, "This command is owner-only.", ephemeral=True)
         return False
 
     @commands.hybrid_command(  # type: ignore[arg-type]
@@ -438,7 +438,7 @@ class CodexRun(commands.Cog):
 
         prompt = (data.get("prompt") or "").strip()
         if not prompt:
-            await safe_reply(ctx, "promptが空だよ。", ephemeral=True)
+            await safe_reply(ctx, "The prompt is empty.", ephemeral=True)
             return
 
         repo = Path(data.get("repo") or ".").resolve()
@@ -470,7 +470,7 @@ class CodexRun(commands.Cog):
                     ok = True
                     break
             if not ok:
-                await safe_reply(ctx, "そのrepoパスは許可されてないよ。", ephemeral=True)
+                await safe_reply(ctx, "That repo path is not allowed.", ephemeral=True)
                 return
 
         run_id = _now_run_id()

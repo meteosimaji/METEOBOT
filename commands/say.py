@@ -330,9 +330,9 @@ class Say(commands.Cog):
         help=(
             "Send a message immediately or schedule recurring announcements with a compact spec.\n\n"
             "**Usage**: `/say <message> --<times>,<days>`\n"
-            "**Examples**: `/say おはよう --7:30,everyday`\n"
-            "`/say 自動募集 VC1にあつまって！--12:00,24:00,monday`\n"
-            "`/say 30分後に通知 --in:30m`\n"
+            "**Examples**: `/say Good morning --7:30,everyday`\n"
+            "`/say Auto reminder: gather in VC1! --12:00,24:00,monday`\n"
+            "`/say Notify me in 30 minutes --in:30m`\n"
             f"`{BOT_PREFIX}say list`\n"
             f"`{BOT_PREFIX}say delete <id>`"
         ),

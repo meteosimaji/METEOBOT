@@ -732,7 +732,7 @@ class Messages(commands.Cog):
             "Text outside filters is "
             "treated as search keywords (supports * wildcard, | for OR, and quoted phrases).\n\n"
             "**Usage**: `/messages [query]`\n"
-            "**Examples**: `/messages`, `/messages 5`, `/messages おはよう from:1234`, "
+            "**Examples**: `/messages`, `/messages 5`, `/messages good morning from:1234`, "
             "`/messages has:link before:2026-01-01`, `/messages scan:1000 has:image`, "
             "`/messages before_id:1234567890 scan:2000`, `/messages in:<#1234567890>`, "
             "`/messages !in:<#1234567890> keyword:err*`, `/messages from:<@&1234567890>`, "

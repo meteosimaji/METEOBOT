@@ -272,7 +272,7 @@ class MusicPlayer:
             raise VoiceConnectionError("Not connected to voice after retry")
         self.voice.play(source, after=after)
 
-    async def join(self, channel: discord.VoiceChannel) -> None:
+    async def join(self, channel: discord.VoiceChannel | discord.StageChannel) -> None:
         async with self._connect_lock:
             self.last_channel_id = channel.id
 

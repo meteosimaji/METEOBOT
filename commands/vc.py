@@ -39,8 +39,8 @@ class VC(commands.Cog):
     async def vc(
         self,
         ctx: commands.Context,
-        channel: discord.VoiceChannel | None = None,
-        channel_id: int | None = None,
+        channel: discord.VoiceChannel | discord.StageChannel | None = None,
+        channel_id: str | None = None,
     ) -> None:
         if ctx.guild is None:
             return await safe_reply(
@@ -52,13 +52,41 @@ class VC(commands.Cog):
 
         target = channel
         if target is None and channel_id is not None:
-            resolved = ctx.guild.get_channel(int(channel_id))
-            if isinstance(resolved, discord.VoiceChannel):
-                target = resolved
-            else:
+            channel_id = channel_id.strip()
+            if not channel_id.isdigit():
                 return await safe_reply(
                     ctx,
-                    tag_error_text("That channel ID is not a voice channel."),
+                    tag_error_text("Please provide a numeric channel ID."),
+                    mention_author=False,
+                )
+            resolved = ctx.guild.get_channel(int(channel_id))
+            if isinstance(resolved, (discord.VoiceChannel, discord.StageChannel)):
+                target = resolved
+            elif resolved is None:
+                return await safe_reply(
+                    ctx,
+                    tag_error_text("That channel ID could not be found."),
+                    mention_author=False,
+                )
+            else:
+                channel_type_names = {
+                    discord.ChannelType.text: "text",
+                    discord.ChannelType.news: "news",
+                    discord.ChannelType.forum: "forum",
+                    discord.ChannelType.category: "category",
+                    discord.ChannelType.private_thread: "private thread",
+                    discord.ChannelType.public_thread: "public thread",
+                    discord.ChannelType.news_thread: "news thread",
+                }
+                channel_type = channel_type_names.get(
+                    getattr(resolved, "type", None),
+                    str(getattr(resolved, "type", "unknown")),
+                )
+                return await safe_reply(
+                    ctx,
+                    tag_error_text(
+                        f"This is a {channel_type} channel. Please provide a voice or stage channel ID."
+                    ),
                     mention_author=False,
                 )
 
