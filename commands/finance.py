@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -65,6 +66,39 @@ FINANCE_ACTIONS = (
     "data",
 )
 FINANCE_ACTION_SET = set(FINANCE_ACTIONS)
+FINANCE_KV_KEYS = (
+    "action",
+    "period",
+    "interval",
+    "query",
+    "symbol",
+    "ticker",
+    "kind",
+    "limit",
+    "region",
+    "section",
+    "horizon_days",
+    "paths",
+    "min_mcap",
+    "min_market_cap",
+    "max_pe",
+    "threshold_pct",
+    "check_every_s",
+    "channel_id",
+    "auto_adjust",
+    "remove_all",
+    "max_rows",
+    "preset",
+    "theme",
+    "events",
+    "ui",
+    "compare",
+    "bench",
+    "base",
+    "mtf",
+    "lookup_kind",
+    "forecast_model",
+)
 FINANCE_ACTION_CHOICES = [
     app_commands.Choice(name=action, value=action) for action in FINANCE_ACTIONS
 ]
@@ -1713,8 +1747,7 @@ class Finance(commands.Cog):
         if self._monitor_task:
             self._monitor_task.cancel()
 
-    @app_commands.choices(action=FINANCE_ACTION_CHOICES)
-    @commands.hybrid_command(
+    @commands.command(
         name="finance",
         description="Stocks: quote/chart/news/watchlist/data (Yahoo Finance via yfinance).",
         help=(
@@ -1746,9 +1779,317 @@ class Finance(commands.Cog):
                 "including chart output. Use action:search if you only know the company name."),
         },
     )
-    async def finance(
+    async def finance(self, ctx: commands.Context, *, raw: str = "") -> None:
+        raw_args = (raw or "").strip()
+        symbol: str | None = None
+        action = "summary"
+        period = "1mo"
+        interval = "1d"
+        auto_adjust = True
+        limit = 5
+        channel_id: int | None = None
+        threshold_pct = 2.0
+        check_every_s = 300
+        section = "fast_info"
+        max_rows = 30
+        query: str | None = None
+        region = "JP"
+        remove_all = False
+        horizon_days = 20
+        paths = 2000
+        lookup_kind = "all"
+        screener_min_mcap: float | None = None
+        screener_max_pe: float | None = None
+        preset = "basic"
+        events = "auto"
+        ui = "auto"
+        bench: str | None = None
+        base = 100.0
+        mtf = "1d,1mo,6mo,1y"
+        theme = "light"
+        forecast_model = "gbm_analytic"
+
+        has_kv = bool(raw_args) and any(
+            f"{key}:" in raw_args or f"{key}=" in raw_args for key in FINANCE_KV_KEYS
+        )
+        def _as_int(val: object, default: int) -> int:
+            try:
+                return int(val)
+            except Exception:
+                return default
+
+        def _as_float(val: object) -> float | None:
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        def _as_bool(val: object) -> bool | None:
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                lowered = val.strip().lower()
+                if lowered in {"true", "1", "yes", "y", "on"}:
+                    return True
+                if lowered in {"false", "0", "no", "n", "off"}:
+                    return False
+            return None
+
+        if raw_args:
+            if has_kv:
+                kv, extras = _parse_kv_query(raw_args)
+                if extras:
+                    log.warning(
+                        "finance kv parse extras=%s raw_args=%s", extras, raw_args
+                    )
+                    await safe_reply(
+                        ctx,
+                        content=tag_error_text(
+                            "Unrecognized tokens in key/value input: "
+                            + " ".join(extras)
+                            + ". Use key:value pairs; wrap multi-word query values in quotes."
+                        ),
+                    )
+                    return
+                if "symbol" not in kv and "ticker" in kv:
+                    kv["symbol"] = kv.get("ticker")
+                symbol = str(kv.get("symbol") or "").strip() or None
+                action = str(kv.get("action") or "summary").strip().lower()
+                period = str(kv.get("period") or "1mo").strip()
+                interval = str(kv.get("interval") or "1d").strip()
+                query = str(kv.get("query") or "").strip() or None
+                region = str(kv.get("region") or "JP").strip()
+                lookup_kind = (
+                    str(kv.get("lookup_kind") or kv.get("kind") or "all")
+                    .strip()
+                    .lower()
+                )
+                section = str(kv.get("section") or "fast_info").strip()
+                preset = str(kv.get("preset") or "basic").strip().lower()
+                theme = str(kv.get("theme") or "light").strip().lower()
+                events = str(kv.get("events") or "auto").strip().lower()
+                ui = str(kv.get("ui") or "auto").strip().lower()
+                bench = str(kv.get("bench") or kv.get("compare") or "").strip() or None
+                mtf = str(kv.get("mtf") or "1d,1mo,6mo,1y").strip()
+                forecast_model = (
+                    str(kv.get("forecast_model") or "gbm_analytic").strip().lower()
+                )
+                limit = _as_int(kv.get("limit"), limit)
+                horizon_days = _as_int(kv.get("horizon_days"), horizon_days)
+                paths = _as_int(kv.get("paths"), paths)
+                max_rows = _as_int(kv.get("max_rows"), max_rows)
+                if kv.get("channel_id") is not None:
+                    try:
+                        channel_id = int(kv.get("channel_id"))
+                    except Exception:
+                        channel_id = None
+                threshold_pct_value = _as_float(kv.get("threshold_pct"))
+                if threshold_pct_value is not None:
+                    threshold_pct = threshold_pct_value
+                check_every_s = _as_int(kv.get("check_every_s"), check_every_s)
+                screener_min_mcap_raw = kv.get("min_market_cap", kv.get("min_mcap"))
+                screener_max_pe_raw = kv.get("max_pe")
+                screener_min_mcap_value = _as_float(screener_min_mcap_raw)
+                screener_max_pe_value = _as_float(screener_max_pe_raw)
+                if screener_min_mcap_value is not None:
+                    screener_min_mcap = screener_min_mcap_value
+                if screener_max_pe_value is not None:
+                    screener_max_pe = screener_max_pe_value
+                auto_adjust_value = _as_bool(kv.get("auto_adjust"))
+                if auto_adjust_value is not None:
+                    auto_adjust = auto_adjust_value
+                remove_all_value = _as_bool(kv.get("remove_all"))
+                if remove_all_value is not None:
+                    remove_all = remove_all_value
+                base_value = _as_float(kv.get("base"))
+                if base_value is not None:
+                    base = base_value
+                log.info(
+                    "finance parsed kv action=%s symbol=%s query=%s period=%s interval=%s region=%s kind=%s section=%s",
+                    action,
+                    symbol,
+                    query,
+                    period,
+                    interval,
+                    region,
+                    lookup_kind,
+                    section,
+                )
+            else:
+                try:
+                    tokens = shlex.split(raw_args)
+                except ValueError:
+                    await safe_reply(
+                        ctx,
+                        content=tag_error_text(
+                            "Failed to parse arguments. Check quotes in the input."
+                        ),
+                    )
+                    return
+                positional_fields: list[tuple[str, str]] = [
+                    ("symbol", "str"),
+                    ("action", "str"),
+                    ("period", "str"),
+                    ("interval", "str"),
+                    ("auto_adjust", "bool"),
+                    ("limit", "int"),
+                    ("channel_id", "int"),
+                    ("threshold_pct", "float"),
+                    ("check_every_s", "int"),
+                    ("section", "str"),
+                    ("max_rows", "int"),
+                    ("query", "str"),
+                    ("region", "str"),
+                    ("remove_all", "bool"),
+                    ("horizon_days", "int"),
+                    ("paths", "int"),
+                    ("lookup_kind", "str"),
+                    ("screener_min_mcap", "float"),
+                    ("screener_max_pe", "float"),
+                    ("preset", "str"),
+                    ("events", "str"),
+                    ("ui", "str"),
+                    ("bench", "str"),
+                    ("base", "float"),
+                    ("mtf", "str"),
+                ]
+                if len(tokens) > len(positional_fields):
+                    await safe_reply(
+                        ctx,
+                        content=tag_error_text(
+                            "Too many positional arguments. Use key:value pairs instead."
+                        ),
+                    )
+                    return
+                for token, (field, kind) in zip(tokens, positional_fields):
+                    if kind == "str":
+                        value: object = token
+                    elif kind == "int":
+                        try:
+                            value = int(token)
+                        except ValueError:
+                            await safe_reply(
+                                ctx,
+                                content=tag_error_text(
+                                    f"Invalid integer for {field}: {token}"
+                                ),
+                            )
+                            return
+                    elif kind == "float":
+                        try:
+                            value = float(token)
+                        except ValueError:
+                            await safe_reply(
+                                ctx,
+                                content=tag_error_text(
+                                    f"Invalid number for {field}: {token}"
+                                ),
+                            )
+                            return
+                    elif kind == "bool":
+                        parsed = _as_bool(token)
+                        if parsed is None:
+                            await safe_reply(
+                                ctx,
+                                content=tag_error_text(
+                                    f"Invalid boolean for {field}: {token}"
+                                ),
+                            )
+                            return
+                        value = parsed
+                    else:
+                        value = token
+                    if field == "symbol":
+                        symbol = str(value).strip() or None
+                    elif field == "action":
+                        action = str(value).strip()
+                    elif field == "period":
+                        period = str(value).strip()
+                    elif field == "interval":
+                        interval = str(value).strip()
+                    elif field == "auto_adjust":
+                        auto_adjust = bool(value)
+                    elif field == "limit":
+                        limit = int(value)
+                    elif field == "channel_id":
+                        channel_id = int(value)
+                    elif field == "threshold_pct":
+                        threshold_pct = float(value)
+                    elif field == "check_every_s":
+                        check_every_s = int(value)
+                    elif field == "section":
+                        section = str(value).strip()
+                    elif field == "max_rows":
+                        max_rows = int(value)
+                    elif field == "query":
+                        query = str(value).strip() or None
+                    elif field == "region":
+                        region = str(value).strip()
+                    elif field == "remove_all":
+                        remove_all = bool(value)
+                    elif field == "horizon_days":
+                        horizon_days = int(value)
+                    elif field == "paths":
+                        paths = int(value)
+                    elif field == "lookup_kind":
+                        lookup_kind = str(value).strip()
+                    elif field == "screener_min_mcap":
+                        screener_min_mcap = float(value)
+                    elif field == "screener_max_pe":
+                        screener_max_pe = float(value)
+                    elif field == "preset":
+                        preset = str(value).strip()
+                    elif field == "events":
+                        events = str(value).strip()
+                    elif field == "ui":
+                        ui = str(value).strip()
+                    elif field == "bench":
+                        bench = str(value).strip() or None
+                    elif field == "base":
+                        base = float(value)
+                    elif field == "mtf":
+                        mtf = str(value).strip()
+        await self._finance_impl(
+            ctx,
+            symbol=symbol,
+            action=action,
+            period=period,
+            interval=interval,
+            auto_adjust=auto_adjust,
+            limit=limit,
+            channel_id=channel_id,
+            threshold_pct=threshold_pct,
+            check_every_s=check_every_s,
+            section=section,
+            max_rows=max_rows,
+            query=query,
+            region=region,
+            remove_all=remove_all,
+            horizon_days=horizon_days,
+            paths=paths,
+            lookup_kind=lookup_kind,
+            screener_min_mcap=screener_min_mcap,
+            screener_max_pe=screener_max_pe,
+            preset=preset,
+            events=events,
+            ui=ui,
+            bench=bench,
+            base=base,
+            mtf=mtf,
+            theme=theme,
+            forecast_model=forecast_model,
+            raw_args=raw_args,
+            has_kv=has_kv,
+        )
+
+    @app_commands.command(
+        name="finance",
+        description="Stocks: quote/chart/news/watchlist/data (Yahoo Finance via yfinance).",
+    )
+    @app_commands.choices(action=FINANCE_ACTION_CHOICES)
+    async def finance_slash(
         self,
-        ctx: commands.Context,
+        interaction: discord.Interaction,
         symbol: str | None = None,
         action: str = "summary",
         period: str = "1mo",
@@ -1775,154 +2116,89 @@ class Finance(commands.Cog):
         base: float = 100.0,
         mtf: str = "1d,1mo,6mo,1y",
     ) -> None:
+        ctx_factory = getattr(commands.Context, "from_interaction", None)
+        if ctx_factory is None:
+            await interaction.response.send_message(
+                "This command isn't available right now. Please try again later.",
+                ephemeral=True,
+            )
+            return
+        ctx_candidate = ctx_factory(interaction)
+        ctx = await ctx_candidate if inspect.isawaitable(ctx_candidate) else ctx_candidate
+        await self._finance_impl(
+            ctx,
+            symbol=symbol,
+            action=action,
+            period=period,
+            interval=interval,
+            auto_adjust=auto_adjust,
+            limit=limit,
+            channel_id=channel_id,
+            threshold_pct=threshold_pct,
+            check_every_s=check_every_s,
+            section=section,
+            max_rows=max_rows,
+            query=query,
+            region=region,
+            remove_all=remove_all,
+            horizon_days=horizon_days,
+            paths=paths,
+            lookup_kind=lookup_kind,
+            screener_min_mcap=screener_min_mcap,
+            screener_max_pe=screener_max_pe,
+            preset=preset,
+            events=events,
+            ui=ui,
+            bench=bench,
+            base=base,
+            mtf=mtf,
+            theme="light",
+            forecast_model="gbm_analytic",
+            raw_args="",
+            has_kv=False,
+        )
+
+    async def _finance_impl(
+        self,
+        ctx: commands.Context,
+        *,
+        symbol: str | None = None,
+        action: str = "summary",
+        period: str = "1mo",
+        interval: str = "1d",
+        auto_adjust: bool = True,
+        limit: int = 5,
+        channel_id: int | None = None,
+        threshold_pct: float = 2.0,
+        check_every_s: int = 300,
+        section: str = "fast_info",
+        max_rows: int = 30,
+        query: str | None = None,
+        region: str = "JP",
+        remove_all: bool = False,
+        horizon_days: int = 20,
+        paths: int = 2000,
+        lookup_kind: str = "all",
+        screener_min_mcap: float | None = None,
+        screener_max_pe: float | None = None,
+        preset: str = "basic",
+        events: str = "auto",
+        ui: str = "auto",
+        bench: str | None = None,
+        base: float = 100.0,
+        mtf: str = "1d,1mo,6mo,1y",
+        theme: str = "light",
+        forecast_model: str = "gbm_analytic",
+        raw_args: str = "",
+        has_kv: bool = False,
+    ) -> None:
         is_prefix = isinstance(ctx, commands.Context) and ctx.interaction is None
-        raw_args = ""
-        if is_prefix and getattr(ctx, "message", None):
-            content = ctx.message.content or ""
-            prefix = ctx.prefix or ""
-            invoked = ctx.invoked_with or (ctx.command.name if ctx.command else "")
-            lead = f"{prefix}{invoked}".strip()
-            if lead and content.startswith(lead):
-                raw_args = content[len(lead) :].lstrip()
-            else:
-                parts = content.split(maxsplit=1)
-                if len(parts) > 1:
-                    raw_args = parts[1]
-        kv_keys = (
-            "action",
-            "period",
-            "interval",
-            "query",
-            "symbol",
-            "ticker",
-            "kind",
-            "limit",
-            "region",
-            "section",
-            "horizon_days",
-            "paths",
-            "min_mcap",
-            "max_pe",
-            "threshold_pct",
-            "check_every_s",
-            "channel_id",
-            "auto_adjust",
-            "remove_all",
-            "max_rows",
-            "preset",
-            "theme",
-            "events",
-            "ui",
-            "compare",
-            "bench",
-            "base",
-            "mtf",
-            "lookup_kind",
-            "forecast_model",
-        )
-        has_kv = bool(raw_args) and any(
-            f"{key}:" in raw_args or f"{key}=" in raw_args for key in kv_keys
-        )
-        theme = "light"
-        forecast_model = "gbm_analytic"
         log.info(
             "finance invocation type=%s raw_args=%s has_kv=%s",
             "prefix" if is_prefix else "slash",
             raw_args if is_prefix else "",
             has_kv if is_prefix else False,
         )
-
-        if is_prefix and has_kv:
-            kv, extras = _parse_kv_query(raw_args)
-            if extras:
-                log.warning(
-                    "finance kv parse extras=%s raw_args=%s", extras, raw_args
-                )
-                await safe_reply(
-                    ctx,
-                    content=tag_error_text(
-                        "Unrecognized tokens in key/value input: "
-                        + " ".join(extras)
-                        + ". Use key:value pairs; wrap multi-word query values in quotes."
-                    ),
-                )
-                return
-            if "symbol" not in kv and "ticker" in kv:
-                kv["symbol"] = kv.get("ticker")
-            symbol = str(kv.get("symbol") or "").strip() or None
-            action = str(kv.get("action") or "summary").strip().lower()
-            period = str(kv.get("period") or "1mo").strip()
-            interval = str(kv.get("interval") or "1d").strip()
-            query = str(kv.get("query") or "").strip() or None
-            region = str(kv.get("region") or "JP").strip()
-            lookup_kind = str(kv.get("lookup_kind") or kv.get("kind") or "all").strip().lower()
-            section = str(kv.get("section") or "fast_info").strip()
-            preset = str(kv.get("preset") or "basic").strip().lower()
-            theme = str(kv.get("theme") or "light").strip().lower()
-            events = str(kv.get("events") or "auto").strip().lower()
-            ui = str(kv.get("ui") or "auto").strip().lower()
-            bench = str(kv.get("bench") or kv.get("compare") or "").strip() or None
-            mtf = str(kv.get("mtf") or "1d,1mo,6mo,1y").strip()
-            forecast_model = str(kv.get("forecast_model") or "gbm_analytic").strip().lower()
-
-            def _as_int(val: object, default: int) -> int:
-                try:
-                    return int(val)
-                except Exception:
-                    return default
-
-            def _as_float(val: object) -> float | None:
-                try:
-                    return float(val)
-                except Exception:
-                    return None
-
-            def _as_bool(val: object, default: bool) -> bool:
-                if isinstance(val, bool):
-                    return val
-                if isinstance(val, str):
-                    lowered = val.strip().lower()
-                    if lowered in {"true", "1", "yes", "y"}:
-                        return True
-                    if lowered in {"false", "0", "no", "n"}:
-                        return False
-                return default
-
-            limit = _as_int(kv.get("limit"), limit)
-            horizon_days = _as_int(kv.get("horizon_days"), horizon_days)
-            paths = _as_int(kv.get("paths"), paths)
-            max_rows = _as_int(kv.get("max_rows"), max_rows)
-            if kv.get("channel_id") is not None:
-                try:
-                    channel_id = int(kv.get("channel_id"))
-                except Exception:
-                    channel_id = None
-            threshold_pct_value = _as_float(kv.get("threshold_pct"))
-            if threshold_pct_value is not None:
-                threshold_pct = threshold_pct_value
-            check_every_s = _as_int(kv.get("check_every_s"), check_every_s)
-            screener_min_mcap_raw = kv.get("min_market_cap", kv.get("min_mcap"))
-            screener_max_pe_raw = kv.get("max_pe")
-            screener_min_mcap_value = _as_float(screener_min_mcap_raw)
-            screener_max_pe_value = _as_float(screener_max_pe_raw)
-            if screener_min_mcap_value is not None:
-                screener_min_mcap = screener_min_mcap_value
-            if screener_max_pe_value is not None:
-                screener_max_pe = screener_max_pe_value
-            auto_adjust = _as_bool(kv.get("auto_adjust"), auto_adjust)
-            remove_all = _as_bool(kv.get("remove_all"), remove_all)
-            base = _as_float(kv.get("base")) or base
-            log.info(
-                "finance parsed kv action=%s symbol=%s query=%s period=%s interval=%s region=%s kind=%s section=%s",
-                action,
-                symbol,
-                query,
-                period,
-                interval,
-                region,
-                lookup_kind,
-                section,
-            )
         region = (region or "JP").strip().upper()
         action = action.strip().lower() or "summary"
         preset = (preset or "basic").strip().lower()

@@ -864,8 +864,8 @@ class BrowserAgent:
             "[role=option], [role=searchbox], [role=slider], [role=spinbutton], [role=switch]"
         )
         entries: list[RefEntry] = []
-        ref_index = 1
-        max_scan = max_items + 40
+        handle_by_entry: dict[int, Any] = {}
+        max_scan = max(max_items * 6, max_items + 120)
         viewport = page.viewport_size or {}
         viewport_w = viewport.get("width")
         viewport_h = viewport.get("height")
@@ -908,32 +908,27 @@ class BrowserAgent:
                     input_type = None
                 role = self._infer_role(role_attr, tag_name, input_type)
                 name = await self._infer_accessible_name(handle, tag_name)
-                selector_path = None
-                with contextlib.suppress(Exception):
-                    selector_path = await handle.evaluate(CSS_PATH_SCRIPT)
-                ref = f"{ref_prefix}{ref_index}"
-                ref_index += 1
                 mode: RefMode = "css"
                 if role and name:
                     mode = "role"
-                entries.append(
-                    RefEntry(
-                        ref=ref,
-                        role=role,
-                        name=name,
-                        nth=None,
-                        mode=mode,
-                        selector=selector_path,
-                        bbox={
-                            "x": float(box.get("x", 0)),
-                            "y": float(box.get("y", 0)),
-                            "width": float(box.get("width", 0)),
-                            "height": float(box.get("height", 0)),
-                        },
-                        frame_name=frame.name or None,
-                        frame_url=frame.url or None,
-                    )
+                entry = RefEntry(
+                    ref="",
+                    role=role,
+                    name=name,
+                    nth=None,
+                    mode=mode,
+                    selector=None,
+                    bbox={
+                        "x": float(box.get("x", 0)),
+                        "y": float(box.get("y", 0)),
+                        "width": float(box.get("width", 0)),
+                        "height": float(box.get("height", 0)),
+                    },
+                    frame_name=frame.name or None,
+                    frame_url=frame.url or None,
                 )
+                entries.append(entry)
+                handle_by_entry[id(entry)] = handle
             if len(entries) >= max_scan:
                 break
         viewport_area = None
@@ -964,15 +959,23 @@ class BrowserAgent:
             filtered.append(entry)
 
         base = filtered if len(filtered) >= max(5, max_items // 2) else entries
-        base.sort(
-            key=lambda entry: (
+        def sort_key(entry: RefEntry) -> tuple[float, ...]:
+            rounded = self._round_bbox(entry.bbox)
+            if rounded:
+                y_key = rounded[1]
+                x_key = rounded[0]
+            else:
+                y_key = float((entry.bbox or {}).get("y", 0.0))
+                x_key = float((entry.bbox or {}).get("x", 0.0))
+            return (
                 0 if (entry.name and str(entry.name).strip()) else 1,
                 role_priority(entry.role),
-                (entry.bbox or {}).get("y", 0.0),
-                (entry.bbox or {}).get("x", 0.0),
+                y_key,
+                x_key,
                 area(entry),
             )
-        )
+
+        base.sort(key=sort_key)
         def iou(bbox_a: dict[str, float], bbox_b: dict[str, float]) -> float:
             ax1 = float(bbox_a.get("x", 0))
             ay1 = float(bbox_a.get("y", 0))
@@ -1008,6 +1011,13 @@ class BrowserAgent:
             ):
                 continue
             selected.append(entry)
+        for index, entry in enumerate(selected, start=1):
+            entry.ref = f"{ref_prefix}{index}"
+            if entry.selector is None:
+                handle = handle_by_entry.get(id(entry))
+                if handle is not None:
+                    with contextlib.suppress(Exception):
+                        entry.selector = await handle.evaluate(CSS_PATH_SCRIPT)
         return selected
 
     @staticmethod
