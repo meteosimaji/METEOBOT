@@ -2068,6 +2068,7 @@ class _AskStatusUI:
         self._summ_id = "__summarizing__"
         self._thinking_text = ""
         self._thinking_source = "output"
+        self._max_thinking_chars = 2000
 
     async def _send(self, **kwargs: Any):
         try:
@@ -2119,8 +2120,7 @@ class _AskStatusUI:
         if not detail:
             return base
         detail = re.sub(r"\s+", " ", detail)
-        if len(detail) > 180:
-            detail = detail[:179] + "…"
+        detail = _truncate_discord(detail, limit=self._max_thinking_chars)
         return f"{base}: {detail}"
 
     def _append_item(
@@ -2328,7 +2328,10 @@ class _AskStatusUI:
                         if self._thinking_source != "reasoning":
                             self._thinking_text = ""
                         self._thinking_source = "reasoning"
-                        self._thinking_text = f"{self._thinking_text}{delta}"[-1200:]
+                        combined = f"{self._thinking_text}{delta}"
+                        self._thinking_text = _truncate_discord(
+                            combined, limit=self._max_thinking_chars
+                        )
                         if self._thinking_id in self._by_id:
                             self._set_state(self._thinking_id, "loading", self._thinking_label(turn))
                             self._dirty = True
@@ -2343,7 +2346,10 @@ class _AskStatusUI:
                 delta = evt.get("delta")
                 if isinstance(delta, str) and delta:
                     async with self._lock:
-                        self._thinking_text = f"refusal: {delta}"[-400:]
+                        refusal = f"refusal: {delta}"
+                        self._thinking_text = _truncate_discord(
+                            refusal, limit=self._max_thinking_chars
+                        )
                         if self._thinking_id in self._by_id:
                             self._set_state(self._thinking_id, "loading", self._thinking_label(evt.get("turn")))
                             self._dirty = True
