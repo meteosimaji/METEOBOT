@@ -78,6 +78,7 @@ MAX_REF_ENTRIES = 200
 MIN_BBOX_ENTRIES = 5
 MAX_SELECTOR_CHARS = 200
 REF_FALLBACK_MAX_ITEMS = int(os.getenv("ASK_BROWSER_REF_FALLBACK_MAX_ITEMS", "30"))
+REF_PRIMARY_MAX_ITEMS = int(os.getenv("ASK_BROWSER_REF_PRIMARY_MAX_ITEMS", "60"))
 
 
 def _env_timeout_seconds(name: str, default: float, *, min_value: float = 0.0, max_value: float = 30.0) -> float:
@@ -804,7 +805,7 @@ class BrowserAgent:
             fallback_entries = await self._refs_from_clickable_targets(
                 page,
                 ref_prefix="c",
-                max_items=MAX_REF_ENTRIES,
+                max_items=min(MAX_REF_ENTRIES, max(1, REF_PRIMARY_MAX_ITEMS)),
             )
             entries = self._merge_ref_entries(entries, fallback_entries)
         return self._apply_nth_to_duplicates(entries[:MAX_REF_ENTRIES])
@@ -866,7 +867,7 @@ class BrowserAgent:
         )
         entries: list[RefEntry] = []
         ref_index = 1
-        max_scan = max_items * 2
+        max_scan = max_items + 40
         viewport = page.viewport_size or {}
         viewport_w = viewport.get("width")
         viewport_h = viewport.get("height")

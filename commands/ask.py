@@ -5055,13 +5055,18 @@ class Ask(commands.Cog):
             y2 = y + height
             draw.rectangle((x, y, x2, y2), outline=(255, 0, 0), width=2)
             label = str(target.get("ref", "?"))
-            text_w, text_h = draw.textsize(label, font=font)
+            text_bbox = draw.textbbox((0, 0), label, font=font)
+            text_w = text_bbox[2] - text_bbox[0]
+            text_h = text_bbox[3] - text_bbox[1]
             pad = 2
+            label_top = max(0, y - text_h - pad * 2)
             draw.rectangle(
-                (x, max(0, y - text_h - pad * 2), x + text_w + pad * 2, y),
+                (x, label_top, x + text_w + pad * 2, y),
                 fill=(255, 0, 0),
             )
-            draw.text((x + pad, max(0, y - text_h - pad)), label, fill=(255, 255, 255), font=font)
+            text_x = x + pad - text_bbox[0]
+            text_y = label_top + pad - text_bbox[1]
+            draw.text((text_x, text_y), label, fill=(255, 255, 255), font=font)
         buffer = BytesIO()
         image.save(buffer, format="PNG")
         return buffer.getvalue()
