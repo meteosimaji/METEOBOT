@@ -94,7 +94,7 @@ def _env_timeout_seconds(name: str, default: float, *, min_value: float = 0.0, m
 
 OBSERVE_READ_TIMEOUT_S = _env_timeout_seconds("ASK_BROWSER_OBSERVE_READ_TIMEOUT_S", 2.5)
 POST_ACTION_LOAD_TIMEOUT_S = _env_timeout_seconds("ASK_BROWSER_POST_ACTION_LOAD_TIMEOUT_S", 1.0)
-REF_PRIMARY_READ_TIMEOUT_S = _env_timeout_seconds("ASK_BROWSER_REF_PRIMARY_TIMEOUT_S", 3.0)
+REF_PRIMARY_READ_TIMEOUT_S = _env_timeout_seconds("ASK_BROWSER_REF_PRIMARY_TIMEOUT_S", 6.0)
 REF_FALLBACK_READ_TIMEOUT_S = _env_timeout_seconds("ASK_BROWSER_REF_FALLBACK_TIMEOUT_S", 4.5)
 
 CSS_PATH_SCRIPT = """
@@ -834,8 +834,6 @@ class BrowserAgent:
                 handle = None
             if handle is not None:
                 with contextlib.suppress(Exception):
-                    selector = await handle.evaluate(CSS_PATH_SCRIPT)
-                with contextlib.suppress(Exception):
                     bbox = await handle.bounding_box()
             entries.append(
                 RefEntry(
@@ -938,13 +936,79 @@ class BrowserAgent:
                 )
             if len(entries) >= max_scan:
                 break
-        entries.sort(
+        viewport_area = None
+        if viewport_w and viewport_h:
+            viewport_area = float(viewport_w) * float(viewport_h)
+
+        def area(entry: RefEntry) -> float:
+            bbox = entry.bbox or {}
+            return float(bbox.get("width", 0)) * float(bbox.get("height", 0))
+
+        def role_priority(role: str | None) -> int:
+            if role in {"button", "link", "tab", "menuitem", "searchbox", "combobox"}:
+                return 0
+            if role in {"checkbox", "radio", "option"}:
+                return 1
+            return 2
+
+        filtered: list[RefEntry] = []
+        for entry in entries:
+            bbox = entry.bbox or {}
+            width = float(bbox.get("width", 0))
+            height = float(bbox.get("height", 0))
+            bbox_area = width * height
+            if width < 10 or height < 10:
+                continue
+            if viewport_area is not None and bbox_area > viewport_area * 0.35:
+                continue
+            filtered.append(entry)
+
+        base = filtered if len(filtered) >= max(5, max_items // 2) else entries
+        base.sort(
             key=lambda entry: (
-                (entry.bbox or {}).get("width", 0) * (entry.bbox or {}).get("height", 0)
-            ),
-            reverse=True,
+                0 if (entry.name and str(entry.name).strip()) else 1,
+                role_priority(entry.role),
+                (entry.bbox or {}).get("y", 0.0),
+                (entry.bbox or {}).get("x", 0.0),
+                area(entry),
+            )
         )
-        return entries[:max_items]
+        def iou(bbox_a: dict[str, float], bbox_b: dict[str, float]) -> float:
+            ax1 = float(bbox_a.get("x", 0))
+            ay1 = float(bbox_a.get("y", 0))
+            ax2 = ax1 + float(bbox_a.get("width", 0))
+            ay2 = ay1 + float(bbox_a.get("height", 0))
+            bx1 = float(bbox_b.get("x", 0))
+            by1 = float(bbox_b.get("y", 0))
+            bx2 = bx1 + float(bbox_b.get("width", 0))
+            by2 = by1 + float(bbox_b.get("height", 0))
+            ix1 = max(ax1, bx1)
+            iy1 = max(ay1, by1)
+            ix2 = min(ax2, bx2)
+            iy2 = min(ay2, by2)
+            iw = max(0.0, ix2 - ix1)
+            ih = max(0.0, iy2 - iy1)
+            inter = iw * ih
+            if inter <= 0:
+                return 0.0
+            a_area = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+            b_area = max(1.0, (bx2 - bx1) * (by2 - by1))
+            return inter / (a_area + b_area - inter)
+
+        selected: list[RefEntry] = []
+        for entry in base:
+            if len(selected) >= max_items:
+                break
+            if not entry.bbox:
+                continue
+            if any(
+                iou(entry.bbox, chosen.bbox) > 0.65
+                for chosen in selected
+                if chosen.bbox
+            ):
+                continue
+            selected.append(entry)
+        return selected
 
     @staticmethod
     def _merge_ref_entries(

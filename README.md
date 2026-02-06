@@ -35,7 +35,7 @@
    - `ASK_BROWSER_CDP_ALLOW_REMOTE` — allow non-localhost CDP endpoints only when set (`true`/`false`, defaults to `false`); remote CDP URLs require `wss://` or `https://`.
    - `ASK_BROWSER_OBSERVE_READ_TIMEOUT_S` — timeout for observation reads like title/ARIA/accessibility snapshots (defaults to `2.5`; set `0` to disable timeout).
    - `ASK_BROWSER_POST_ACTION_LOAD_TIMEOUT_S` — short post-action DOM-content wait for navigation-prone actions (defaults to `1.0`).
-   - `ASK_BROWSER_REF_PRIMARY_TIMEOUT_S` — timeout for primary ref extraction (ARIA + merge path) before fallback (defaults to `3.0`; set `0` to disable timeout).
+   - `ASK_BROWSER_REF_PRIMARY_TIMEOUT_S` — timeout for primary ref extraction (ARIA + merge path) before fallback (defaults to `6.0`; set `0` to disable timeout).
    - `ASK_BROWSER_REF_FALLBACK_TIMEOUT_S` — timeout for clickable-target fallback ref extraction (defaults to `4.5`; set `0` to disable timeout).
    - CDP headers are loaded at process start; restart the bot after changing `ASK_BROWSER_CDP_HEADERS_JSON`.
    - Operator instance IDs persist in `data/operator_instance_id.txt` unless overridden by `ASK_OPERATOR_INSTANCE_ID`. Set a fixed ID for restart-safe links.
