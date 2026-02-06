@@ -47,8 +47,27 @@ INTERACTIVE_ROLES: set[str] = {
     "textbox",
 }
 
+CONTEXT_ROLES: set[str] = {
+    "article",
+    "cell",
+    "columnheader",
+    "group",
+    "heading",
+    "list",
+    "listitem",
+    "region",
+    "row",
+    "rowheader",
+    "section",
+}
+
 ARIA_REF_LINE_RE = re.compile(
     r'^\s*-\s*(?P<role>[\w-]+)(?:\s+"(?P<name>[^"]*)")?.*?\[ref=(?P<ref>e\d+)\]',
+    re.IGNORECASE,
+)
+
+ARIA_TREE_LINE_RE = re.compile(
+    r'^(?P<indent>\s*)-\s*(?P<role>[\w-]+)(?:\s+"(?P<name>[^"]*)")?(?:.*?\[ref=(?P<ref>e\d+)\])?',
     re.IGNORECASE,
 )
 
@@ -258,6 +277,8 @@ class BrowserAgent:
         mode: BrowserMode = "launch",
         headless: bool = True,
         cdp_url: str | None = None,
+        cdp_headers: dict[str, str] | None = None,
+        cdp_timeout_ms: int | None = None,
         viewport: dict[str, int] | None = None,
         user_agent: str | None = None,
         user_data_dir: str | None = None,
@@ -272,6 +293,8 @@ class BrowserAgent:
                 mode=mode,
                 headless=headless,
                 cdp_url=cdp_url,
+                cdp_headers=cdp_headers,
+                cdp_timeout_ms=cdp_timeout_ms,
                 viewport=viewport,
                 user_agent=user_agent,
                 user_data_dir=user_data_dir,
@@ -286,6 +309,8 @@ class BrowserAgent:
         mode: BrowserMode,
         headless: bool,
         cdp_url: str | None,
+        cdp_headers: dict[str, str] | None,
+        cdp_timeout_ms: int | None,
         viewport: dict[str, int] | None,
         user_agent: str | None,
         user_data_dir: str | None,
@@ -315,7 +340,11 @@ class BrowserAgent:
         else:
             if not cdp_url:
                 raise ValueError("cdp_url is required for mode='cdp'.")
-            self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
+            self._browser = await self._playwright.chromium.connect_over_cdp(
+                cdp_url,
+                headers=cdp_headers,
+                timeout=cdp_timeout_ms,
+            )
             if self._browser.contexts:
                 self._context = self._browser.contexts[0]
                 self._owns_context = False
@@ -495,7 +524,10 @@ class BrowserAgent:
             nav_race = nav_race or ref_nav_race
             self._refs_by_tab[tab_id] = {entry.ref: entry for entry in entries}
             self._ref_generation_by_tab[tab_id] = ref_generation
-            ref_snapshot = self._format_ref_snapshot(entries)
+            if aria_ref_snapshot:
+                ref_snapshot = self._format_ref_snapshot_tree(aria_ref_snapshot, entries)
+            else:
+                ref_snapshot = self._format_ref_snapshot(entries)
             refs = [entry.to_dict() for entry in entries]
 
         ok = not any([title_error, aria_error])
@@ -827,9 +859,83 @@ class BrowserAgent:
         for entry in entries:
             role = entry.role or "element"
             name = f' "{entry.name}"' if entry.name else ""
-            nth = f" (nth={entry.nth})" if entry.nth is not None else ""
+            nth = f" (nth={entry.nth + 1})" if entry.nth is not None else ""
             lines.append(f"- {role}{name} [ref={entry.ref}]{nth}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_ref_snapshot_tree(aria_ref_snapshot: str, entries: list[RefEntry]) -> str:
+        entries_by_ref = {entry.ref: entry for entry in entries}
+        parsed_nodes = BrowserAgent._parse_aria_tree_nodes(aria_ref_snapshot)
+        if not parsed_nodes:
+            return BrowserAgent._format_ref_snapshot(entries)
+
+        keep_indices: set[int] = set()
+        for idx, node in enumerate(parsed_nodes):
+            node_ref = node.get("ref")
+            if isinstance(node_ref, str) and node_ref in entries_by_ref:
+                walk = idx
+                while walk >= 0 and walk not in keep_indices:
+                    keep_indices.add(walk)
+                    parent_idx = parsed_nodes[walk]["parent"]
+                    walk = int(parent_idx) if isinstance(parent_idx, int) else -1
+
+        for idx, node in enumerate(parsed_nodes):
+            if idx in keep_indices:
+                continue
+            role = str(node.get("role") or "").lower()
+            if role not in CONTEXT_ROLES:
+                continue
+            parent_idx = node.get("parent")
+            if isinstance(parent_idx, int) and parent_idx in keep_indices:
+                keep_indices.add(idx)
+
+        if not keep_indices:
+            return BrowserAgent._format_ref_snapshot(entries)
+
+        lines: list[str] = []
+        for idx, node in enumerate(parsed_nodes):
+            if idx not in keep_indices:
+                continue
+            role = str(node.get("role") or "element")
+            node_name = node.get("name")
+            name = f' "{node_name}"' if node_name else ""
+            depth = int(node.get("depth") or 0)
+            indent = "  " * depth
+            node_ref = node.get("ref")
+            ref_suffix = ""
+            if isinstance(node_ref, str):
+                entry = entries_by_ref.get(node_ref)
+                if entry is not None:
+                    nth = f" (nth={entry.nth + 1})" if entry.nth is not None else ""
+                    ref_suffix = f" [ref={node_ref}]{nth}"
+            lines.append(f"{indent}- {role}{name}{ref_suffix}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_aria_tree_nodes(aria_ref_snapshot: str) -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = []
+        stack: list[tuple[int, int]] = []
+        for line in aria_ref_snapshot.splitlines():
+            match = ARIA_TREE_LINE_RE.search(line)
+            if not match:
+                continue
+            indent_text = (match.group("indent") or "").replace("\t", "    ")
+            indent_len = len(indent_text)
+            while stack and stack[-1][0] >= indent_len:
+                stack.pop()
+            depth = len(stack)
+            parent_idx = stack[-1][1] if stack else None
+            node = {
+                "depth": depth,
+                "parent": parent_idx,
+                "role": (match.group("role") or "").lower() or None,
+                "name": match.group("name") or None,
+                "ref": match.group("ref") or None,
+            }
+            nodes.append(node)
+            stack.append((indent_len, len(nodes) - 1))
+        return nodes
 
     def _get_ref_entry(self, tab_id: str | None, ref: str) -> RefEntry | None:
         if not tab_id:

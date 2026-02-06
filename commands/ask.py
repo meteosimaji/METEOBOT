@@ -238,6 +238,12 @@ ASK_OPERATOR_HEADLESS = (
 ASK_OPERATOR_START_COOLDOWN_S = float(
     os.getenv("ASK_OPERATOR_START_COOLDOWN_S", "20")
 )
+ASK_BROWSER_CDP_CONNECT_TIMEOUT_S = float(
+    os.getenv("ASK_BROWSER_CDP_CONNECT_TIMEOUT_S", "8")
+)
+ASK_BROWSER_CDP_ALLOW_REMOTE = (
+    (os.getenv("ASK_BROWSER_CDP_ALLOW_REMOTE") or "").strip().lower() in {"1", "true", "yes"}
+)
 ASK_OPERATOR_AUTOSTART_XVFB = (
     (os.getenv("ASK_OPERATOR_AUTOSTART_XVFB", "true") or "").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -307,6 +313,8 @@ class _DownloadToken:
 class OperatorScreenshotCache:
     image_bytes: bytes
     captured_at: float
+    width_px: int | None = None
+    height_px: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1535,6 +1543,62 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
+def _parse_cdp_headers_env() -> dict[str, str]:
+    raw = (os.getenv("ASK_BROWSER_CDP_HEADERS_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        log.warning("ASK_BROWSER_CDP_HEADERS_JSON is invalid JSON; ignoring.")
+        return {}
+    if not isinstance(parsed, dict):
+        log.warning("ASK_BROWSER_CDP_HEADERS_JSON must be an object; ignoring.")
+        return {}
+    headers: dict[str, str] = {}
+    for key, value in parsed.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        header = key.strip()
+        if not header:
+            continue
+        headers[header] = value
+    return headers
+
+
+def _classify_cdp_connect_error(exc: Exception) -> str:
+    if isinstance(exc, asyncio.TimeoutError):
+        return "cdp_connect_timeout"
+    message = str(exc).lower()
+    if any(token in message for token in ("unauthorized", "forbidden", "401", "403")):
+        return "cdp_auth_failed"
+    if any(token in message for token in ("name or service not known", "enotfound", "dns")):
+        return "cdp_dns_failed"
+    if any(token in message for token in ("connection refused", "econnrefused")):
+        return "cdp_connection_refused"
+    if "handshake" in message:
+        return "cdp_handshake_failed"
+    return "cdp_connect_failed"
+
+
+def _is_remote_cdp_url_allowed(cdp_url: str | None) -> bool:
+    if not cdp_url:
+        return True
+    try:
+        parsed = urlparse(cdp_url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "").lower()
+    if not host:
+        return False
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    if ASK_BROWSER_CDP_ALLOW_REMOTE is not True:
+        return False
+    return scheme in {"wss", "https"}
+
+
 MAX_TOOL_TURNS = _env_int("ASK_MAX_TOOL_TURNS", 50, minimum=1)
 TOOL_WARNING_TURN = min(MAX_TOOL_TURNS, _env_int("ASK_TOOL_WARNING_TURN", 40, minimum=1))
 ASK_CONTAINER_FILE_LINK_TTL_S = _env_int("ASK_CONTAINER_FILE_LINK_TTL_S", 30 * 60, minimum=60)
@@ -2560,6 +2624,7 @@ class Ask(commands.Cog):
             (os.getenv("ASK_OPERATOR_ALLOW_SHARED_TOKENS") or "").strip().lower()
             in {"1", "true", "yes"}
         )
+        self._cdp_headers = _parse_cdp_headers_env()
         operator_secret = (
             os.getenv("ASK_OPERATOR_TOKEN_SECRET")
             or os.getenv("DISCORD_BOT_TOKEN")
@@ -3358,6 +3423,8 @@ class Ask(commands.Cog):
         warning: str | None = None
         mode: Literal["launch", "cdp"] = "cdp" if prefer_cdp else "launch"
         cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
+        cdp_headers = self._cdp_headers if cdp_url else None
+        cdp_timeout_ms = int(max(1.0, ASK_BROWSER_CDP_CONNECT_TIMEOUT_S) * 1000)
         headless = self._operator_headless_preference(state_key=state_key)
         if mode == "cdp" and not cdp_url:
             log.warning(
@@ -3366,6 +3433,11 @@ class Ask(commands.Cog):
             mode = "launch"
             self._browser_prefer_cdp_by_channel.pop(state_key, None)
             warning = "cdp_fallback_missing_url"
+        if mode == "cdp" and not _is_remote_cdp_url_allowed(cdp_url):
+            log.warning("CDP URL rejected by policy; falling back to launch.")
+            mode = "launch"
+            self._browser_prefer_cdp_by_channel.pop(state_key, None)
+            warning = "cdp_fallback_remote_not_allowed"
         user_data_dir = None
         last_failure = self._operator_last_start_failure.get(state_key)
         if last_failure is not None:
@@ -3392,29 +3464,37 @@ class Ask(commands.Cog):
                     return None, xvfb_error
         if mode == "cdp":
             try:
-                await agent.start(
-                    mode=mode,
-                    headless=headless,
-                    cdp_url=cdp_url,
-                    user_data_dir=user_data_dir,
+                await asyncio.wait_for(
+                    agent.start(
+                        mode=mode,
+                        headless=headless,
+                        cdp_url=cdp_url,
+                        cdp_headers=cdp_headers,
+                        cdp_timeout_ms=cdp_timeout_ms,
+                        user_data_dir=user_data_dir,
+                    ),
+                    timeout=max(1.0, ASK_BROWSER_CDP_CONNECT_TIMEOUT_S),
                 )
                 self._operator_record_headless_running(state_key, headless)
             except Exception as exc:
+                category = _classify_cdp_connect_error(exc)
                 log.warning(
                     "Failed to connect via CDP (%s); falling back to launch.",
-                    type(exc).__name__,
+                    category,
                 )
                 mode = "launch"
                 self._browser_prefer_cdp_by_channel.pop(state_key, None)
                 user_data_dir = str(self._browser_profile_dir(state_key))
                 cdp_url = None
-                warning = "cdp_fallback_connect_failed"
+                warning = category
         if mode == "launch":
             try:
                 await agent.start(
                     mode=mode,
                     headless=headless,
                     cdp_url=cdp_url,
+                    cdp_headers=None,
+                    cdp_timeout_ms=None,
                     user_data_dir=user_data_dir,
                 )
                 self._operator_record_headless_running(state_key, headless)
@@ -3457,7 +3537,33 @@ class Ask(commands.Cog):
 
     async def _operator_observation(self, agent: BrowserAgent) -> dict[str, Any]:
         observation = await agent.observe()
-        return {"url": observation.url, "title": observation.title}
+        viewport = agent.page.viewport_size or {}
+        viewport_width = int(viewport.get("width") or 0)
+        viewport_height = int(viewport.get("height") or 0)
+        shot_size = {"width": 0, "height": 0}
+        with contextlib.suppress(Exception):
+            shot_size = await agent.page.evaluate(
+                """
+                () => ({
+                  width: Math.max(0, window.innerWidth || 0),
+                  height: Math.max(0, window.innerHeight || 0),
+                })
+                """
+            )
+        return {
+            "url": observation.url,
+            "title": observation.title,
+            "ref_generation": observation.ref_generation,
+            "refs": observation.refs,
+            "viewport_css": {
+                "width": viewport_width,
+                "height": viewport_height,
+            },
+            "screenshot_px": {
+                "width": int(shot_size.get("width") or 0),
+                "height": int(shot_size.get("height") or 0),
+            },
+        }
 
     async def _operator_handle_index(self, request: web.Request) -> web.Response:
         token = request.match_info.get("token", "")
@@ -3497,11 +3603,23 @@ class Ask(commands.Cog):
                 return web.json_response({"ok": False, "error": "browser_not_started"}, status=409)
             observation = await self._operator_observation(agent)
             domain = self._operator_domain_from_url(observation.get("url"))
+            cached = self._operator_screenshot_cache.get(state_key)
+            if cached and cached.width_px and cached.height_px:
+                observation["screenshot_px"] = {
+                    "width": int(cached.width_px),
+                    "height": int(cached.height_px),
+                }
         warning = self._operator_start_warnings.get(state_key)
         running_headless = self._operator_headless_running.get(state_key)
         session_headless = self._operator_headless_by_state.get(state_key)
         domain_headless = self._operator_headless_by_domain.get(domain) if domain else None
         cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
+        cdp_connected = bool(
+            cdp_url
+            and bool(self._browser_prefer_cdp_by_channel.get(state_key))
+            and warning not in {"cdp_fallback_missing_url"}
+            and not (isinstance(warning, str) and warning.startswith("cdp_"))
+        )
         server_host = self._operator_base_host
         return web.json_response(
             {
@@ -3509,6 +3627,7 @@ class Ask(commands.Cog):
                 "observation": observation,
                 "warning": warning,
                 "cdp_url": cdp_url,
+                "cdp_connected": cdp_connected,
                 "server_host": server_host,
                 "headless": {
                     "running": running_headless,
@@ -3582,9 +3701,16 @@ class Ask(commands.Cog):
                     {"ok": False, "error": f"screenshot_failed: {type(exc).__name__}"},
                     status=500,
                 )
+            screenshot_width = 0
+            screenshot_height = 0
+            with contextlib.suppress(Exception):
+                with PILImage.open(BytesIO(image_bytes)) as image:
+                    screenshot_width, screenshot_height = image.size
             self._operator_screenshot_cache[state_key] = OperatorScreenshotCache(
                 image_bytes=image_bytes,
                 captured_at=time.monotonic(),
+                width_px=screenshot_width or None,
+                height_px=screenshot_height or None,
             )
             return web.Response(body=image_bytes, content_type="image/png")
         finally:
@@ -3615,7 +3741,12 @@ class Ask(commands.Cog):
         action_type = str(action.get("type") or "")
         allowed_actions = {
             "goto",
+            "click_ref",
             "click_xy",
+            "fill_ref",
+            "hover_ref",
+            "scroll_ref",
+            "scroll_into_view_ref",
             "scroll",
             "type",
             "press",
@@ -3631,6 +3762,27 @@ class Ask(commands.Cog):
             url = str(action.get("url") or "")
             if not url or not await self._is_safe_browser_url(url):
                 return web.json_response({"ok": False, "error": "unsafe_url"}, status=400)
+        if action_type in {
+            "click_ref",
+            "fill_ref",
+            "hover_ref",
+            "scroll_ref",
+            "scroll_into_view_ref",
+        }:
+            ref = str(action.get("ref") or "").strip()
+            if not ref:
+                return web.json_response({"ok": False, "error": "missing_ref"}, status=400)
+            ref_generation_raw = action.get("ref_generation")
+            if ref_generation_raw is None:
+                return web.json_response(
+                    {"ok": False, "error": "missing_ref_generation"}, status=400
+                )
+            try:
+                int(ref_generation_raw)
+            except (TypeError, ValueError):
+                return web.json_response(
+                    {"ok": False, "error": "invalid_ref_generation"}, status=400
+                )
         lock = self._get_browser_lock_for_state_key(state_key)
         async with lock:
             owner_id = self._browser_owner_by_channel.get(state_key)
@@ -4002,6 +4154,52 @@ class Ask(commands.Cog):
       let smoothFps = null;
       let headlessState = null;
       let desiredHeadless = null;
+      let currentObservation = null;
+
+      function normalizeNumber(value) {{
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      }}
+
+      function findRefAtPoint(x, y) {{
+        const refs = currentObservation?.refs;
+        const refGeneration = currentObservation?.ref_generation;
+        const viewportCss = currentObservation?.viewport_css || {{}};
+        const screenshotPx = currentObservation?.screenshot_px || {{}};
+        if (!Array.isArray(refs) || !Number.isInteger(refGeneration)) {{
+          return null;
+        }}
+        const viewportWidth = normalizeNumber(viewportCss.width) || normalizeNumber(screen.naturalWidth);
+        const viewportHeight = normalizeNumber(viewportCss.height) || normalizeNumber(screen.naturalHeight);
+        const screenshotWidth = normalizeNumber(screenshotPx.width) || normalizeNumber(screen.naturalWidth);
+        const screenshotHeight = normalizeNumber(screenshotPx.height) || normalizeNumber(screen.naturalHeight);
+        if (!viewportWidth || !viewportHeight || !screenshotWidth || !screenshotHeight) {{
+          return null;
+        }}
+        const toCssX = viewportWidth / screenshotWidth;
+        const toCssY = viewportHeight / screenshotHeight;
+        const cssX = x * toCssX;
+        const cssY = y * toCssY;
+        let best = null;
+        for (const entry of refs) {{
+          const ref = entry?.ref;
+          const bbox = entry?.bbox;
+          if (!ref || !bbox) continue;
+          const bx = normalizeNumber(bbox.x);
+          const by = normalizeNumber(bbox.y);
+          const bw = normalizeNumber(bbox.width);
+          const bh = normalizeNumber(bbox.height);
+          if (bx === null || by === null || bw === null || bh === null) continue;
+          if (bw <= 0 || bh <= 0) continue;
+          if (cssX < bx || cssY < by || cssX > bx + bw || cssY > by + bh) continue;
+          const area = bw * bh;
+          if (!best || area < best.area) {{
+            best = {{ ref, ref_generation: refGeneration, area }};
+          }}
+        }}
+        if (!best) return null;
+        return {{ ref: best.ref, ref_generation: best.ref_generation }};
+      }}
 
       const operatorBase = (() => {{
         const path = window.location.pathname;
@@ -4179,10 +4377,22 @@ class Ask(commands.Cog):
         try {{
           const data = await api("state");
           if (data.ok && data.observation) {{
+            currentObservation = data.observation;
             metaEl.textContent = `${{data.observation.title || "Untitled"}} — ${{data.observation.url || ""}}`;
             if (data.warning === "cdp_fallback_missing_url") {{
               showBanner("CDP URL is not set. Using a server-launched browser.");
-            }} else if (data.warning === "cdp_fallback_connect_failed") {{
+            }} else if (data.warning === "cdp_fallback_remote_not_allowed") {{
+              showBanner("CDP URL was blocked by policy. Using a server-launched browser.");
+            }} else if (
+              [
+                "cdp_connect_timeout",
+                "cdp_auth_failed",
+                "cdp_dns_failed",
+                "cdp_connection_refused",
+                "cdp_handshake_failed",
+                "cdp_connect_failed",
+              ].includes(data.warning)
+            ) {{
               showBanner("CDP connection failed. Using a server-launched browser.");
             }} else {{
               clearBanner();
@@ -4333,6 +4543,9 @@ class Ask(commands.Cog):
         statusEl.textContent = "Sending action...";
         try {{
           const data = await api("action", {{ action }});
+          if (data?.observation) {{
+            currentObservation = data.observation;
+          }}
           const errorDetail = data.error || data?.result?.error || data?.result?.reason;
           statusEl.textContent = data.ok ? "Action complete." : `Action failed: ${{errorDetail || "unknown"}}`;
           if (!data.ok) {{
@@ -4357,6 +4570,11 @@ class Ask(commands.Cog):
         const scaleY = screen.naturalHeight / rect.height;
         const x = (event.clientX - rect.left) * scaleX;
         const y = (event.clientY - rect.top) * scaleY;
+        const refTarget = findRefAtPoint(x, y);
+        if (refTarget) {{
+          sendAction({{ type: "click_ref", ref: refTarget.ref, ref_generation: refTarget.ref_generation }});
+          return;
+        }}
         sendAction({{ type: "click_xy", x, y }});
       }});
       let scrollDeltaX = 0;
@@ -7752,12 +7970,20 @@ class Ask(commands.Cog):
                 arg_cdp_url = str(args.get("cdp_url") or "").strip() or None
                 env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
                 cdp_url = env_cdp_url or arg_cdp_url
+                cdp_headers = self._cdp_headers if cdp_url else None
+                cdp_timeout_ms = int(max(1.0, ASK_BROWSER_CDP_CONNECT_TIMEOUT_S) * 1000)
                 action_type = _get_action_str(action, "type")
                 mode = str(args.get("mode") or "launch")
                 if mode == "launch" and cdp_url and self._prefers_cdp(ctx):
                     mode = "cdp"
                 if mode not in {"launch", "cdp"}:
                     return {"ok": False, "error": "bad_mode", "reason": "mode must be launch or cdp."}
+                if mode == "cdp" and not _is_remote_cdp_url_allowed(cdp_url):
+                    return {
+                        "ok": False,
+                        "error": "cdp_remote_not_allowed",
+                        "reason": "CDP URL is not allowed by policy. Use localhost or enable ASK_BROWSER_CDP_ALLOW_REMOTE with wss/https.",
+                    }
                 headless = bool(args.get("headless", True))
                 owner_id = self._get_browser_owner(ctx)
                 is_admin = self._is_admin(ctx)
@@ -7818,12 +8044,35 @@ class Ask(commands.Cog):
                             "error": "missing_cdp_url",
                             "reason": "cdp_url is required for mode='cdp'.",
                         }
-                    await agent.start(
-                        mode=mode,
-                        headless=headless,
-                        cdp_url=cdp_url,
-                        user_data_dir=user_data_dir,
-                    )
+                    if mode == "cdp":
+                        try:
+                            await asyncio.wait_for(
+                                agent.start(
+                                    mode=mode,
+                                    headless=headless,
+                                    cdp_url=cdp_url,
+                                    cdp_headers=cdp_headers,
+                                    cdp_timeout_ms=cdp_timeout_ms,
+                                    user_data_dir=user_data_dir,
+                                ),
+                                timeout=max(1.0, ASK_BROWSER_CDP_CONNECT_TIMEOUT_S),
+                            )
+                        except Exception as exc:
+                            category = _classify_cdp_connect_error(exc)
+                            return {
+                                "ok": False,
+                                "error": category,
+                                "reason": "CDP connection failed.",
+                            }
+                    else:
+                        await agent.start(
+                            mode=mode,
+                            headless=headless,
+                            cdp_url=cdp_url,
+                            cdp_headers=cdp_headers,
+                            cdp_timeout_ms=None,
+                            user_data_dir=user_data_dir,
+                        )
                 if action_type == "goto":
                     url = _get_action_str(action, "url")
                     if not await self._is_safe_browser_url(url):
