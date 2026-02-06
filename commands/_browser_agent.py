@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from collections import deque
 import asyncio
 import contextlib
+import importlib.metadata
 import logging
 import os
 import time
@@ -76,7 +77,23 @@ MAX_REF_ENTRIES = 200
 MIN_BBOX_ENTRIES = 5
 MAX_SELECTOR_CHARS = 200
 REF_FALLBACK_MAX_ITEMS = int(os.getenv("ASK_BROWSER_REF_FALLBACK_MAX_ITEMS", "30"))
-REF_FALLBACK_READ_TIMEOUT_S = float(os.getenv("ASK_BROWSER_REF_FALLBACK_TIMEOUT_S", "2.0"))
+
+
+def _env_timeout_seconds(name: str, default: float, *, min_value: float = 0.0, max_value: float = 30.0) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return default
+    return min(max(parsed, min_value), max_value)
+
+
+OBSERVE_READ_TIMEOUT_S = _env_timeout_seconds("ASK_BROWSER_OBSERVE_READ_TIMEOUT_S", 2.5)
+POST_ACTION_LOAD_TIMEOUT_S = _env_timeout_seconds("ASK_BROWSER_POST_ACTION_LOAD_TIMEOUT_S", 1.0)
+REF_PRIMARY_READ_TIMEOUT_S = _env_timeout_seconds("ASK_BROWSER_REF_PRIMARY_TIMEOUT_S", 3.0)
+REF_FALLBACK_READ_TIMEOUT_S = _env_timeout_seconds("ASK_BROWSER_REF_FALLBACK_TIMEOUT_S", 4.5)
 
 CSS_PATH_SCRIPT = """
 el => {
@@ -191,8 +208,8 @@ class BrowserAgent:
         "Target closed",
         "has been closed",
     )
-    _OBSERVE_READ_TIMEOUT_S = 1.0
-    _POST_ACTION_LOAD_TIMEOUT_S = 1.0
+    _OBSERVE_READ_TIMEOUT_S = OBSERVE_READ_TIMEOUT_S
+    _POST_ACTION_LOAD_TIMEOUT_S = POST_ACTION_LOAD_TIMEOUT_S
 
     def __init__(
         self,
@@ -219,6 +236,16 @@ class BrowserAgent:
         self._ref_generation_by_tab: dict[str, int] = {}
         self._aria_snapshot_ref_supported: bool | None = None
         self._last_good_observation_by_tab: dict[str, BrowserObservation] = {}
+
+    @staticmethod
+    def _detect_playwright_version() -> tuple[str, str]:
+        try:
+            return importlib.metadata.version("playwright"), "metadata"
+        except Exception:
+            version = getattr(playwright, "__version__", None)
+            if isinstance(version, str) and version.strip():
+                return version, "module_attribute"
+            return "unknown", "fallback"
 
     @property
     def page(self) -> Page:
@@ -323,7 +350,9 @@ class BrowserAgent:
         user_data_dir: str | None,
     ) -> None:
         self._playwright = await async_playwright().start()
-        log.info("Playwright version: %s", getattr(playwright, "__version__", "unknown"))
+        playwright_version, source = self._detect_playwright_version()
+        log.info("Playwright version: %s", playwright_version)
+        log.debug("Playwright version source: %s", source)
 
         if mode == "launch":
             if user_data_dir:
@@ -438,7 +467,24 @@ class BrowserAgent:
                 error=f"observe_failed: {type(exc).__name__}",
                 timestamp=time.time(),
             )
-        if observation.ok and observation.ref_error is None and tab_id:
+        last_good = self._last_good_observation_by_tab.get(tab_id) if tab_id else None
+        if (
+            tab_id
+            and last_good is not None
+            and not observation.refs
+            and (observation.ref_error is not None or observation.ref_degraded)
+            and last_good.refs
+        ):
+            observation = replace(
+                observation,
+                refs=last_good.refs,
+                ref_snapshot=last_good.ref_snapshot,
+                ref_generation=last_good.ref_generation,
+                ref_degraded=True,
+                last_good_used=True,
+                ref_error=observation.ref_error or "ref_entries_reused_last_good",
+            )
+        if observation.ok and observation.refs and tab_id:
             self._last_good_observation_by_tab[tab_id] = observation
         return observation
 
@@ -522,7 +568,7 @@ class BrowserAgent:
         ref_error_raw = None
         ref_degraded = False
         if tab_id:
-            ref_generation = self._ref_generation_by_tab.get(tab_id, 0) + 1
+            previous_generation = self._ref_generation_by_tab.get(tab_id, 0)
             entries, ref_error, ref_error_raw, ref_degraded, ref_retry_count, ref_nav_race = (
                 await self._build_ref_entries_with_fallback(
                     page,
@@ -531,13 +577,21 @@ class BrowserAgent:
             )
             retry_count += ref_retry_count
             nav_race = nav_race or ref_nav_race
-            self._refs_by_tab[tab_id] = {entry.ref: entry for entry in entries}
-            self._ref_generation_by_tab[tab_id] = ref_generation
-            if aria_ref_snapshot and any(entry.mode == "aria" for entry in entries):
-                ref_snapshot = self._format_ref_snapshot_tree(aria_ref_snapshot, entries)
+            if entries:
+                ref_generation = previous_generation + 1
+                self._refs_by_tab[tab_id] = {entry.ref: entry for entry in entries}
+                self._ref_generation_by_tab[tab_id] = ref_generation
+                if aria_ref_snapshot and any(entry.mode == "aria" for entry in entries):
+                    ref_snapshot = self._format_ref_snapshot_tree(aria_ref_snapshot, entries)
+                else:
+                    ref_snapshot = self._format_ref_snapshot(entries)
+                refs = [entry.to_dict() for entry in entries]
             else:
-                ref_snapshot = self._format_ref_snapshot(entries)
-            refs = [entry.to_dict() for entry in entries]
+                ref_generation = previous_generation
+                cached_entries = list(self._refs_by_tab.get(tab_id, {}).values())
+                if cached_entries:
+                    refs = [entry.to_dict() for entry in cached_entries]
+                    ref_snapshot = self._format_ref_snapshot(cached_entries)
 
         ok = not any([title_error, aria_error])
         error = "partial_observation" if not ok else None
@@ -575,6 +629,13 @@ class BrowserAgent:
         nav_race = False
         last_error: str | None = None
         read_timeout = self._OBSERVE_READ_TIMEOUT_S if timeout_s is None else timeout_s
+        if read_timeout <= 0:
+            try:
+                return await func(), retry_count, None, nav_race
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                log.debug("Observation %s failed: %s", label, last_error)
+                return default, retry_count, last_error, nav_race
         for attempt in range(max_retries + 1):
             try:
                 read_task = asyncio.create_task(func())
@@ -640,6 +701,7 @@ class BrowserAgent:
             "ref_entries",
             lambda: self._build_ref_entries(page, aria_ref_snapshot),
             default=[],
+            timeout_s=max(0.0, REF_PRIMARY_READ_TIMEOUT_S),
         )
         ref_degraded = False
         raw_ref_error = ref_error
@@ -654,7 +716,7 @@ class BrowserAgent:
                     max_items=max(1, REF_FALLBACK_MAX_ITEMS),
                 ),
                 default=[],
-                timeout_s=max(0.2, REF_FALLBACK_READ_TIMEOUT_S),
+                timeout_s=max(0.0, REF_FALLBACK_READ_TIMEOUT_S),
             )
             ref_retry_count += fb_retry_count
             ref_nav_race = ref_nav_race or fb_nav_race
