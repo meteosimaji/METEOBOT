@@ -4647,6 +4647,9 @@ class Ask(commands.Cog):
         const previous = tabSelect.value;
         try {{
           const data = await api("action", {{ action: {{ type: "list_tabs" }} }});
+          if (data?.ok && data?.observation) {{
+            currentObservation = data.observation;
+          }}
           const tabs = data?.result?.tabs || [];
           tabSelect.innerHTML = "";
           if (!tabs.length) {{
@@ -4732,7 +4735,7 @@ class Ask(commands.Cog):
         }}
       }}
 
-      async function sendAction(action, {{ refresh = true }} = {{}}) {{
+      async function sendAction(action, {{ refresh = true, retryOnMismatch = true }} = {{}}) {{
         statusEl.textContent = "Sending action...";
         try {{
           const data = await api("action", {{ action }});
@@ -4743,6 +4746,20 @@ class Ask(commands.Cog):
             }}
           }}
           const errorDetail = data.error || data?.result?.error || data?.result?.reason;
+          if (!data.ok && errorDetail === "ref_generation_mismatch" && retryOnMismatch) {{
+            const refActionTypes = ["click_ref", "fill_ref", "hover_ref", "scroll_ref", "scroll_into_view_ref"];
+            if (refActionTypes.includes(action?.type)) {{
+              await refreshState();
+              const latestGeneration = currentObservation?.ref_generation;
+              if (Number.isInteger(latestGeneration)) {{
+                await sendAction(
+                  {{ ...action, ref_generation: latestGeneration }},
+                  {{ refresh, retryOnMismatch: false }}
+                );
+                return;
+              }}
+            }}
+          }}
           statusEl.textContent = data.ok ? "Action complete." : `Action failed: ${{errorDetail || "unknown"}}`;
           if (!data.ok) {{
             showBanner(statusEl.textContent);
@@ -4760,6 +4777,10 @@ class Ask(commands.Cog):
       }}
 
       screen.addEventListener("click", (event) => {{
+        if (refreshInFlight) {{
+          statusEl.textContent = "Refreshing screenshot... try again in a moment.";
+          return;
+        }}
         if (!screen.naturalWidth) return;
         const rect = screen.getBoundingClientRect();
         const scaleX = screen.naturalWidth / rect.width;
