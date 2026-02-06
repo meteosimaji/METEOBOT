@@ -1,10 +1,12 @@
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any, cast
+from unittest import mock
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from commands._browser_agent import BrowserAgent, RefEntry
+from commands._browser_agent import BrowserAgent, BrowserObservation, RefEntry
 
 
 def _entry(ref: str, *, role: str, name: str, nth: int | None) -> RefEntry:
@@ -114,3 +116,85 @@ def test_build_ref_entries_with_fallback_uses_clickable_when_primary_times_out()
     assert ref_degraded is True
     assert retry_count == 0
     assert nav_race is False
+
+
+def test_build_ref_entries_with_fallback_passes_configured_timeouts() -> None:
+    agent = BrowserAgent()
+    recorded: dict[str, float | None] = {}
+
+    async def fake_safe_page_read(page, label, func, *, default, max_retries=2, timeout_s=None):
+        recorded[label] = timeout_s
+        if label == "ref_entries":
+            return [], 0, "TimeoutError:", False
+        if label == "ref_entries_fallback":
+            return [], 0, "TimeoutError:", False
+        return default, 0, None, False
+
+    agent._safe_page_read = fake_safe_page_read  # type: ignore[method-assign]
+
+    asyncio.run(agent._build_ref_entries_with_fallback(page=None, aria_ref_snapshot=None))  # type: ignore[arg-type]
+
+    assert recorded["ref_entries"] is not None
+    assert recorded["ref_entries_fallback"] is not None
+
+
+def test_observe_reuses_last_good_refs_when_current_ref_extraction_fails() -> None:
+    agent = BrowserAgent()
+
+    class _DummyPage:
+        def is_closed(self) -> bool:
+            return False
+
+    page = _DummyPage()
+    agent._page = page  # type: ignore[assignment]
+    agent._active_tab_id = "tab1"
+    agent._page_ids = {cast(Any, page): "tab1"}
+
+    last_good = BrowserObservation(
+        url="https://example.com",
+        title="Example",
+        aria="",
+        ref_generation=5,
+        ref_snapshot='- button "OK" [ref=e1]',
+        refs=[{"ref": "e1", "role": "button", "name": "OK", "bbox": {"x": 1, "y": 1, "width": 10, "height": 10}}],
+        ok=True,
+    )
+    agent._last_good_observation_by_tab["tab1"] = last_good
+
+    async def fake_observe_page(_page):
+        return BrowserObservation(
+            url="https://example.com",
+            title="Example",
+            aria="",
+            ref_generation=6,
+            ref_snapshot="",
+            refs=[],
+            ok=True,
+            title_error=None,
+            aria_error=None,
+            ref_error="ref_entries_timeout",
+            ref_error_raw="TimeoutError:",
+            ref_degraded=True,
+            nav_race=False,
+            last_good_used=False,
+            retry_count=0,
+            error=None,
+            timestamp=0.0,
+        )
+
+    agent._observe_page = fake_observe_page  # type: ignore[method-assign]
+
+    observation = asyncio.run(agent.observe())
+
+    assert observation.last_good_used is True
+    assert observation.ref_generation == 5
+    assert observation.refs == last_good.refs
+
+
+def test_detect_playwright_version_falls_back_to_unknown_when_missing() -> None:
+    with mock.patch("commands._browser_agent.importlib.metadata.version", side_effect=Exception("boom")):
+        with mock.patch("commands._browser_agent.playwright.__version__", "", create=True):
+            version, source = BrowserAgent._detect_playwright_version()
+
+    assert version == "unknown"
+    assert source == "fallback"

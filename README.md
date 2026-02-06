@@ -33,6 +33,10 @@
    - `ASK_BROWSER_CDP_AUTO_HOST` / `ASK_BROWSER_CDP_AUTO_PORT` — host/port used for auto local CDP launch (defaults `127.0.0.1:0`; port `0` picks a free ephemeral port per operator state).
    - `ASK_BROWSER_CDP_AUTO_LAUNCH_TIMEOUT_S` — grace interval for checking auto-launched browser startup (defaults to `6`).
    - `ASK_BROWSER_CDP_ALLOW_REMOTE` — allow non-localhost CDP endpoints only when set (`true`/`false`, defaults to `false`); remote CDP URLs require `wss://` or `https://`.
+   - `ASK_BROWSER_OBSERVE_READ_TIMEOUT_S` — timeout for observation reads like title/ARIA/accessibility snapshots (defaults to `2.5`; set `0` to disable timeout).
+   - `ASK_BROWSER_POST_ACTION_LOAD_TIMEOUT_S` — short post-action DOM-content wait for navigation-prone actions (defaults to `1.0`).
+   - `ASK_BROWSER_REF_PRIMARY_TIMEOUT_S` — timeout for primary ref extraction (ARIA + merge path) before fallback (defaults to `3.0`; set `0` to disable timeout).
+   - `ASK_BROWSER_REF_FALLBACK_TIMEOUT_S` — timeout for clickable-target fallback ref extraction (defaults to `4.5`; set `0` to disable timeout).
    - CDP headers are loaded at process start; restart the bot after changing `ASK_BROWSER_CDP_HEADERS_JSON`.
    - Operator instance IDs persist in `data/operator_instance_id.txt` unless overridden by `ASK_OPERATOR_INSTANCE_ID`. Set a fixed ID for restart-safe links.
    - Shared tokens do **not** share browser state across instances. Use sticky sessions (or a single instance) for `/operator/*` traffic to avoid profile conflicts or separate browser sessions. If `ASK_OPERATOR_ALLOW_SHARED_TOKENS` is enabled, expect a separate browser per instance.
