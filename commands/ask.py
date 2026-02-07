@@ -2708,10 +2708,16 @@ class _AskTaskCancelView(discord.ui.View):
         embed = self._cog._build_task_cancelled_embed()
         try:
             await interaction.response.edit_message(embed=embed, view=None)
+            self._cog._schedule_message_delete(
+                interaction.message, delay=ASK_AUTO_DELETE_DELAY_S
+            )
         except Exception:
             with contextlib.suppress(Exception):
-                await interaction.followup.send(
+                message = await interaction.followup.send(
                     "Cancel requested. The task is stopping now.", ephemeral=True
+                )
+                self._cog._schedule_message_delete(
+                    message, delay=ASK_AUTO_DELETE_DELAY_S
                 )
         self.stop()
 
@@ -10984,30 +10990,43 @@ class Ask(commands.Cog):
                 except Exception:
                     return
 
-            resp, all_outputs, error = await run_responses_agent(
-                self._responses_create,
-                responses_stream=self._responses_stream,
-                responses_retrieve=self._responses_retrieve,
-                responses_cancel=self._responses_cancel,
-                model="gpt-5.2-2025-12-11",
-                input_items=input_items,
-                tools=tools,
-                include=["web_search_call.action.sources"],
-                instructions=instructions,
-                previous_response_id=prev_id,
-                shell_executor=self.shell_executor,
-                function_router=_router,
-                event_cb=status_ui.emit,
-                reasoning=_ask_reasoning_cfg(),
-                text=_ask_structured_output_cfg(),
-                toolgate=getattr(ctx, "task_toolgate", None),
-                background=use_background,
-                response_id_cb=_record_response_id,
-            )
+            try:
+                resp, all_outputs, error = await run_responses_agent(
+                    self._responses_create,
+                    responses_stream=self._responses_stream,
+                    responses_retrieve=self._responses_retrieve,
+                    responses_cancel=self._responses_cancel,
+                    model="gpt-5.2-2025-12-11",
+                    input_items=input_items,
+                    tools=tools,
+                    include=["web_search_call.action.sources"],
+                    instructions=instructions,
+                    previous_response_id=prev_id,
+                    shell_executor=self.shell_executor,
+                    function_router=_router,
+                    event_cb=status_ui.emit,
+                    reasoning=_ask_reasoning_cfg(),
+                    text=_ask_structured_output_cfg(),
+                    toolgate=getattr(ctx, "task_toolgate", None),
+                    background=use_background,
+                    response_id_cb=_record_response_id,
+                )
+            except ToolGateDenied:
+                with contextlib.suppress(Exception):
+                    await status_ui.finish(ok=False)
+                run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
+                for run_id in run_ids:
+                    self._start_pending_ask_auto_delete(run_id)
+                return
 
             if error or resp is None:
                 if isinstance(error, str) and "Task cancellation requested" in error:
-                    raise ToolGateDenied(error)
+                    with contextlib.suppress(Exception):
+                        await status_ui.finish(ok=False)
+                    run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
+                    for run_id in run_ids:
+                        self._start_pending_ask_auto_delete(run_id)
+                    return
                 raise RuntimeError(error or "Unknown tool loop failure")
 
             try:
