@@ -53,3 +53,24 @@ def test_task_store_list_by_status(tmp_path: Path) -> None:
 
     assert [task.task_id for task in queued] == ["task-1"]
     assert [task.task_id for task in running] == ["task-2"]
+
+
+def test_task_store_list_by_state_key_without_initialize(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "taskman.sqlite")
+
+    tasks = asyncio.run(store.list_tasks_by_state_key(state_key="1:2"))
+
+    assert tasks == []
+
+
+def test_task_store_reinitializes_after_db_removed(tmp_path: Path) -> None:
+    db_path = tmp_path / "taskman.sqlite"
+    store = TaskStore(db_path)
+    asyncio.run(store.initialize())
+    assert db_path.exists()
+    db_path.unlink()
+
+    tasks = asyncio.run(store.list_tasks_by_state_key(state_key="1:2"))
+
+    assert tasks == []
+    assert db_path.exists()
