@@ -14,10 +14,17 @@ class TaskStore:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._init_lock = asyncio.Lock()
+        self._initialized = False
 
     async def initialize(self) -> None:
+        await self.ensure_initialized()
+
+    async def ensure_initialized(self) -> None:
         async with self._init_lock:
+            if self._initialized and await asyncio.to_thread(self._schema_exists):
+                return
             await asyncio.to_thread(self._init_db)
+            self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path, timeout=30)
@@ -86,7 +93,17 @@ class TaskStore:
             )
             conn.commit()
 
+    def _schema_exists(self) -> bool:
+        if not self._path.exists():
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+            ).fetchone()
+        return row is not None
+
     async def upsert_task(self, task: TaskRecord) -> None:
+        await self.ensure_initialized()
         await asyncio.to_thread(self._upsert_task, task)
 
     def _upsert_task(self, task: TaskRecord) -> None:
@@ -123,6 +140,7 @@ class TaskStore:
             conn.commit()
 
     async def get_task(self, task_id: str) -> TaskRecord | None:
+        await self.ensure_initialized()
         return await asyncio.to_thread(self._get_task, task_id)
 
     def _get_task(self, task_id: str) -> TaskRecord | None:
@@ -137,6 +155,7 @@ class TaskStore:
     async def list_tasks_by_status(
         self, statuses: Iterable[TaskStatus], *, lane: str | None = None
     ) -> list[TaskRecord]:
+        await self.ensure_initialized()
         return await asyncio.to_thread(self._list_tasks_by_status, list(statuses), lane)
 
     def _list_tasks_by_status(
@@ -160,6 +179,7 @@ class TaskStore:
     async def list_tasks_by_state_key(
         self, *, state_key: str, lane: str | None = None, status: TaskStatus | None = None
     ) -> list[TaskRecord]:
+        await self.ensure_initialized()
         return await asyncio.to_thread(
             self._list_tasks_by_state_key, state_key, lane, status
         )
@@ -191,6 +211,7 @@ class TaskStore:
         heartbeat_at: int | None = None,
         cancel_requested: bool | None = None,
     ) -> None:
+        await self.ensure_initialized()
         await asyncio.to_thread(
             self._update_status, task_id, status, updated_at, heartbeat_at, cancel_requested
         )
@@ -220,6 +241,7 @@ class TaskStore:
             conn.commit()
 
     async def update_runner_state(self, task_id: str, runner_state: dict[str, Any], updated_at: int) -> None:
+        await self.ensure_initialized()
         await asyncio.to_thread(self._update_runner_state, task_id, runner_state, updated_at)
 
     def _update_runner_state(
@@ -241,6 +263,7 @@ class TaskStore:
         status: TaskStatus,
         updated_at: int,
     ) -> None:
+        await self.ensure_initialized()
         await asyncio.to_thread(self._update_result, task_id, result, status, updated_at)
 
     def _update_result(
@@ -255,6 +278,7 @@ class TaskStore:
             conn.commit()
 
     async def append_event(self, event: TaskEvent) -> None:
+        await self.ensure_initialized()
         await asyncio.to_thread(self._append_event, event)
 
     def _append_event(self, event: TaskEvent) -> None:
