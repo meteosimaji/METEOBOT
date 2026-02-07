@@ -56,7 +56,8 @@ class AskRunner:
             setattr(resolved_ctx, "task_output_channel_id", task_channel_id)
         setattr(resolved_ctx, "task_toolgate", ctx.toolgate)
         setattr(resolved_ctx, "task_update_runner_state", ctx.update_runner_state)
-        setattr(resolved_ctx, "task_background", True)
+        use_background = request.get("background")
+        setattr(resolved_ctx, "task_background", use_background is True)
 
         try:
             await self._ask._ask_impl(
