@@ -75,6 +75,15 @@ class TaskManager:
     def set_runtime_context(self, task_id: str, payload: dict[str, Any]) -> None:
         self._runtime_context[task_id] = payload
 
+    async def get_task(self, task_id: str) -> TaskRecord | None:
+        return await self._store.get_task(task_id)
+
+    def get_runtime_context(self, task_id: str) -> dict[str, Any]:
+        payload = self._runtime_context.get(task_id)
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
     async def submit(self, spec: TaskSpec, *, task_id: str) -> str:
         if not self._ready:
             await self.start()

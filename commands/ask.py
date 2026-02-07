@@ -51,7 +51,7 @@ from pypdf import PdfReader
 
 from commands._browser_agent import BrowserAgent, BrowserObservation, MAX_REF_ENTRIES
 from taskman import TaskManager, TaskSpec, TaskStore
-from taskman.runners.ask_runner import AskRunner
+from taskman.runners.ask_runner import AskRunner, TaskContext
 from taskman.toolgate import ToolGate, ToolGateDenied, ToolGatePolicy
 from utils import (
     ASK_ERROR_TAG,
@@ -1462,6 +1462,7 @@ def _ask_structured_output_cfg() -> dict[str, Any]:
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
+                    "title": {"type": "string"},
                     "answer": {"type": "string"},
                     "reasoning_summary": {
                         "type": "array",
@@ -1496,7 +1497,7 @@ def _ask_structured_output_cfg() -> dict[str, Any]:
                         },
                     },
                 },
-                "required": ["answer", "reasoning_summary", "tool_timeline", "artifacts"],
+                "required": ["title", "answer", "reasoning_summary", "tool_timeline", "artifacts"],
             },
         }
     }
@@ -1510,11 +1511,14 @@ def _parse_ask_structured_output(raw_text: str) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         return None
 
+    title = parsed.get("title")
     answer = parsed.get("answer")
     reasoning_summary = parsed.get("reasoning_summary")
     tool_timeline = parsed.get("tool_timeline")
     artifacts = parsed.get("artifacts")
 
+    if not isinstance(title, str):
+        return None
     if not isinstance(answer, str):
         return None
     if not isinstance(reasoning_summary, list) or not all(isinstance(x, str) for x in reasoning_summary):
@@ -1541,6 +1545,7 @@ def _parse_ask_structured_output(raw_text: str) -> dict[str, Any] | None:
         return None
 
     return {
+        "title": title,
         "answer": answer,
         "reasoning_summary": reasoning_summary,
         "tool_timeline": tool_timeline,
@@ -2677,7 +2682,7 @@ class _AskAutoDeleteButton(discord.ui.Button):
                 await interaction.followup.send("Auto-delete stopped.", ephemeral=True)
 
 
-class _AskTaskCancelView(discord.ui.View):
+class _AskTaskQueueView(discord.ui.View):
     def __init__(self, cog: "Ask", task_id: str, author_id: int) -> None:
         super().__init__(timeout=RESET_VIEW_TIMEOUT_S)
         self._cog = cog
@@ -2695,6 +2700,21 @@ class _AskTaskCancelView(discord.ui.View):
             )
             return False
         return True
+
+    @discord.ui.button(label="Answer now", style=discord.ButtonStyle.primary)
+    async def answer_now(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.disable_all_items()
+        try:
+            await interaction.response.edit_message(
+                embed=self._cog._build_queue_start_embed(), view=None
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                await interaction.followup.send(
+                    "Starting now. Cancelling the background task first.", ephemeral=True
+                )
+        await self._cog.answer_now_task(self._task_id, interaction)
+        self.stop()
 
     @discord.ui.button(label="Cancel task", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -5651,6 +5671,7 @@ class Ask(commands.Cog):
             "action": action,
             "text": text,
             "state_key": state_key,
+            "background": True,
             "guild_id": ctx.guild.id if ctx.guild else 0,
             "channel_id": ctx.channel.id if ctx.channel else 0,
             "author_id": ctx.author.id if ctx.author else 0,
@@ -5664,7 +5685,7 @@ class Ask(commands.Cog):
         position = position + 1
         cancel_view = None
         if ctx.author is not None:
-            cancel_view = _AskTaskCancelView(self, task_id, ctx.author.id)
+            cancel_view = _AskTaskQueueView(self, task_id, ctx.author.id)
         placeholder = await self._reply(
             ctx,
             embed=self._build_queue_embed(position, position),
@@ -5887,6 +5908,131 @@ class Ask(commands.Cog):
 
     async def cancel_task(self, task_id: str) -> None:
         await self._task_manager.cancel(task_id)
+
+    async def _rebuild_context_from_task_request(
+        self, request: dict[str, Any]
+    ) -> commands.Context | TaskContext | None:
+        channel_id = request.get("channel_id")
+        message_id = request.get("message_id")
+        if isinstance(channel_id, int) and isinstance(message_id, int):
+            channel = self.bot.get_channel(channel_id)
+            message = await self._fetch_message_from_channel(
+                channel_id=channel_id,
+                message_id=message_id,
+                channel=channel,
+                actor=None,
+            )
+            if message is not None:
+                context = await self.bot.get_context(message)
+                return context
+
+        channel_obj = None
+        if isinstance(channel_id, int):
+            channel_obj = self.bot.get_channel(channel_id)
+            if channel_obj is None:
+                try:
+                    channel_obj = await self.bot.fetch_channel(channel_id)
+                except Exception:
+                    channel_obj = None
+        if channel_obj is None:
+            return None
+        guild = getattr(channel_obj, "guild", None)
+        author_id = request.get("author_id")
+        author = None
+        if isinstance(author_id, int):
+            member = None
+            if isinstance(guild, discord.Guild):
+                member = guild.get_member(author_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(author_id)
+                    except Exception:
+                        member = None
+            if member is not None:
+                author = member
+            else:
+                author = self.bot.get_user(author_id)
+                if author is None:
+                    try:
+                        author = await self.bot.fetch_user(author_id)
+                    except Exception:
+                        author = None
+        if author is None:
+            author = self.bot.user
+        if author is None:
+            return None
+        fallback_ctx = TaskContext(
+            bot=self.bot,
+            channel=channel_obj,
+            author=author,
+            guild=guild if isinstance(guild, discord.Guild) else None,
+        )
+        return fallback_ctx
+
+    async def answer_now_task(
+        self, task_id: str, interaction: discord.Interaction
+    ) -> None:
+        task = await self._task_manager.get_task(task_id)
+        if task is None:
+            with contextlib.suppress(Exception):
+                await interaction.followup.send("Task not found.", ephemeral=True)
+            return
+        author_id = task.request.get("author_id")
+        if isinstance(author_id, int) and author_id != interaction.user.id:
+            with contextlib.suppress(Exception):
+                await interaction.followup.send(
+                    "Only the person who ran the command can use this button.",
+                    ephemeral=True,
+                )
+            return
+        if task.status != "queued":
+            message = (
+                "That task has already started." if task.status in {"running", "recovering"} else "That task already finished."
+            )
+            with contextlib.suppress(Exception):
+                await interaction.followup.send(
+                    message, ephemeral=True
+                )
+            return
+
+        runtime = self._task_manager.get_runtime_context(task_id)
+        ctx = runtime.get("ctx") if isinstance(runtime, dict) else None
+        if not isinstance(ctx, commands.Context):
+            ctx = await self._rebuild_context_from_task_request(task.request)
+        if ctx is None:
+            with contextlib.suppress(Exception):
+                await interaction.followup.send(
+                    "Couldn't rebuild the original context for this task.", ephemeral=True
+                )
+            return
+
+        extra_images = None
+        if isinstance(runtime, dict):
+            extra_images = runtime.get("extra_images")
+
+        setattr(ctx, "task_background", False)
+        message_id = getattr(interaction.message, "id", None)
+        if message_id:
+            setattr(ctx, "task_output_message_id", str(message_id))
+        channel_id = getattr(getattr(interaction, "channel", None), "id", None)
+        if channel_id:
+            setattr(ctx, "task_output_channel_id", channel_id)
+
+        try:
+            await self._task_manager.cancel(task_id)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await interaction.followup.send(
+                    "Failed to cancel the background task; running in the foreground anyway.",
+                    ephemeral=True,
+                )
+        await self._ask_impl(
+            ctx,
+            str(task.request.get("action") or "ask"),
+            task.request.get("text"),
+            extra_images=extra_images if isinstance(extra_images, list) else None,
+            skip_queue=True,
+        )
 
     def _attachment_bucket(self, cache_key: tuple[int, int, int]) -> OrderedDict[str, AskAttachmentRecord]:
         bucket = self._attachment_cache.get(cache_key)
@@ -10826,6 +10972,7 @@ class Ask(commands.Cog):
             f"Current time: {current_time}. "
             "Your built-in knowledge might be wrong or outdated; question it and seek fresh verification. "
             "Respond in JSON matching the provided schema. "
+            "Provide a short, user-facing title in title. "
             "Write concise user-facing content in answer. "
             "reasoning_summary must be safe-to-share bullet-style observations, not private chain-of-thought. "
             "tool_timeline should summarize what tools you used and why. "
@@ -11074,7 +11221,13 @@ class Ask(commands.Cog):
             link_context_entries = self._prune_link_context(self._load_link_context(ctx))
             answer = self._expand_link_placeholders(answer, container_files, link_context_entries)
 
-            title_text = _question_preview(text) or "Ask"
+            title_text = ""
+            if structured is not None:
+                title_text = (structured.get("title") or "").strip()
+            if not title_text:
+                title_text = _question_preview(text, limit=200) or "Ask"
+            else:
+                title_text = _truncate_discord(title_text, 200)
             title_text = f"\U0001F4AC {title_text}"
             files: list[discord.File] = []
             max_file_bytes = (
