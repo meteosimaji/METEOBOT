@@ -56,6 +56,9 @@ class TaskManager:
         self._worker_tasks.clear()
         self._ready = False
 
+    def is_ready(self) -> bool:
+        return self._ready
+
     def _setup_lanes(self) -> None:
         for lane, limit in self._lane_limits.items():
             self._lanes[lane] = LaneScheduler(
@@ -73,6 +76,8 @@ class TaskManager:
         self._runtime_context[task_id] = payload
 
     async def submit(self, spec: TaskSpec, *, task_id: str) -> str:
+        if not self._ready:
+            await self.start()
         now = int(time.time())
         record = TaskRecord(
             task_id=task_id,

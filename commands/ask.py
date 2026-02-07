@@ -5620,6 +5620,8 @@ class Ask(commands.Cog):
         extra_images: list[discord.Attachment | None] | None,
         state_key: str,
     ) -> None:
+        if not self._task_manager.is_ready():
+            await self._task_manager.start()
         policy = _parse_tool_policy_env()
         task_id = uuid.uuid4().hex
         request = {
