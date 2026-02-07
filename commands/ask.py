@@ -50,6 +50,9 @@ from pptx import Presentation
 from pypdf import PdfReader
 
 from commands._browser_agent import BrowserAgent, BrowserObservation, MAX_REF_ENTRIES
+from taskman import TaskManager, TaskSpec, TaskStore
+from taskman.runners.ask_runner import AskRunner
+from taskman.toolgate import ToolGate, ToolGateDenied, ToolGatePolicy
 from utils import (
     ASK_ERROR_TAG,
     BOT_PREFIX,
@@ -240,6 +243,27 @@ ASK_OPERATOR_HEADLESS = (
 ASK_OPERATOR_START_COOLDOWN_S = float(
     os.getenv("ASK_OPERATOR_START_COOLDOWN_S", "20")
 )
+
+
+def _parse_tool_policy_env() -> ToolGatePolicy:
+    raw_allow = (os.getenv("ASK_TOOL_ALLOW") or "").strip()
+    raw_deny = (os.getenv("ASK_TOOL_DENY") or "").strip()
+    allow = {item.strip() for item in raw_allow.split(",") if item.strip()}
+    deny = {item.strip() for item in raw_deny.split(",") if item.strip()}
+    permission_mode = (os.getenv("ASK_TOOL_PERMISSION_MODE") or "execute").strip().lower()
+    return ToolGatePolicy(
+        allowed_tools=allow,
+        denied_tools=deny,
+        permission_mode=permission_mode or "execute",
+    )
+
+
+def _tool_policy_payload(policy: ToolGatePolicy) -> dict[str, Any]:
+    return {
+        "allowed_tools": sorted(policy.allowed_tools),
+        "denied_tools": sorted(policy.denied_tools),
+        "permission_mode": policy.permission_mode,
+    }
 ASK_BROWSER_CDP_CONNECT_TIMEOUT_S = float(
     os.getenv("ASK_BROWSER_CDP_CONNECT_TIMEOUT_S", "8")
 )
@@ -1681,6 +1705,7 @@ MESSAGE_LINK_RE = re.compile(
 async def run_responses_agent(
     responses_create,
     responses_stream=None,
+    responses_retrieve=None,
     *,
     model: str,
     input_items: list[dict[str, Any]],
@@ -1693,6 +1718,9 @@ async def run_responses_agent(
     event_cb=None,
     reasoning: dict[str, Any] | None = None,
     text: dict[str, Any] | None = None,
+    toolgate: ToolGate | None = None,
+    background: bool = False,
+    response_id_cb=None,
 ):
     inputs = list(input_items)
     all_outputs: list[Any] = []
@@ -1747,6 +1775,11 @@ async def run_responses_agent(
             return
 
     for turn in range(1, MAX_TOOL_TURNS + 1):
+        if toolgate is not None:
+            try:
+                toolgate.raise_if_cancelled()
+            except ToolGateDenied as exc:
+                return None, all_outputs, str(exc)
         await _emit({"type": "turn_start", "turn": turn, "max_turns": MAX_TOOL_TURNS})
         request: dict[str, Any] = {
             "model": model,
@@ -1764,88 +1797,146 @@ async def run_responses_agent(
         if text is not None:
             request["text"] = text
 
-        streamed_chunks: list[str] = []
-        if responses_stream is not None:
-            stream = await responses_stream(**request)
-            if stream is not None:
-                completed_response = None
-                async for event in stream:
-                    event_type = getattr(event, "type", None)
-                    if event_type == "response.output_text.delta":
-                        delta = getattr(event, "delta", None)
-                        if isinstance(delta, str) and delta:
-                            streamed_chunks.append(delta)
-                            await _emit(
-                                {
-                                    "type": "model_output_text_delta",
-                                    "turn": turn,
-                                    "delta": delta,
-                                    "text": "".join(streamed_chunks),
-                                }
-                            )
-                    elif event_type == "response.refusal.delta":
-                        delta = getattr(event, "delta", None)
-                        if isinstance(delta, str) and delta:
-                            await _emit(
-                                {
-                                    "type": "model_refusal_delta",
-                                    "turn": turn,
-                                    "delta": delta,
-                                }
-                            )
-                    elif event_type == "response.refusal.done":
-                        refusal = getattr(event, "refusal", None)
-                        if isinstance(refusal, str) and refusal:
-                            await _emit(
-                                {
-                                    "type": "model_refusal_delta",
-                                    "turn": turn,
-                                    "delta": refusal,
-                                }
-                            )
-                    elif event_type in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
-                        delta = getattr(event, "delta", None)
-                        if isinstance(delta, str) and delta:
-                            await _emit(
-                                {
-                                    "type": "model_reasoning_delta",
-                                    "turn": turn,
-                                    "delta": delta,
-                                }
-                            )
-                    elif event_type == "response.completed":
-                        completed_response = getattr(event, "response", None)
-                    elif event_type == "response.failed":
-                        failed = getattr(event, "response", None)
-                        failed_error = getattr(failed, "error", None) if failed is not None else None
-                        message = (
-                            getattr(failed_error, "message", None)
-                            or str(failed_error)
-                            or "Response stream failed"
-                        )
-                        return None, all_outputs, message
-                    elif event_type == "response.incomplete":
-                        incomplete = getattr(event, "response", None)
-                        details = getattr(incomplete, "incomplete_details", None) if incomplete is not None else None
-                        reason = getattr(details, "reason", None) or str(details) or "unknown"
-                        return None, all_outputs, f"Response stream incomplete: {reason}"
-                    elif event_type in {"response.error", "error"}:
-                        err = getattr(event, "error", None)
-                        message = (
-                            getattr(err, "message", None)
-                            or getattr(event, "message", None)
-                            or str(err)
-                            or "Unknown response stream error"
-                        )
-                        return None, all_outputs, message
-
-                if completed_response is None:
-                    return None, all_outputs, "Response stream ended without a completed response"
-                resp = completed_response
-            else:
-                resp = await responses_create(**request)
-        else:
+        if background:
+            request["background"] = True
+            request["store"] = True
+            if responses_retrieve is None:
+                return None, all_outputs, "Background responses require responses_retrieve"
+            await _emit({"type": "background_start", "turn": turn})
             resp = await responses_create(**request)
+            response_id = getattr(resp, "id", None)
+            if not isinstance(response_id, str) or not response_id:
+                log.warning("Background response did not return a valid response id.")
+                return None, all_outputs, "Background response did not return a response id"
+            if response_id_cb and isinstance(response_id, str) and response_id:
+                try:
+                    maybe = response_id_cb(response_id)
+                    if inspect.isawaitable(maybe):
+                        await maybe
+                except Exception:
+                    pass
+            status = getattr(resp, "status", None)
+            last_status = status
+            while status in {"queued", "in_progress"}:
+                if toolgate is not None:
+                    try:
+                        toolgate.raise_if_cancelled()
+                    except ToolGateDenied as exc:
+                        return None, all_outputs, str(exc)
+                await asyncio.sleep(2)
+                resp = await responses_retrieve(response_id)
+                status = getattr(resp, "status", None)
+                if status != last_status:
+                    await _emit(
+                        {
+                            "type": "background_status",
+                            "turn": turn,
+                            "status": status,
+                            "response_id": response_id,
+                        }
+                    )
+                    last_status = status
+            if status == "cancelled":
+                log.info(
+                    "Background response cancelled (response_id=%s).",
+                    response_id,
+                )
+                return None, all_outputs, "Task cancellation requested"
+            if status != "completed":
+                error = getattr(resp, "error", None)
+                incomplete = getattr(resp, "incomplete_details", None)
+                message = (
+                    getattr(error, "message", None)
+                    or getattr(incomplete, "reason", None)
+                    or (str(error) if error else "")
+                    or (str(incomplete) if incomplete else "")
+                    or f"Background response ended with status {status!r}"
+                )
+                log.warning(
+                    "Background response ended without completion (status=%s, response_id=%s).",
+                    status,
+                    response_id,
+                )
+                return None, all_outputs, message
+        else:
+            streamed_chunks: list[str] = []
+            if responses_stream is not None:
+                stream = await responses_stream(**request)
+                if stream is not None:
+                    completed_response = None
+                    async for event in stream:
+                        event_type = getattr(event, "type", None)
+                        if event_type == "response.output_text.delta":
+                            delta = getattr(event, "delta", None)
+                            if isinstance(delta, str) and delta:
+                                streamed_chunks.append(delta)
+                                await _emit(
+                                    {
+                                        "type": "model_output_text_delta",
+                                        "turn": turn,
+                                        "delta": delta,
+                                        "text": "".join(streamed_chunks),
+                                    }
+                                )
+                        elif event_type == "response.refusal.delta":
+                            delta = getattr(event, "delta", None)
+                            if isinstance(delta, str) and delta:
+                                await _emit(
+                                    {
+                                        "type": "model_refusal_delta",
+                                        "turn": turn,
+                                        "delta": delta,
+                                    }
+                                )
+                        elif event_type == "response.refusal.done":
+                            refusal = getattr(event, "refusal", None)
+                            if isinstance(refusal, str) and refusal:
+                                await _emit(
+                                    {
+                                        "type": "model_refusal_delta",
+                                        "turn": turn,
+                                        "delta": refusal,
+                                    }
+                                )
+                        elif event_type in {"response.completed", "response.done"}:
+                            completed_response = getattr(event, "response", None)
+                        elif event_type == "response.failed":
+                            failed = getattr(event, "response", None)
+                            failed_error = getattr(failed, "error", None) if failed is not None else None
+                            message = (
+                                getattr(failed_error, "message", None)
+                                or str(failed_error)
+                                or "Response stream failed"
+                            )
+                            return None, all_outputs, message
+                        elif event_type == "response.incomplete":
+                            details = getattr(event, "details", None)
+                            reason = getattr(details, "reason", None) or str(details) or "unknown"
+                            return None, all_outputs, f"Response stream incomplete: {reason}"
+                        elif event_type in {"response.error", "error"}:
+                            err = getattr(event, "error", None)
+                            message = (
+                                getattr(err, "message", None)
+                                or getattr(event, "message", None)
+                                or str(err)
+                                or "Unknown response stream error"
+                            )
+                            return None, all_outputs, message
+
+                    if completed_response is None:
+                        return None, all_outputs, "Response stream ended without a completed response"
+                    resp = completed_response
+                else:
+                    resp = await responses_create(**request)
+        if not background:
+            response_id = getattr(resp, "id", None)
+            if response_id_cb and isinstance(response_id, str) and response_id:
+                try:
+                    maybe = response_id_cb(response_id)
+                    if inspect.isawaitable(maybe):
+                        await maybe
+                except Exception:
+                    pass
         outputs = getattr(resp, "output", []) or []
         all_outputs.extend(outputs)
         await _emit({"type": "model_response", "turn": turn, "output_items": len(outputs)})
@@ -1874,12 +1965,25 @@ async def run_responses_agent(
                 ok = True
                 if function_router is not None:
                     try:
-                        result_value = await function_router(name, args if isinstance(args, dict) else {})
+                        if toolgate is not None:
+                            tool_name = f"function:{name}" if name else "function"
+                            result_value = await toolgate.run(
+                                tool_name,
+                                {"name": name, "args": args if isinstance(args, dict) else {}},
+                                lambda: function_router(name, args if isinstance(args, dict) else {}),
+                            )
+                        else:
+                            result_value = await function_router(
+                                name, args if isinstance(args, dict) else {}
+                            )
                         result = (
                             result_value
                             if isinstance(result_value, str)
                             else json.dumps(result_value, ensure_ascii=False)
                         )
+                    except ToolGateDenied as exc:
+                        ok = False
+                        result = str(exc)
                     except Exception as e:
                         ok = False
                         result = f"Function '{name}' failed: {e!r}"
@@ -1936,7 +2040,34 @@ async def run_responses_agent(
                     )
                     continue
 
-                results = await shell_executor.run_many(commands or [], timeout_ms=timeout_ms)
+                if toolgate is not None:
+                    try:
+                        results = await toolgate.run(
+                            "shell",
+                            {"commands": commands, "timeout_ms": timeout_ms},
+                            lambda: shell_executor.run_many(
+                                commands or [], timeout_ms=timeout_ms
+                            ),
+                        )
+                    except ToolGateDenied as exc:
+                        tool_outputs.append(
+                            {
+                                "type": "shell_call_output",
+                                "call_id": call_id,
+                                "output": [
+                                    {
+                                        "stdout": "",
+                                        "stderr": str(exc),
+                                        "outcome": {"type": "exit", "exit_code": 1},
+                                    }
+                                ],
+                            }
+                        )
+                        continue
+                else:
+                    results = await shell_executor.run_many(
+                        commands or [], timeout_ms=timeout_ms
+                    )
                 payload: dict[str, Any] = {
                     "type": "shell_call_output",
                     "call_id": call_id,
@@ -2529,6 +2660,45 @@ class _AskAutoDeleteButton(discord.ui.Button):
                 await interaction.followup.send("Auto-delete stopped.", ephemeral=True)
 
 
+class _AskTaskCancelView(discord.ui.View):
+    def __init__(self, cog: "Ask", task_id: str, author_id: int) -> None:
+        super().__init__(timeout=RESET_VIEW_TIMEOUT_S)
+        self._cog = cog
+        self._task_id = task_id
+        self._author_id = author_id
+
+    def disable_all_items(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self._author_id:
+            await interaction.response.send_message(
+                "Only the person who ran the command can use this button.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Cancel task", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        log.info(
+            "Cancelling /ask task via button (task_id=%s, user_id=%s).",
+            self._task_id,
+            interaction.user.id,
+        )
+        await self._cog.cancel_task(self._task_id)
+        self.disable_all_items()
+        embed = self._cog._build_task_cancelled_embed()
+        try:
+            await interaction.response.edit_message(embed=embed, view=None)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await interaction.followup.send(
+                    "Cancel requested. The task is stopping now.", ephemeral=True
+                )
+        self.stop()
+
+
 def _collect_strict_schema_issues(schema: Any, path: str = "") -> list[str]:
     issues: list[str] = []
     if isinstance(schema, dict):
@@ -2693,6 +2863,19 @@ class Ask(commands.Cog):
         if not hasattr(self.bot, "ai_last_response_id"):
             self.bot.ai_last_response_id = {}  # type: ignore[attr-defined]
         self._load_ask_state_store()
+        self._task_store = TaskStore(repo_root / "data" / "taskman.sqlite")
+        self._task_manager = TaskManager(
+            self._task_store,
+            workspace_root=(repo_root / "data" / "task_workspaces"),
+            lane_limits={"main": 2, "subagent": 4, "background": 8},
+        )
+        self._task_manager.attach_runner("ask", AskRunner(self))
+
+    async def cog_load(self) -> None:
+        await self._task_manager.start()
+
+    def cog_unload(self) -> None:
+        self._task_manager.shutdown()
 
     @staticmethod
     def _is_valid_state_key(state_key: Any) -> bool:
@@ -5421,6 +5604,69 @@ class Ask(commands.Cog):
             color=0xED4245,
         )
 
+    def _build_task_cancelled_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title="🛑 /ask cancelled",
+            description="This task was cancelled.",
+            color=0xED4245,
+        )
+
+    async def _submit_ask_task(
+        self,
+        ctx: commands.Context,
+        *,
+        action: str,
+        text: str | None,
+        extra_images: list[discord.Attachment | None] | None,
+        state_key: str,
+    ) -> None:
+        policy = _parse_tool_policy_env()
+        task_id = uuid.uuid4().hex
+        request = {
+            "action": action,
+            "text": text,
+            "state_key": state_key,
+            "guild_id": ctx.guild.id if ctx.guild else 0,
+            "channel_id": ctx.channel.id if ctx.channel else 0,
+            "author_id": ctx.author.id if ctx.author else 0,
+            "message_id": getattr(getattr(ctx, "message", None), "id", None),
+            "interaction_id": getattr(getattr(ctx, "interaction", None), "id", None),
+            "tool_policy": _tool_policy_payload(policy),
+        }
+        position = await self._task_manager.queued_position(
+            state_key=state_key, lane="main"
+        )
+        position = position + 1
+        cancel_view = None
+        if ctx.author is not None:
+            cancel_view = _AskTaskCancelView(self, task_id, ctx.author.id)
+        placeholder = await self._reply(
+            ctx,
+            embed=self._build_queue_embed(position, position),
+            view=cancel_view,
+        )
+        output_message_id = str(placeholder.id) if placeholder else None
+        spec = TaskSpec(
+            kind="ask",
+            lane="main",
+            state_key=state_key,
+            request=request,
+            output_message_id=output_message_id,
+        )
+        if output_message_id:
+            setattr(ctx, "task_output_message_id", output_message_id)
+            setattr(ctx, "task_output_channel_id", request["channel_id"])
+            setattr(ctx, "task_output_ephemeral", False)
+        self._task_manager.set_runtime_context(
+            task_id,
+            {
+                "ctx": ctx,
+                "extra_images": extra_images,
+                "tool_policy": policy,
+            },
+        )
+        await self._task_manager.submit(spec, task_id=task_id)
+
     async def _send_queue_embed(
         self,
         ctx: commands.Context,
@@ -5599,6 +5845,8 @@ class Ask(commands.Cog):
         log.info("Finished /ask queue worker (state_key=%s).", state_key)
 
     async def _clear_ask_queue(self, state_key: str) -> None:
+        with contextlib.suppress(Exception):
+            await self._task_manager.cancel_state_key(state_key)
         queue = self._get_ask_queue(state_key)
         if not queue:
             self._ask_queue_pause_until.pop(state_key, None)
@@ -5611,6 +5859,9 @@ class Ask(commands.Cog):
             await self._schedule_queue_message_delete(request)
         self._ask_queue_pause_until.pop(state_key, None)
         log.info("Cleared /ask queue (state_key=%s, cleared=%s).", state_key, cleared_count)
+
+    async def cancel_task(self, task_id: str) -> None:
+        await self._task_manager.cancel(task_id)
 
     def _attachment_bucket(self, cache_key: tuple[int, int, int]) -> OrderedDict[str, AskAttachmentRecord]:
         bucket = self._attachment_cache.get(cache_key)
@@ -9549,6 +9800,14 @@ class Ask(commands.Cog):
             return await self.client.responses.create(**kwargs)
         return await asyncio.to_thread(self.client.responses.create, **kwargs)
 
+    async def _responses_retrieve(self, response_id: str):
+        retrieve_fn = getattr(self.client.responses, "retrieve", None)
+        if retrieve_fn is None:
+            raise RuntimeError("Responses retrieve is not available on the OpenAI client.")
+        if self._async_client:
+            return await retrieve_fn(response_id)
+        return await asyncio.to_thread(retrieve_fn, response_id)
+
     async def _responses_stream(self, **kwargs: Any):
         if not self._async_client:
             return None
@@ -9709,9 +9968,87 @@ class Ask(commands.Cog):
         reference: discord.Message | discord.MessageReference | None = None,
         **kwargs: Any,
     ) -> discord.Message | None:
+        def _channel_send_payload(payload: dict[str, Any]) -> dict[str, Any]:
+            allowed = {
+                "content",
+                "embed",
+                "embeds",
+                "files",
+                "view",
+                "allowed_mentions",
+                "reference",
+                "tts",
+                "suppress_embeds",
+            }
+            return {key: value for key, value in payload.items() if key in allowed}
+
+        task_message_id = getattr(ctx, "task_output_message_id", None)
+        task_channel_id = getattr(ctx, "task_output_channel_id", None)
+        task_output_ephemeral = getattr(ctx, "task_output_ephemeral", False) is True
+        files_to_send = None
+        if task_message_id and "files" in kwargs:
+            files_to_send = kwargs.pop("files")
+        if task_message_id:
+            if task_channel_id is None and getattr(ctx, "channel", None) is not None:
+                task_channel_id = getattr(ctx.channel, "id", None)
+            if isinstance(task_channel_id, int):
+                message = await self._fetch_message_from_channel(
+                    channel_id=task_channel_id,
+                    message_id=int(task_message_id),
+                    channel=getattr(ctx, "channel", None),
+                    actor=None,
+                )
+                if message is not None:
+                    existing_embeds = getattr(message, "embeds", []) or []
+                    if any(
+                        getattr(embed, "title", None) == "🛑 /ask cancelled"
+                        for embed in existing_embeds
+                    ):
+                        return message
+                    edit_kwargs = dict(kwargs)
+                    edit_kwargs.pop("mention_author", None)
+                    edit_kwargs.pop("reference", None)
+                    edit_kwargs.setdefault("view", None)
+                    try:
+                        await message.edit(**edit_kwargs)
+                        if files_to_send:
+                            try:
+                                if task_output_ephemeral and ctx.interaction:
+                                    await ctx.interaction.followup.send(
+                                        files=files_to_send,
+                                        ephemeral=True,
+                                    )
+                                else:
+                                    await message.channel.send(files=files_to_send)
+                            except Exception:
+                                log.exception(
+                                    "Failed to send /ask task files (channel_id=%s, message_id=%s).",
+                                    task_channel_id,
+                                    task_message_id,
+                                )
+                                if not task_output_ephemeral:
+                                    with contextlib.suppress(Exception):
+                                        await message.channel.send(files=files_to_send)
+                        return message
+                    except Exception:
+                        if files_to_send is not None:
+                            kwargs["files"] = files_to_send
+                        pass
         if ctx.interaction:
             if ctx.interaction.response.is_done():
-                return await ctx.interaction.followup.send(**kwargs, wait=True)
+                try:
+                    return await ctx.interaction.followup.send(**kwargs, wait=True)
+                except Exception:
+                    if kwargs.get("ephemeral") is True:
+                        log.warning(
+                            "Interaction followup failed for an ephemeral reply; skipping channel fallback.",
+                            exc_info=True,
+                        )
+                        return None
+                    channel = getattr(ctx, "channel", None)
+                    if channel is not None:
+                        return await channel.send(**_channel_send_payload(kwargs))
+                    raise
             else:
                 await ctx.interaction.response.send_message(**kwargs)
                 return await ctx.interaction.original_response()
@@ -10066,7 +10403,7 @@ class Ask(commands.Cog):
             if ctx.interaction:
                 await defer_interaction(ctx)
                 deferred = True
-            await self._enqueue_ask_request(
+            await self._submit_ask_task(
                 ctx,
                 action=action,
                 text=text,
@@ -10607,9 +10944,23 @@ class Ask(commands.Cog):
             async def _router(fname: str, fargs: dict[str, Any]):
                 return await self._function_router(ctx, fname, fargs)
 
+            update_runner_state = getattr(ctx, "task_update_runner_state", None)
+            use_background = getattr(ctx, "task_background", False) is True
+
+            async def _record_response_id(response_id: str) -> None:
+                if update_runner_state is None:
+                    return
+                try:
+                    maybe = update_runner_state({"openai_response_id": response_id})
+                    if inspect.isawaitable(maybe):
+                        await maybe
+                except Exception:
+                    return
+
             resp, all_outputs, error = await run_responses_agent(
                 self._responses_create,
                 responses_stream=self._responses_stream,
+                responses_retrieve=self._responses_retrieve,
                 model="gpt-5.2-2025-12-11",
                 input_items=input_items,
                 tools=tools,
@@ -10621,9 +10972,14 @@ class Ask(commands.Cog):
                 event_cb=status_ui.emit,
                 reasoning=_ask_reasoning_cfg(),
                 text=_ask_structured_output_cfg(),
+                toolgate=getattr(ctx, "task_toolgate", None),
+                background=use_background,
+                response_id_cb=_record_response_id,
             )
 
             if error or resp is None:
+                if isinstance(error, str) and "Task cancellation requested" in error:
+                    raise ToolGateDenied(error)
                 raise RuntimeError(error or "Unknown tool loop failure")
 
             try:
