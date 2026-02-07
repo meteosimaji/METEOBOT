@@ -1706,6 +1706,7 @@ async def run_responses_agent(
     responses_create,
     responses_stream=None,
     responses_retrieve=None,
+    responses_cancel=None,
     *,
     model: str,
     input_items: list[dict[str, Any]],
@@ -1808,6 +1809,21 @@ async def run_responses_agent(
             if not isinstance(response_id, str) or not response_id:
                 log.warning("Background response did not return a valid response id.")
                 return None, all_outputs, "Background response did not return a response id"
+
+            async def _cancel_background_response() -> None:
+                if responses_cancel is None:
+                    return
+                try:
+                    maybe = responses_cancel(response_id)
+                    if inspect.isawaitable(maybe):
+                        await maybe
+                except Exception:
+                    log.warning(
+                        "Failed to cancel background response (response_id=%s).",
+                        response_id,
+                        exc_info=True,
+                    )
+
             if response_id_cb and isinstance(response_id, str) and response_id:
                 try:
                     maybe = response_id_cb(response_id)
@@ -1822,6 +1838,7 @@ async def run_responses_agent(
                     try:
                         toolgate.raise_if_cancelled()
                     except ToolGateDenied as exc:
+                        await _cancel_background_response()
                         return None, all_outputs, str(exc)
                 await asyncio.sleep(2)
                 resp = await responses_retrieve(response_id)
@@ -9810,6 +9827,14 @@ class Ask(commands.Cog):
             return await retrieve_fn(response_id)
         return await asyncio.to_thread(retrieve_fn, response_id)
 
+    async def _responses_cancel(self, response_id: str):
+        cancel_fn = getattr(self.client.responses, "cancel", None)
+        if cancel_fn is None:
+            raise RuntimeError("Responses cancel is not available on the OpenAI client.")
+        if self._async_client:
+            return await cancel_fn(response_id)
+        return await asyncio.to_thread(cancel_fn, response_id)
+
     async def _responses_stream(self, **kwargs: Any):
         if not self._async_client:
             return None
@@ -10963,6 +10988,7 @@ class Ask(commands.Cog):
                 self._responses_create,
                 responses_stream=self._responses_stream,
                 responses_retrieve=self._responses_retrieve,
+                responses_cancel=self._responses_cancel,
                 model="gpt-5.2-2025-12-11",
                 input_items=input_items,
                 tools=tools,
