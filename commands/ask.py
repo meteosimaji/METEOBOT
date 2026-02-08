@@ -2769,21 +2769,6 @@ class _AskTaskQueueView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Answer now", style=discord.ButtonStyle.primary)
-    async def answer_now(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        self.disable_all_items()
-        try:
-            await interaction.response.edit_message(
-                embed=self._cog._build_queue_start_embed(), view=None
-            )
-        except Exception:
-            with contextlib.suppress(Exception):
-                await interaction.followup.send(
-                    "Starting now. Cancelling the background task first.", ephemeral=True
-                )
-        await self._cog.answer_now_task(self._task_id, interaction)
-        self.stop()
-
     @discord.ui.button(label="Cancel task", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         log.info(
@@ -5840,7 +5825,7 @@ class Ask(commands.Cog):
             "action": action,
             "text": text,
             "state_key": state_key,
-            "background": True,
+            "background": False,
             "guild_id": ctx.guild.id if ctx.guild else 0,
             "channel_id": ctx.channel.id if ctx.channel else 0,
             "author_id": ctx.author.id if ctx.author else 0,
