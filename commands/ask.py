@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Literal, Union, get_args, get_origin
+from typing import Any, Awaitable, Callable, Iterable, Literal, Union, get_args, get_origin
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -1750,6 +1750,12 @@ ASK_CONTAINER_FILE_MAX_BYTES = _env_int(
 )
 ASK_CONTAINER_FILE_MAX_COUNT = _env_int("ASK_CONTAINER_FILE_MAX_COUNT", 5, minimum=1)
 ASK_CONTAINER_FILE_RETAIN_S = _env_int("ASK_CONTAINER_FILE_RETAIN_S", 24 * 60 * 60, minimum=60)
+ASK_CONTAINER_FILE_LIST_TIMEOUT_S = _env_int(
+    "ASK_CONTAINER_FILE_LIST_TIMEOUT_S", 10, minimum=1
+)
+ASK_CONTAINER_FILE_DOWNLOAD_TIMEOUT_S = _env_int(
+    "ASK_CONTAINER_FILE_DOWNLOAD_TIMEOUT_S", 60, minimum=1
+)
 ASK_LINK_CONTEXT_MAX_ENTRIES = _env_int("ASK_LINK_CONTEXT_MAX_ENTRIES", 50, minimum=1)
 ASK_LINK_CONTEXT_MAX_PROMPT = _env_int("ASK_LINK_CONTEXT_MAX_PROMPT", 10, minimum=1)
 ASK_AUTO_DELETE_DELAY_S = 5
@@ -2247,17 +2253,6 @@ async def run_responses_agent(
         )
     )
     return friendly_stop, all_outputs, None
-
-
-def _pretty_source(title: str | None, url: str | None, index: int) -> str:
-    if not url:
-        return f"[{index}] (no url)"
-    host = urlparse(url).netloc or url
-    label = (title or "").strip() or host
-    label = label if len(label) <= 100 else label[:99] + "…"
-    return f"[{index}] [{label}]({url})"
-
-
 
 
 class _AskStatusUI:
@@ -6775,9 +6770,10 @@ class Ask(commands.Cog):
             return []
         url = f"https://api.openai.com/v1/containers/{container_id}/files?order=desc&limit=100"
         session = await self._get_http_session()
+        timeout = aiohttp.ClientTimeout(total=ASK_CONTAINER_FILE_LIST_TIMEOUT_S)
         headers = {"Authorization": f"Bearer {self._openai_token}"}
         try:
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
                     log.warning(
                         "Container file list failed: status=%s container_id=%s",
@@ -6806,11 +6802,12 @@ class Ask(commands.Cog):
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         url = f"https://api.openai.com/v1/containers/{container_id}/files/{file_id}/content"
         session = await self._get_http_session()
+        timeout = aiohttp.ClientTimeout(total=ASK_CONTAINER_FILE_DOWNLOAD_TIMEOUT_S)
         headers = {"Authorization": f"Bearer {self._openai_token}"}
         size = 0
         content_type = None
         try:
-            async with session.get(url, headers=headers) as resp:
+            async with session.get(url, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
                     log.warning(
                         "Container file download failed: status=%s container_id=%s file_id=%s",
@@ -10608,6 +10605,27 @@ class Ask(commands.Cog):
             return [entry for entry in links if isinstance(entry, dict) and entry.get("url")]
         return []
 
+    async def _send_with_retry(
+        self,
+        send_fn: Callable[..., Awaitable[discord.Message]],
+        *,
+        attempts: int = 2,
+        delay_s: float = 1.0,
+        **kwargs: Any,
+    ) -> discord.Message:
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return await send_fn(**kwargs)
+            except discord.HTTPException as exc:
+                last_exc = exc
+                if attempt + 1 >= attempts:
+                    break
+                await asyncio.sleep(delay_s)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Send failed without an HTTP exception.")
+
     async def _reply(
         self,
         ctx: commands.Context,
@@ -10661,12 +10679,16 @@ class Ask(commands.Cog):
                         if files_to_send:
                             try:
                                 if task_output_ephemeral and ctx.interaction:
-                                    await ctx.interaction.followup.send(
+                                    await self._send_with_retry(
+                                        ctx.interaction.followup.send,
                                         files=files_to_send,
                                         ephemeral=True,
                                     )
                                 else:
-                                    await message.channel.send(files=files_to_send)
+                                    await self._send_with_retry(
+                                        message.channel.send,
+                                        files=files_to_send,
+                                    )
                             except Exception:
                                 log.exception(
                                     "Failed to send /ask task files (channel_id=%s, message_id=%s).",
@@ -10675,7 +10697,10 @@ class Ask(commands.Cog):
                                 )
                                 if not task_output_ephemeral:
                                     with contextlib.suppress(Exception):
-                                        await message.channel.send(files=files_to_send)
+                                        await self._send_with_retry(
+                                            message.channel.send,
+                                            files=files_to_send,
+                                        )
                         return message
                     except Exception:
                         if files_to_send is not None:
@@ -10684,7 +10709,11 @@ class Ask(commands.Cog):
         if ctx.interaction:
             if ctx.interaction.response.is_done():
                 try:
-                    return await ctx.interaction.followup.send(**kwargs, wait=True)
+                    return await self._send_with_retry(
+                        ctx.interaction.followup.send,
+                        **kwargs,
+                        wait=True,
+                    )
                 except Exception:
                     if kwargs.get("ephemeral") is True:
                         log.warning(
@@ -10694,7 +10723,10 @@ class Ask(commands.Cog):
                         return None
                     channel = getattr(ctx, "channel", None)
                     if channel is not None:
-                        return await channel.send(**_channel_send_payload(kwargs))
+                        return await self._send_with_retry(
+                            channel.send,
+                            **_channel_send_payload(kwargs),
+                        )
                     raise
             else:
                 await ctx.interaction.response.send_message(**kwargs)
@@ -10703,9 +10735,18 @@ class Ask(commands.Cog):
             if reference is None and ctx.message:
                 reference = ctx.message.to_reference(fail_if_not_exists=False)
             try:
-                return await ctx.send(**kwargs, mention_author=False, reference=reference)
+                return await self._send_with_retry(
+                    ctx.send,
+                    **kwargs,
+                    mention_author=False,
+                    reference=reference,
+                )
             except discord.HTTPException:
-                return await ctx.send(**kwargs, mention_author=False)
+                return await self._send_with_retry(
+                    ctx.send,
+                    **kwargs,
+                    mention_author=False,
+                )
         return None
 
     @commands.command(
@@ -11471,7 +11512,7 @@ class Ask(commands.Cog):
             "Note: the bot workspace is separate from the python tool container (/mnt/data). The shell cannot read python tool files. "
             "When discord_read_attachment or browser download returns code_interpreter.path, use that /mnt/data path inside the python tool (do not use workspace paths). "
             f"{link_context_prompt}"
-            f"When you create files with the python tool, the bot will mirror up to {ASK_CONTAINER_FILE_MAX_COUNT} outputs as temporary download links (about 30 minutes) and list them under \"Generated files (30 min)\". "
+            "When you create files with the python tool, note that generated files are not listed in Discord replies. "
             "List the filenames you created and briefly describe what each contains. Do NOT invent or guess download URLs. "
             "When creating files, use clear deterministic names like output.csv, results.json, or plot.png. "
             "To reference links in your reply, use {{link:/mnt/data/filename}} (full container path) or {{links}} placeholders; the bot replaces them with real URLs. "
@@ -11689,32 +11730,8 @@ class Ask(commands.Cog):
             else:
                 answer = output_text.strip() or "(no output)"
 
-            seen = set()
-            sources_lines: list[str] = []
-            for item in all_outputs:
-                item_type = getattr(item, "type", None) if not isinstance(item, dict) else item.get("type")
-                if item_type != "web_search_call":
-                    continue
-                action = getattr(item, "action", None) if not isinstance(item, dict) else item.get("action")
-                sources = getattr(action, "sources", None) if not isinstance(action, dict) else action.get("sources")
-                sources = sources or []
-                for source in sources:
-                    url = getattr(source, "url", None) if not isinstance(source, dict) else source.get("url")
-                    if not url or url in seen:
-                        continue
-                    seen.add(url)
-                    title = getattr(source, "title", None) if not isinstance(source, dict) else source.get("title")
-                    sources_lines.append(_pretty_source(title, url, len(sources_lines) + 1))
-
-            container_files, container_notes = await self._collect_container_file_links(
-                ctx=ctx,
-                workspace_dir=workspace_dir,
-                outputs=all_outputs,
-            )
-            if container_notes:
-                skipped_notes.extend(container_notes)
             link_context_entries = self._prune_link_context(self._load_link_context(ctx))
-            answer = self._expand_link_placeholders(answer, container_files, link_context_entries)
+            answer = self._expand_link_placeholders(answer, [], link_context_entries)
 
             title_text = ""
             if structured is not None:
@@ -11770,28 +11787,6 @@ class Ask(commands.Cog):
             footer_text = " | ".join(footer_parts)
             embed.set_footer(text=_truncate_discord(footer_text, 2048))
 
-            sources_text = ""
-            sources_value = ""
-            sources_files: list[discord.File] = []
-            sources_attached = False
-            if sources_lines:
-                sources_text = "\n".join(sources_lines)
-                sources_value = sources_text
-                if len(sources_text) > 4096:
-                    sources_attached, sources_truncated = _extend_text_files(
-                        sources_files,
-                        "ask-sources.txt",
-                        sources_text,
-                        max_bytes=max_file_bytes,
-                    )
-                    if sources_attached and not sources_truncated:
-                        note = answer_note
-                    else:
-                        note = answer_truncated_note
-                    preview_limit = max(1, 4096 - (len(note) + 1))
-                    sources_preview = _truncate_discord(sources_text, preview_limit)
-                    sources_value = f"{note}\n{sources_preview}"
-
             if not answer_attached and _embed_char_count(embed) > 6000:
                 answer_attached, answer_truncated = _extend_text_files(
                     files,
@@ -11810,86 +11805,6 @@ class Ask(commands.Cog):
                     embed.description = f"{answer_note_text}{answer_preview}"
                     answer_attached = True
 
-            sources_embed = None
-            if sources_lines:
-                sources_embed = discord.Embed(
-                    title="\U0001F517 Sources",
-                    description=sources_value,
-                    color=0x5865F2,
-                )
-
-            details_embed = None
-            details_files: list[discord.File] = []
-            if structured is not None:
-                details_text = _format_ask_structured_details(structured)
-                if details_text:
-                    if len(details_text) > 4096:
-                        attached, truncated = _extend_text_files(
-                            details_files,
-                            "ask-details.txt",
-                            details_text,
-                            max_bytes=max_file_bytes,
-                        )
-                        if attached:
-                            note = "See attached ask-details.txt."
-                            if truncated:
-                                note = "See attached ask-details.txt (truncated)."
-                            details_embed = discord.Embed(
-                                title="\U0001F9FE Ask details",
-                                description=note,
-                                color=0x5865F2,
-                            )
-                    else:
-                        details_embed = discord.Embed(
-                            title="\U0001F9FE Ask details",
-                            description=details_text,
-                            color=0x5865F2,
-                        )
-
-            files_embed = None
-            if container_files:
-                file_lines = []
-                for entry in container_files:
-                    filename = str(entry.get("filename") or "output")
-                    url = str(entry.get("url") or "")
-                    path = entry.get("path")
-                    size = entry.get("size")
-                    size_label = f"{size:,} bytes" if isinstance(size, int) else "size unknown"
-                    if isinstance(path, str) and path:
-                        file_lines.append(f"- [{filename}]({url}) ({size_label}, {path})")
-                    else:
-                        file_lines.append(f"- [{filename}]({url}) ({size_label})")
-                files_text = "\n".join(file_lines)
-                if len(files_text) > 4096:
-                    attached, truncated = _extend_text_files(
-                        files,
-                        "ask-outputs.txt",
-                        files_text,
-                        max_bytes=max_file_bytes,
-                    )
-                    if attached:
-                        note = "See attached ask-outputs.txt (30 min links)."
-                        if truncated:
-                            note = "See attached ask-outputs.txt (truncated, 30 min links)."
-                        files_embed = discord.Embed(
-                            title="Generated files (30 min)",
-                            description=note,
-                            color=0x5865F2,
-                        )
-                    else:
-                        preview = _truncate_discord(files_text, 4096)
-                        files_embed = discord.Embed(
-                            title="Generated files (30 min)",
-                            description=preview,
-                            color=0x5865F2,
-                        )
-                else:
-                    files_embed = discord.Embed(
-                        title="Generated files (30 min)",
-                        description=files_text,
-                        color=0x5865F2,
-                    )
-
             trimmed = _clamp_embed_description(embed)
             if trimmed and not answer_attached:
                 note = f"{answer_truncated_note}\n\n"
@@ -11899,19 +11814,7 @@ class Ask(commands.Cog):
             reply_kwargs: dict[str, Any] = {"embed": embed}
             if files:
                 reply_kwargs["files"] = files
-            main_message = await self._reply(ctx, **reply_kwargs)
-            if sources_embed:
-                sources_kwargs: dict[str, Any] = {"embed": sources_embed}
-                if sources_files:
-                    sources_kwargs["files"] = sources_files
-                await self._reply(ctx, reference=main_message, **sources_kwargs)
-            if details_embed:
-                details_kwargs: dict[str, Any] = {"embed": details_embed}
-                if details_files:
-                    details_kwargs["files"] = details_files
-                await self._reply(ctx, reference=main_message, **details_kwargs)
-            if files_embed:
-                await self._reply(ctx, reference=main_message, embed=files_embed)
+            await self._reply(ctx, **reply_kwargs)
             run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
             for run_id in run_ids:
                 self._start_pending_ask_auto_delete(run_id)
