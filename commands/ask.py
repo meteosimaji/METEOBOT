@@ -298,11 +298,6 @@ ASK_OPERATOR_XVFB_DISPLAY_TRIES = int(os.getenv("ASK_OPERATOR_XVFB_DISPLAY_TRIES
 OPERATOR_SCREENSHOT_MIN_INTERVAL_S = float(
     os.getenv("ASK_OPERATOR_SCREENSHOT_MIN_INTERVAL_S", "0.3")
 )
-BROWSER_TRUSTED_HOST_SUFFIXES = (
-    "codeload.github.com",
-    "github.com",
-    "githubusercontent.com",
-)
 ASK_STATE_STORE_FILE = "ask_conversations.json"
 STATE_KEY_RE = re.compile(r"^\d+:\d+$")
 
@@ -3457,49 +3452,7 @@ class Ask(commands.Cog):
         parsed = urlparse(url)
         if parsed.scheme == "about" and parsed.path == "blank":
             return True
-        if (parsed.scheme or "").lower() not in {"http", "https"}:
-            return False
-        host = (parsed.hostname or "").lower()
-        if not host:
-            return False
-        if host in {"localhost"} or host.endswith(".local"):
-            return False
-        if any(
-            host == suffix or host.endswith(f".{suffix}")
-            for suffix in BROWSER_TRUSTED_HOST_SUFFIXES
-        ):
-            return True
-
-        def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-            return not (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_reserved
-                or ip.is_unspecified
-                or ip.is_multicast
-            )
-
-        try:
-            ip = ipaddress.ip_address(host)
-        except ValueError:
-            try:
-                infos = await asyncio.get_running_loop().getaddrinfo(host, None)
-            except OSError:
-                return False
-            resolved_any = False
-            for family, _, _, _, sockaddr in infos:
-                ip_str = sockaddr[0]
-                try:
-                    resolved_ip = ipaddress.ip_address(ip_str)
-                except ValueError:
-                    continue
-                resolved_any = True
-                if not _is_public_ip(resolved_ip):
-                    return False
-            return resolved_any
-
-        return _is_public_ip(ip)
+        return (parsed.scheme or "").lower() in {"http", "https"}
 
     async def _operator_url_candidates(self) -> list[str]:
         urls: list[str] = []
@@ -9148,6 +9101,14 @@ class Ask(commands.Cog):
                             else:
                                 await agent.page.locator(selector).click()
                         download = await download_info.value
+                        dl_url = getattr(download, "url", "") or ""
+                        if dl_url and not await self._is_safe_browser_url(str(dl_url)):
+                            await self._close_browser_for_ctx(ctx)
+                            return {
+                                "ok": False,
+                                "error": "unsafe_redirect",
+                                "reason": f"Download URL ended on a blocked host: {dl_url}",
+                            }
                     except Exception as exc:
                         return {
                             "ok": False,
@@ -9320,14 +9281,18 @@ class Ask(commands.Cog):
                                 ),
                             }
                         observation = await agent.observe()
-                        if not await self._is_safe_browser_url(observation.url):
+                        observed_url = getattr(observation, "url", "") or ""
+                        parsed = urlparse(str(observed_url))
+                        if parsed.scheme in {"http", "https"} and not await self._is_safe_browser_url(
+                            str(observed_url)
+                        ):
                             await self._close_browser_for_ctx(ctx)
                             return {
                                 "ok": False,
                                 "error": "unsafe_redirect",
                                 "reason": (
                                     "Navigation ended on a blocked host: "
-                                    f"{observation.url or 'unknown'}"
+                                    f"{observed_url or 'unknown'}"
                                 ),
                             }
                         upload_path = stored_original_path or dest_path
