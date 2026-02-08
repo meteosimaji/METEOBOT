@@ -48,6 +48,7 @@ from PIL import Image as PILImage, ImageOps, ImageDraw, ImageFont, UnidentifiedI
 from PIL.Image import Image as PILImageType
 from pptx import Presentation
 from pypdf import PdfReader
+from playwright.async_api import Error as PlaywrightError
 
 from commands._browser_agent import BrowserAgent, BrowserObservation, MAX_REF_ENTRIES
 from taskman import TaskManager, TaskSpec, TaskStore
@@ -8961,6 +8962,12 @@ class Ask(commands.Cog):
                     value = action_obj.get(key)
                     return value if isinstance(value, str) else ""
 
+                def _is_download_starting_error(exc: Exception) -> bool:
+                    if not isinstance(exc, PlaywrightError):
+                        return False
+                    message = str(exc).lower()
+                    return "page.goto" in message and "download is starting" in message
+
                 arg_cdp_url = str(args.get("cdp_url") or "").strip() or None
                 env_cdp_url = (os.getenv("ASK_BROWSER_CDP_URL") or "").strip() or None
                 cdp_url = env_cdp_url or arg_cdp_url
@@ -9101,7 +9108,11 @@ class Ask(commands.Cog):
                     try:
                         async with agent.page.expect_download(timeout=15_000) as download_info:
                             if url:
-                                await agent.page.goto(url)
+                                try:
+                                    await agent.page.goto(url)
+                                except Exception as exc:
+                                    if not _is_download_starting_error(exc):
+                                        raise
                             else:
                                 await agent.page.locator(selector).click()
                         download = await download_info.value
