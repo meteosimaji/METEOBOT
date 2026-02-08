@@ -11,6 +11,7 @@ import json
 import hashlib
 import hmac
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -9123,7 +9124,14 @@ class Ask(commands.Cog):
                             "reason": f"{type(exc).__name__}: {exc}",
                         }
                     with tempfile.TemporaryDirectory(prefix="ask_download_") as tmp_dir:
-                        filename = download.suggested_filename or "download"
+                        raw_name = str(download.suggested_filename or "download").strip()
+                        raw_name = raw_name.replace("\\", "/")
+                        safe_filename = Path(raw_name).name
+                        filename = (
+                            safe_filename
+                            if safe_filename and safe_filename not in {".", ".."}
+                            else "download"
+                        )
                         dest_path = Path(tmp_dir) / filename
                         await download.save_as(dest_path)
                         size = dest_path.stat().st_size
@@ -9133,7 +9141,18 @@ class Ask(commands.Cog):
                                 "error": "too_large",
                                 "reason": f"Download exceeds {MAX_ATTACHMENT_DOWNLOAD_BYTES} bytes.",
                             }
-                        content_type = (download.mime_type or "").split(";", 1)[0].lower()
+                        mime = getattr(download, "mime_type", None)
+                        if isinstance(mime, str) and mime:
+                            content_type = mime.split(";", 1)[0].lower()
+                        else:
+                            guessed, _ = mimetypes.guess_type(filename)
+                            if not guessed:
+                                download_url = getattr(download, "url", "")
+                                if isinstance(download_url, str) and download_url:
+                                    url_path = urlparse(download_url).path
+                                    if url_path:
+                                        guessed, _ = mimetypes.guess_type(url_path)
+                            content_type = (guessed or "").split(";", 1)[0].lower()
                         try:
                             loop = asyncio.get_running_loop()
                             full_max_chars = max(
