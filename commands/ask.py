@@ -2842,6 +2842,8 @@ class Ask(commands.Cog):
         self._ask_queue_by_channel: dict[str, deque[QueuedAskRequest]] = {}
         self._ask_queue_workers: dict[str, asyncio.Task] = {}
         self._ask_queue_pause_until: dict[str, datetime] = {}
+        self._ask_workspace_by_state: dict[str, Path] = {}
+        self._ci_container_by_state: dict[str, str] = {}
         self._http_session: aiohttp.ClientSession | None = None
         self._attachment_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ask_attach")
         self._browser_by_channel: dict[str, BrowserAgent] = {}
@@ -3534,6 +3536,7 @@ class Ask(commands.Cog):
         app = web.Application()
         app.router.add_get("/operator/{token}", self._operator_handle_index)
         app.router.add_get("/operator/{token}/state", self._operator_handle_state)
+        app.router.add_get("/operator/{token}/downloads", self._operator_handle_downloads)
         app.router.add_get("/operator/{token}/screenshot", self._operator_handle_screenshot)
         app.router.add_post("/operator/{token}/action", self._operator_handle_action)
         app.router.add_post("/operator/{token}/mode", self._operator_handle_mode)
@@ -4031,6 +4034,86 @@ class Ask(commands.Cog):
             }
         )
 
+    async def _operator_handle_downloads(self, request: web.Request) -> web.Response:
+        token = request.match_info.get("token", "")
+        session = self._get_operator_session(token)
+        if session is None:
+            raise web.HTTPNotFound(text="Operator session expired or invalid.")
+        state_key = session.state_key
+        workspace_dir = self._ask_workspace_by_state.get(state_key)
+        if workspace_dir is None:
+            return web.json_response({"ok": True, "downloads": []})
+        manifest = self._load_ask_workspace_manifest(workspace_dir)
+        downloads = manifest.get("downloads")
+        if not isinstance(downloads, list):
+            return web.json_response({"ok": True, "downloads": []})
+        entries: list[dict[str, Any]] = []
+        manifest_updated = False
+        now = datetime.now(timezone.utc)
+        workspace_root = workspace_dir.resolve()
+        for entry in downloads:
+            if not isinstance(entry, dict):
+                continue
+            filename = str(entry.get("filename") or "download")
+            rel_path = entry.get("original_path")
+            if not isinstance(rel_path, str) or not rel_path:
+                rel_path = entry.get("path")
+            download_url = entry.get("download_url") if isinstance(entry.get("download_url"), str) else None
+            download_expires_at = (
+                entry.get("download_expires_at")
+                if isinstance(entry.get("download_expires_at"), str)
+                else None
+            )
+            path = None
+            if isinstance(rel_path, str) and rel_path:
+                candidate = Path(rel_path)
+                if candidate.is_absolute():
+                    continue
+                path = (self._repo_root / rel_path).resolve()
+                try:
+                    path.relative_to(workspace_root)
+                except ValueError:
+                    continue
+            else:
+                download_url = None
+                download_expires_at = None
+            valid_link = False
+            if download_url and download_expires_at:
+                with contextlib.suppress(ValueError):
+                    if datetime.fromisoformat(download_expires_at) > now:
+                        valid_link = True
+            if not valid_link and path and path.is_file():
+                link = await self.register_download(
+                    path,
+                    filename=filename,
+                    expires_s=ASK_CONTAINER_FILE_LINK_TTL_S,
+                    keep_file=True,
+                )
+                if link:
+                    download_url = link
+                    download_expires_at = (
+                        now + timedelta(seconds=ASK_CONTAINER_FILE_LINK_TTL_S)
+                    ).isoformat()
+                    entry["download_url"] = download_url
+                    entry["download_expires_at"] = download_expires_at
+                    manifest_updated = True
+            entries.append(
+                {
+                    "filename": filename,
+                    "size": entry.get("size"),
+                    "content_type": entry.get("content_type"),
+                    "source": entry.get("source"),
+                    "stored_at": entry.get("stored_at"),
+                    "download_url": download_url,
+                    "download_expires_at": download_expires_at,
+                }
+            )
+        if manifest_updated:
+            manifest["downloads"] = downloads
+            manifest["updated_at"] = now.isoformat()
+            self._write_ask_workspace_manifest(workspace_dir, manifest)
+        return web.json_response({"ok": True, "downloads": entries})
+
     async def _operator_handle_screenshot(self, request: web.Request) -> web.Response:
         token = request.match_info.get("token", "")
         session = self._get_operator_session(token)
@@ -4501,6 +4584,13 @@ class Ask(commands.Cog):
           </div>
         </div>
         <div>
+          <label>Downloads</label>
+          <div class="row" style="margin-bottom: 6px;">
+            <button class="secondary" id="downloadsRefreshBtn">Refresh downloads</button>
+          </div>
+          <div class="meta meta-scroll" id="downloadsList">No downloads yet.</div>
+        </div>
+        <div>
           <label>Role actions</label>
           <div class="row">
             <input id="roleInput" placeholder="Role (e.g. button)" />
@@ -4565,6 +4655,8 @@ class Ask(commands.Cog):
       const refreshLabel = document.getElementById("refreshLabel");
       const fpsLabel = document.getElementById("fpsLabel");
       const fastRefreshBtn = document.getElementById("fastRefreshBtn");
+      const downloadsRefreshBtn = document.getElementById("downloadsRefreshBtn");
+      const downloadsList = document.getElementById("downloadsList");
       let lastScreenUrl = null;
       let autoRefresh = false;
       let autoRefreshTimer = null;
@@ -4684,6 +4776,46 @@ class Ask(commands.Cog):
           }}
         }}
         lastFrameAt = now;
+      }}
+
+      function renderDownloads(items) {{
+        if (!downloadsList) return;
+        if (!Array.isArray(items) || items.length === 0) {{
+          downloadsList.textContent = "No downloads yet.";
+          return;
+        }}
+        downloadsList.innerHTML = "";
+        for (const entry of items) {{
+          const row = document.createElement("div");
+          const filename = entry?.filename || "download";
+          const size = typeof entry?.size === "number" ? `${{entry.size}} bytes` : "size unknown";
+          const expires = entry?.download_expires_at ? ` (expires ${{entry.download_expires_at}})` : "";
+          if (entry?.download_url) {{
+            const link = document.createElement("a");
+            link.className = "link";
+            link.href = entry.download_url;
+            link.target = "_blank";
+            link.rel = "noreferrer";
+            link.textContent = filename;
+            row.appendChild(link);
+          }} else {{
+            row.textContent = filename;
+          }}
+          const meta = document.createElement("span");
+          meta.textContent = ` — ${{size}}${{entry?.download_url ? expires : " (link unavailable)"}}`;
+          row.appendChild(meta);
+          downloadsList.appendChild(row);
+        }}
+      }}
+
+      async function refreshDownloads() {{
+        if (!downloadsList) return;
+        try {{
+          const response = await api("downloads");
+          renderDownloads(response?.downloads || []);
+        }} catch (err) {{
+          downloadsList.textContent = `Failed to load downloads: ${{err.message || err}}`;
+        }}
       }}
 
       function resolveDesiredHeadless() {{
@@ -5233,9 +5365,15 @@ class Ask(commands.Cog):
           refreshTabs({{ preserveSelection: false }});
         }});
       }}
+      if (downloadsRefreshBtn) {{
+        downloadsRefreshBtn.addEventListener("click", () => {{
+          refreshDownloads();
+        }});
+      }}
 
       refreshTabs({{ preserveSelection: true }});
       refreshScreenshot();
+      refreshDownloads();
     </script>
   </body>
 </html>
@@ -6661,6 +6799,126 @@ class Ask(commands.Cog):
             return None, None
         return size, content_type
 
+    async def _create_ci_container(self, *, state_key: str) -> str | None:
+        if not self._openai_token:
+            return None
+        session = await self._get_http_session()
+        url = "https://api.openai.com/v1/containers"
+        headers = {
+            "Authorization": f"Bearer {self._openai_token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "name": f"ask-{state_key}",
+            "memory_limit": "4g",
+        }
+        try:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if not 200 <= resp.status < 300:
+                    log.warning("Container create failed: status=%s", resp.status)
+                    return None
+                data = await resp.json()
+        except Exception:
+            log.exception("Container create failed")
+            return None
+        container_id = data.get("id") if isinstance(data, dict) else None
+        if isinstance(container_id, str) and container_id:
+            return container_id
+        return None
+
+    async def _retrieve_ci_container(self, container_id: str) -> bool:
+        if not self._openai_token:
+            return False
+        session = await self._get_http_session()
+        url = f"https://api.openai.com/v1/containers/{container_id}"
+        headers = {"Authorization": f"Bearer {self._openai_token}"}
+        try:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    return True
+                if resp.status in {404, 410}:
+                    return False
+                log.warning("Container retrieve failed: status=%s", resp.status)
+                return False
+        except Exception:
+            log.exception("Container retrieve failed: container_id=%s", container_id)
+            return False
+
+    async def _ensure_ci_container(self, state_key: str) -> str | None:
+        cached = self._ci_container_by_state.get(state_key)
+        if cached and await self._retrieve_ci_container(cached):
+            return cached
+        container_id = await self._create_ci_container(state_key=state_key)
+        if container_id:
+            self._ci_container_by_state[state_key] = container_id
+        return container_id
+
+    async def _upload_container_file(
+        self,
+        *,
+        container_id: str,
+        file_path: Path,
+        filename: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if not self._openai_token:
+            return None, "OPENAI_TOKEN missing."
+        try:
+            size = file_path.stat().st_size
+        except OSError:
+            return None, "Failed to read file size."
+        if size > ASK_CONTAINER_FILE_MAX_BYTES:
+            return None, f"File exceeds {ASK_CONTAINER_FILE_MAX_BYTES} bytes."
+        session = await self._get_http_session()
+        url = f"https://api.openai.com/v1/containers/{container_id}/files"
+        headers = {"Authorization": f"Bearer {self._openai_token}"}
+        form = aiohttp.FormData()
+        try:
+            with file_path.open("rb") as fh:
+                form.add_field("file", fh, filename=filename)
+                async with session.post(url, headers=headers, data=form) as resp:
+                    if not 200 <= resp.status < 300:
+                        log.warning(
+                            "Container file upload failed: status=%s container_id=%s",
+                            resp.status,
+                            container_id,
+                        )
+                        return None, f"Upload failed (HTTP {resp.status})."
+                    data = await resp.json()
+        except Exception:
+            log.exception("Container file upload failed: container_id=%s", container_id)
+            return None, "Upload failed."
+        if not isinstance(data, dict):
+            return None, "Upload response missing data."
+        file_id = data.get("id")
+        path = data.get("path")
+        if not isinstance(file_id, str) or not isinstance(path, str):
+            return None, "Upload response missing file id/path."
+        return {
+            "container_id": container_id,
+            "file_id": file_id,
+            "path": path,
+            "bytes": data.get("bytes") if isinstance(data.get("bytes"), int) else size,
+            "filename": filename,
+        }, None
+
+    async def _upload_workspace_file_to_container(
+        self,
+        *,
+        ctx: commands.Context,
+        file_path: Path,
+        filename: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        raw_state_key = self._state_key(ctx)
+        shared_state_key = self._resolve_state_key(raw_state_key)
+        container_id = await self._ensure_ci_container(shared_state_key)
+        if not container_id:
+            return None, "Container unavailable."
+        return await self._upload_container_file(
+            container_id=container_id,
+            file_path=file_path,
+            filename=filename,
+        )
+
     async def _collect_container_file_links(
         self,
         *,
@@ -6682,7 +6940,7 @@ class Ask(commands.Cog):
                     if not isinstance(file_id, str) or not file_id:
                         continue
                     source = item.get("source")
-                    if isinstance(source, str) and source not in {"assistant", "userassistant"}:
+                    if isinstance(source, str) and source not in {"assistant", "user", "userassistant"}:
                         continue
                     path = item.get("path")
                     filename = Path(path).name if isinstance(path, str) else file_id
@@ -8543,6 +8801,22 @@ class Ask(commands.Cog):
                         total_chars = cached_entry.get("text_chars")
                         total_chars = total_chars if isinstance(total_chars, int) else len(preview)
                         truncated = total_chars > len(preview)
+                        code_interpreter = None
+                        code_interpreter_error = None
+                        rel_original = cached_entry.get("original_path")
+                        if isinstance(rel_original, str) and rel_original:
+                            original_path = Path(rel_original)
+                            if not original_path.is_absolute():
+                                original_path = self._repo_root / original_path
+                            if original_path.exists():
+                                (
+                                    code_interpreter,
+                                    code_interpreter_error,
+                                ) = await self._upload_workspace_file_to_container(
+                                    ctx=ctx,
+                                    file_path=original_path,
+                                    filename=str(cached_entry.get("filename") or record.filename),
+                                )
                         return {
                             "ok": True,
                             "text": preview,
@@ -8554,6 +8828,8 @@ class Ask(commands.Cog):
                                 "run_id": manifest.get("run_id"),
                                 "text_path": str(text_path.relative_to(self._repo_root)),
                             },
+                            "code_interpreter": code_interpreter,
+                            "code_interpreter_error": code_interpreter_error,
                         }
             with tempfile.TemporaryDirectory(prefix="ask_read_") as tmp_dir:
                 dest_dir = Path(tmp_dir)
@@ -8660,6 +8936,19 @@ class Ask(commands.Cog):
                     ),
                 }
                 extracted["cached"] = False
+                upload_path = stored_original_path or downloaded_path
+                code_interpreter = None
+                code_interpreter_error = None
+                if upload_path and upload_path.exists():
+                    code_interpreter, code_interpreter_error = (
+                        await self._upload_workspace_file_to_container(
+                            ctx=ctx,
+                            file_path=upload_path,
+                            filename=record.filename,
+                        )
+                    )
+                extracted["code_interpreter"] = code_interpreter
+                extracted["code_interpreter_error"] = code_interpreter_error
                 return extracted
 
         if name == "browser":
@@ -8859,6 +9148,7 @@ class Ask(commands.Cog):
                                 "reason": "Attachment extraction timed out; background work may still be running.",
                             }
                         workspace_dir = self._ensure_ask_workspace(ctx)
+                        self._ask_workspace_by_state[self._state_key(ctx)] = workspace_dir
                         manifest = self._load_ask_workspace_manifest(workspace_dir)
                         sha256 = self._hash_file(
                             dest_path,
@@ -8920,6 +9210,36 @@ class Ask(commands.Cog):
                                 stored_original_path = self._repo_root / rel_original_path
                             if extracted.get("ok"):
                                 extracted_text = str(extracted.get("text") or "")
+                        download_url = None
+                        download_expires_at = None
+                        download_path = None
+                        if stored_original_path and stored_original_path.exists():
+                            download_path = stored_original_path
+                        elif existing_entry is not None:
+                            rel_path = existing_entry.get("original_path")
+                            if isinstance(rel_path, str) and rel_path:
+                                candidate = self._repo_root / rel_path
+                                if candidate.exists():
+                                    download_path = candidate
+                        if download_path is not None:
+                            link = await self.register_download(
+                                download_path,
+                                filename=filename,
+                                expires_s=ASK_CONTAINER_FILE_LINK_TTL_S,
+                                keep_file=True,
+                            )
+                            if link:
+                                download_url = link
+                                download_expires_at = (
+                                    datetime.now(timezone.utc)
+                                    + timedelta(seconds=ASK_CONTAINER_FILE_LINK_TTL_S)
+                                ).isoformat()
+                                if existing_entry is not None:
+                                    existing_entry["download_url"] = link
+                                    existing_entry["download_expires_at"] = download_expires_at
+                                elif downloads:
+                                    downloads[-1]["download_url"] = link
+                                    downloads[-1]["download_expires_at"] = download_expires_at
                         manifest["downloads"] = downloads
                         manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
                         self._write_ask_workspace_manifest(workspace_dir, manifest)
@@ -8946,15 +9266,30 @@ class Ask(commands.Cog):
                                 "error": "unsafe_redirect",
                                 "reason": "Navigation ended on a blocked host.",
                             }
+                        upload_path = stored_original_path or dest_path
+                        code_interpreter = None
+                        code_interpreter_error = None
+                        if upload_path and upload_path.exists():
+                            code_interpreter, code_interpreter_error = (
+                                await self._upload_workspace_file_to_container(
+                                    ctx=ctx,
+                                    file_path=upload_path,
+                                    filename=filename,
+                                )
+                            )
                         return {
                             "ok": True,
                             "download": {
                                 "filename": filename,
                                 "size": size,
                                 "content_type": content_type,
+                                "url": download_url,
+                                "expires_at": download_expires_at,
                             },
                             "extract": extracted,
                             "observation": observation.to_dict(),
+                            "code_interpreter": code_interpreter,
+                            "code_interpreter_error": code_interpreter_error,
                         }
                 if action_type == "content":
                     try:
@@ -10749,6 +11084,8 @@ class Ask(commands.Cog):
             async with self._get_ctx_lock(ctx):
                 await self._clear_ask_queue(raw_state_key)
                 await self._close_browser_for_ctx_key(raw_state_key)
+                self._ask_workspace_by_state.pop(raw_state_key, None)
+                self._ci_container_by_state.pop(state_key, None)
                 self._set_browser_prefer_cdp(ctx, False)
                 profile_dir = self._browser_profile_path(raw_state_key)
                 profile_removed = False
@@ -10931,6 +11268,10 @@ class Ask(commands.Cog):
             return
 
         workspace_dir = self._ensure_ask_workspace(ctx)
+        self._ask_workspace_by_state[raw_state_key] = workspace_dir
+        container_id: str | None = None
+        if action == "ask":
+            container_id = await self._ensure_ci_container(state_key)
         try:
             workspace_rel = workspace_dir.relative_to(self._repo_root)
         except ValueError:
@@ -10995,6 +11336,7 @@ class Ask(commands.Cog):
             f"The ask workspace for this run lives at `{workspace_rel}` inside the repo. "
             "Attachments and downloads are saved there with full extracted text files plus manifest.json. "
             "Note: the bot workspace is separate from the python tool container (/mnt/data). The shell cannot read python tool files. "
+            "When discord_read_attachment or browser download returns code_interpreter.path, use that /mnt/data path inside the python tool (do not use workspace paths). "
             f"{link_context_prompt}"
             f"When you create files with the python tool, the bot will mirror up to {ASK_CONTAINER_FILE_MAX_COUNT} outputs as temporary download links (about 30 minutes) and list them under \"Generated files (30 min)\". "
             "List the filenames you created and briefly describe what each contains. Do NOT invent or guess download URLs. "
@@ -11095,9 +11437,14 @@ class Ask(commands.Cog):
             " seconds:12 or size:720x1280 in arg. Allowed values: seconds=4|8|12, size=720x1280|1280x720."
         )
 
+        container_config: dict[str, Any] | str
+        if container_id:
+            container_config = container_id
+        else:
+            container_config = {"type": "auto", "memory_limit": "4g"}
         tools = [
             {"type": "web_search"},
-            {"type": "code_interpreter", "container": {"type": "auto", "memory_limit": "4g"}},
+            {"type": "code_interpreter", "container": container_config},
             {"type": "shell"},
             *self._build_bot_tools(),
             *self._build_browser_tools(),
