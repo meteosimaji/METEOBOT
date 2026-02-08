@@ -20,6 +20,7 @@ from playwright.async_api import (
     Browser,
     BrowserContext,
     Frame,
+    Locator,
     Page,
     Playwright,
     TimeoutError as PlaywrightTimeoutError,
@@ -1328,6 +1329,21 @@ class BrowserAgent:
             return text
         return text[: max(0, limit - 1)] + "…"
 
+    async def _resolve_role_locator(self, page: Page, role: str, name: str | None) -> Locator:
+        if not name:
+            return page.get_by_role(role)
+        locator_exact = page.get_by_role(role, name=str(name), exact=True)
+        exact_count = await locator_exact.count()
+        if exact_count == 1:
+            return locator_exact
+        if exact_count > 1:
+            return locator_exact.first
+        locator = page.get_by_role(role, name=str(name))
+        count = await locator.count()
+        if count >= 1:
+            return locator.first
+        return locator
+
     async def act(self, action: dict[str, Any]) -> dict[str, Any]:
         page = self._page
         if page is None:
@@ -1380,7 +1396,7 @@ class BrowserAgent:
             elif action_type == "click_role":
                 role = str(action["role"])
                 name = action.get("name")
-                locator = page.get_by_role(role, name=str(name) if name else None)
+                locator = await self._resolve_role_locator(page, role, str(name) if name else None)
                 with contextlib.suppress(Exception):
                     await locator.scroll_into_view_if_needed(timeout=5_000)
                 try:
@@ -1523,7 +1539,8 @@ class BrowserAgent:
             elif action_type == "fill_role":
                 role = str(action["role"])
                 name = action.get("name")
-                await page.get_by_role(role, name=str(name) if name else None).fill(
+                locator = await self._resolve_role_locator(page, role, str(name) if name else None)
+                await locator.fill(
                     str(action.get("text", ""))
                 )
                 self._record_action(
