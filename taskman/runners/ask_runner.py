@@ -91,7 +91,10 @@ class AskRunner:
         response_id = runner_state.get("openai_response_id") or runner_state.get(
             "previous_response_id"
         )
-        if not response_id:
+        use_background = False
+        if isinstance(ctx.task.request, dict):
+            use_background = ctx.task.request.get("background") is True
+        if not response_id or not use_background:
             return TaskResult(status="cancelled", result={"cancelled": True})
         client = getattr(self._ask, "client", None)
         if client is None:
