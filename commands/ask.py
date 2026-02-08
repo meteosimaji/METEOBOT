@@ -1506,10 +1506,20 @@ def _ask_structured_output_cfg() -> dict[str, Any]:
 
 
 def _parse_ask_structured_output(raw_text: str) -> dict[str, Any] | None:
+    parsed = None
     try:
         parsed = json.loads(raw_text)
     except Exception:
-        return None
+        raw_text = raw_text.strip()
+        start = raw_text.find("{")
+        end = raw_text.rfind("}")
+        if 0 <= start < end:
+            try:
+                parsed = json.loads(raw_text[start : end + 1])
+            except Exception:
+                return None
+        else:
+            return None
     if not isinstance(parsed, dict):
         return None
 
@@ -1555,6 +1565,44 @@ def _parse_ask_structured_output(raw_text: str) -> dict[str, Any] | None:
     }
 
 
+def _format_ask_structured_details(structured: dict[str, Any]) -> str:
+    sections: list[str] = []
+
+    reasoning_summary = structured.get("reasoning_summary") or []
+    if isinstance(reasoning_summary, list):
+        if reasoning_summary:
+            summary_lines = "\n".join(f"- {item}" for item in reasoning_summary)
+        else:
+            summary_lines = "- (none)"
+        sections.append("## Reasoning summary\n" + summary_lines)
+
+    tool_timeline = structured.get("tool_timeline") or []
+    if isinstance(tool_timeline, list):
+        if tool_timeline:
+            timeline_lines = "\n".join(
+                f"- {item.get('tool', '')}: {item.get('summary', '')}".strip()
+                for item in tool_timeline
+                if isinstance(item, dict)
+            )
+        else:
+            timeline_lines = "- (none)"
+        sections.append("## Tool timeline\n" + timeline_lines)
+
+    artifacts = structured.get("artifacts") or []
+    if isinstance(artifacts, list):
+        if artifacts:
+            artifact_lines = "\n".join(
+                f"- {item.get('name', '')} ({item.get('kind', '')}): {item.get('value', '')}".strip()
+                for item in artifacts
+                if isinstance(item, dict)
+            )
+        else:
+            artifact_lines = "- (none)"
+        sections.append("## Artifacts\n" + artifact_lines)
+
+    return "\n\n".join(section for section in sections if section)
+
+
 def _extract_response_refusal(resp: Any) -> str | None:
     outputs = getattr(resp, "output", []) or []
     for item in outputs:
@@ -1571,6 +1619,29 @@ def _extract_response_refusal(resp: Any) -> str | None:
             if isinstance(refusal, str) and refusal.strip():
                 return refusal.strip()
     return None
+
+
+def _extract_response_text(resp: Any) -> str:
+    output_text = getattr(resp, "output_text", "") or ""
+    if output_text:
+        return output_text
+    outputs = getattr(resp, "output", []) or []
+    parts: list[str] = []
+    for item in outputs:
+        item_type = getattr(item, "type", None) if not isinstance(item, dict) else item.get("type")
+        if item_type != "message":
+            continue
+        content = getattr(item, "content", None) if not isinstance(item, dict) else item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            part_type = getattr(part, "type", None) if not isinstance(part, dict) else part.get("type")
+            if part_type not in {"output_text", "text"}:
+                continue
+            text = getattr(part, "text", None) if not isinstance(part, dict) else part.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts)
 
 
 def _question_preview(text: str, limit: int = 15) -> str:
@@ -11593,11 +11664,26 @@ class Ask(commands.Cog):
             except Exception:
                 pass
 
-            output_text = getattr(resp, "output_text", "") or ""
-            structured = _parse_ask_structured_output(output_text)
+            status = getattr(resp, "status", None)
+            incomplete_reason = ""
+            if status == "incomplete":
+                incomplete = getattr(resp, "incomplete_details", None)
+                incomplete_reason = (
+                    getattr(incomplete, "reason", None)
+                    or (str(incomplete) if incomplete else "")
+                )
+            output_text = _extract_response_text(resp)
+            structured = None if incomplete_reason else _parse_ask_structured_output(output_text)
             refusal = _extract_response_refusal(resp)
             if refusal:
                 answer = refusal
+            elif incomplete_reason:
+                note = f"⚠️ Response incomplete"
+                if incomplete_reason:
+                    note = f"{note} ({incomplete_reason})"
+                answer = note
+                if output_text.strip():
+                    answer = f"{answer}\n\n{output_text.strip()}"
             elif structured is not None:
                 answer = (structured.get("answer") or "").strip() or "(no output)"
             else:
@@ -11732,6 +11818,34 @@ class Ask(commands.Cog):
                     color=0x5865F2,
                 )
 
+            details_embed = None
+            details_files: list[discord.File] = []
+            if structured is not None:
+                details_text = _format_ask_structured_details(structured)
+                if details_text:
+                    if len(details_text) > 4096:
+                        attached, truncated = _extend_text_files(
+                            details_files,
+                            "ask-details.txt",
+                            details_text,
+                            max_bytes=max_file_bytes,
+                        )
+                        if attached:
+                            note = "See attached ask-details.txt."
+                            if truncated:
+                                note = "See attached ask-details.txt (truncated)."
+                            details_embed = discord.Embed(
+                                title="\U0001F9FE Ask details",
+                                description=note,
+                                color=0x5865F2,
+                            )
+                    else:
+                        details_embed = discord.Embed(
+                            title="\U0001F9FE Ask details",
+                            description=details_text,
+                            color=0x5865F2,
+                        )
+
             files_embed = None
             if container_files:
                 file_lines = []
@@ -11791,6 +11905,11 @@ class Ask(commands.Cog):
                 if sources_files:
                     sources_kwargs["files"] = sources_files
                 await self._reply(ctx, reference=main_message, **sources_kwargs)
+            if details_embed:
+                details_kwargs: dict[str, Any] = {"embed": details_embed}
+                if details_files:
+                    details_kwargs["files"] = details_files
+                await self._reply(ctx, reference=main_message, **details_kwargs)
             if files_embed:
                 await self._reply(ctx, reference=main_message, embed=files_embed)
             run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
