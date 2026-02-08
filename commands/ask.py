@@ -6616,10 +6616,20 @@ class Ask(commands.Cog):
         if not text:
             return text
         link_map: dict[str, str] = {}
+        placeholder_keys: list[str] = []
 
         def add_link_key(key: Any, url: Any) -> None:
             if isinstance(key, str) and isinstance(url, str):
-                link_map.setdefault(key, url)
+                existing = link_map.get(key)
+                if existing is not None and existing != url:
+                    log.warning(
+                        "Link placeholder key collision for %s; keeping %s over %s",
+                        key,
+                        existing,
+                        url,
+                    )
+                    return
+                link_map[key] = url
 
         def add_entry(entry: dict[str, Any]) -> None:
             filename = entry.get("filename")
@@ -6628,7 +6638,11 @@ class Ask(commands.Cog):
             add_link_key(entry.get("path"), url)
             add_link_key(entry.get("id"), url)
             if isinstance(filename, str):
-                add_link_key(Path(filename).name, url)
+                basename = Path(filename).name
+                add_link_key(basename, url)
+                add_link_key(f"/mnt/data/{basename}", url)
+                if filename.startswith("/mnt/data/"):
+                    add_link_key(filename, url)
 
         for entry in entries:
             add_entry(entry)
@@ -6637,6 +6651,7 @@ class Ask(commands.Cog):
 
         def replace_single(match: re.Match[str]) -> str:
             name = match.group(1).strip()
+            placeholder_keys.append(name)
             return link_map.get(name, match.group(0))
 
         text = re.sub(r"\{\{link:([^}]+)\}\}", replace_single, text)
@@ -6646,6 +6661,12 @@ class Ask(commands.Cog):
             else:
                 block = "(no links)"
             text = text.replace("{{links}}", block)
+        if placeholder_keys:
+            log.debug(
+                "Link placeholder expansion: keys=%s resolved=%s",
+                placeholder_keys,
+                [key for key in placeholder_keys if key in link_map],
+            )
         return text
 
     @staticmethod
@@ -9307,6 +9328,36 @@ class Ask(commands.Cog):
                                     filename=filename,
                                 )
                             )
+                        if download_url and isinstance(code_interpreter, dict):
+                            container_path = code_interpreter.get("path")
+                            if isinstance(container_path, str) and container_path:
+                                link_context_entries = self._prune_link_context(
+                                    self._load_link_context(ctx)
+                                )
+                                link_id = self._next_link_context_id(link_context_entries)
+                                created_at = datetime.now(timezone.utc)
+                                link_expires_at = download_expires_at or (
+                                    created_at
+                                    + timedelta(seconds=ASK_CONTAINER_FILE_LINK_TTL_S)
+                                ).isoformat()
+                                link_context_entries.append(
+                                    {
+                                        "id": link_id,
+                                        "created_at": created_at.isoformat(),
+                                        "url": download_url,
+                                        "filename": filename,
+                                        "path": container_path,
+                                        "bytes": size,
+                                        "content_type": content_type,
+                                        "source": "browser_download",
+                                        "link_expires_at": link_expires_at,
+                                        "file_expires_at": link_expires_at,
+                                        "note": manifest.get("run_id"),
+                                    }
+                                )
+                                self._write_link_context(
+                                    ctx, self._prune_link_context(link_context_entries)
+                                )
                         return {
                             "ok": True,
                             "download": {
