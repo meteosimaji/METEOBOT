@@ -299,6 +299,7 @@ OPERATOR_SCREENSHOT_MIN_INTERVAL_S = float(
     os.getenv("ASK_OPERATOR_SCREENSHOT_MIN_INTERVAL_S", "0.3")
 )
 BROWSER_TRUSTED_HOST_SUFFIXES = (
+    "codeload.github.com",
     "github.com",
     "githubusercontent.com",
 )
