@@ -8708,6 +8708,98 @@ class Ask(commands.Cog):
             return f"https://discord.com/channels/{ref.guild_id}/{ref.channel_id}/{ref.message_id}"
         return None
 
+    def _extract_prompt_from_message(
+        self,
+        ctx: commands.Context,
+        message: discord.Message,
+        *,
+        fallback_text: str | None,
+    ) -> str | None:
+        content = (message.content or "").strip()
+        if not content:
+            return fallback_text
+
+        command = getattr(ctx, "command", None)
+        if command is None:
+            if not self.bot.user:
+                return fallback_text
+            bot_id = self.bot.user.id
+            mention_prefix = re.compile(rf"^\s*<@!?{bot_id}>\s*")
+            match = mention_prefix.match(content)
+            if match:
+                return content[match.end() :].strip()
+
+            ref = message.reference
+            resolved = getattr(ref, "resolved", None)
+            if isinstance(resolved, discord.Message) and resolved.author:
+                if resolved.author.id == bot_id:
+                    return content
+            return fallback_text
+
+        prefix = getattr(ctx, "prefix", None) or ""
+        invoked = getattr(ctx, "invoked_with", None) or getattr(command, "name", "")
+        if prefix and invoked:
+            pattern = rf"^\s*{re.escape(prefix)}{re.escape(invoked)}\s*"
+            match = re.match(pattern, content)
+            if match:
+                return content[match.end() :].strip()
+        return fallback_text
+
+    def _escape_diff_fragment(self, text: str) -> str:
+        return text.replace("*", "\\*")
+
+    def _format_bold_diff(self, original: str, updated: str) -> tuple[str, str]:
+        matcher = difflib.SequenceMatcher(None, original, updated)
+        original_parts: list[str] = []
+        updated_parts: list[str] = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                original_parts.append(self._escape_diff_fragment(original[i1:i2]))
+                updated_parts.append(self._escape_diff_fragment(updated[j1:j2]))
+                continue
+            if tag in {"replace", "delete"}:
+                segment = self._escape_diff_fragment(original[i1:i2])
+                if segment:
+                    original_parts.append(f"**{segment}**")
+            if tag in {"replace", "insert"}:
+                segment = self._escape_diff_fragment(updated[j1:j2])
+                if segment:
+                    updated_parts.append(f"**{segment}**")
+        return "".join(original_parts), "".join(updated_parts)
+
+    def _format_edit_notice(
+        self,
+        original: str,
+        updated: str,
+        *,
+        max_chars: int = 800,
+        diff_guard: int = 400,
+    ) -> str:
+        if not original:
+            return _truncate_discord(
+                f"The user edited their message.\n{updated}".strip(),
+                limit=max_chars,
+            )
+        if len(original) + len(updated) > diff_guard:
+            return _truncate_discord(
+                f"The user edited their message.\n{updated}".strip(),
+                limit=max_chars,
+            )
+        ratio = difflib.SequenceMatcher(None, original, updated).ratio()
+        if ratio >= 0.5:
+            original_marked, updated_marked = self._format_bold_diff(original, updated)
+            return _truncate_discord(
+                (
+                    "The user edited their message.\n"
+                    f"{original_marked}->{updated_marked}"
+                ).strip(),
+                limit=max_chars,
+            )
+        return _truncate_discord(
+            f"The user edited their message.\n{updated}".strip(),
+            limit=max_chars,
+        )
+
     def _summarize_embed(self, embed: discord.Embed, *, max_chars: int) -> dict[str, Any]:
         def clamp(value: str) -> str:
             return _truncate_discord(value, limit=max_chars)
@@ -8748,6 +8840,7 @@ class Ask(commands.Cog):
     ) -> dict[str, Any]:
         content = message.content or ""
         reference_url = self._message_reference_url(message)
+        edited_at = message.edited_at.isoformat() if message.edited_at else None
 
         attachment_payloads: list[dict[str, Any]] = []
         for att in message.attachments:
@@ -8781,6 +8874,8 @@ class Ask(commands.Cog):
             "channel_id": getattr(getattr(message, "channel", None), "id", None),
             "author": author_payload,
             "created_at": message.created_at.isoformat(),
+            "edited_at": edited_at,
+            "is_edited": bool(edited_at),
             "jump_url": message.jump_url,
             "referenced_message_url": reference_url,
             "content": _truncate_discord(content, limit=max_chars),
@@ -8824,24 +8919,46 @@ class Ask(commands.Cog):
         )
         return {"ok": True, "message": summary}
 
-    def _summarize_current_request(
+    async def _summarize_current_request(
         self,
         ctx: commands.Context,
         *,
         max_chars: int,
         include_embeds: bool,
     ) -> dict[str, Any]:
+        deleted = False
         if getattr(ctx, "message", None) is not None and ctx.message:
-            return {
-                "ok": True,
-                "message": self._summarize_message(
-                    ctx.message, max_chars=max_chars, include_embeds=include_embeds
-                ),
-            }
+            message, error = await self._fetch_message_with_acl(
+                actor=ctx.author,
+                guild_id=getattr(getattr(ctx, "guild", None), "id", None),
+                channel_id=ctx.message.channel.id,
+                message_id=ctx.message.id,
+                channel=ctx.message.channel,
+                enforce_user_acl=True,
+            )
+            edit_notice = getattr(ctx, "ask_request_edit_notice", None)
+            if message is not None:
+                summary = self._summarize_message(
+                    message, max_chars=max_chars, include_embeds=include_embeds
+                )
+                if edit_notice:
+                    summary["edit_notice"] = _truncate_discord(edit_notice, limit=max_chars)
+                summary["deleted"] = False
+                return {"ok": True, "message": summary}
+
+            deleted = bool(error and error.get("error") == "message_not_found")
+            if deleted:
+                edit_notice = edit_notice or "The user's message was deleted."
 
         attachments = getattr(ctx, "ask_request_attachments", None) or []
         content = getattr(ctx, "ask_request_text", "") or ""
         reply_url = getattr(ctx, "ask_request_reply_url", None)
+        edit_notice = edit_notice or getattr(ctx, "ask_request_edit_notice", None)
+        deleted = deleted or bool(getattr(ctx, "ask_request_message_deleted", False))
+        if deleted:
+            edit_notice = edit_notice or "The user's message was deleted."
+        if edit_notice:
+            edit_notice = _truncate_discord(edit_notice, limit=max_chars)
 
         interaction_embeds: list[discord.Embed] = []
         interaction = getattr(ctx, "interaction", None)
@@ -8894,6 +9011,10 @@ class Ask(commands.Cog):
                 "channel_id": getattr(getattr(ctx, "channel", None), "id", None),
                 "author": author_payload,
                 "created_at": now_iso,
+                "edited_at": None,
+                "is_edited": bool(edit_notice),
+                "deleted": deleted,
+                "edit_notice": edit_notice,
                 "jump_url": "",
                 "referenced_message_url": reply_url,
                 "content": _truncate_discord(content, limit=max_chars),
@@ -8930,7 +9051,7 @@ class Ask(commands.Cog):
             max_chars = max(50, min(max_chars, 6000))
             include_embeds = bool(args.get("include_embeds", True))
             if not url:
-                result = self._summarize_current_request(
+                result = await self._summarize_current_request(
                     ctx, max_chars=max_chars, include_embeds=include_embeds
                 )
             else:
@@ -10810,6 +10931,45 @@ class Ask(commands.Cog):
             }
             return {key: value for key, value in payload.items() if key in allowed}
 
+        async def _resolve_reference(
+            ref: discord.Message | discord.MessageReference | None,
+        ) -> discord.MessageReference | None:
+            if ref is None and ctx.message:
+                message = await self._fetch_message_from_channel(
+                    channel_id=ctx.message.channel.id,
+                    message_id=ctx.message.id,
+                    channel=ctx.message.channel,
+                    actor=ctx.author,
+                )
+                if message is None:
+                    return None
+                return ctx.message.to_reference(fail_if_not_exists=False)
+            if isinstance(ref, discord.Message):
+                message = await self._fetch_message_from_channel(
+                    channel_id=ref.channel.id,
+                    message_id=ref.id,
+                    channel=ref.channel,
+                    actor=ctx.author,
+                )
+                if message is None:
+                    return None
+                return ref.to_reference(fail_if_not_exists=False)
+            if isinstance(ref, discord.MessageReference):
+                message_id = getattr(ref, "message_id", None)
+                channel_id = getattr(ref, "channel_id", None)
+                if message_id and channel_id:
+                    message = await self._fetch_message_from_channel(
+                        channel_id=channel_id,
+                        message_id=message_id,
+                        channel=ctx.channel if getattr(ctx.channel, "id", None) == channel_id else None,
+                        guild_id=getattr(ref, "guild_id", None),
+                        actor=ctx.author,
+                    )
+                    if message is None:
+                        return None
+                return ref
+            return None
+
         task_message_id = getattr(ctx, "task_output_message_id", None)
         task_channel_id = getattr(ctx, "task_output_channel_id", None)
         task_output_ephemeral = getattr(ctx, "task_output_ephemeral", False) is True
@@ -10895,8 +11055,7 @@ class Ask(commands.Cog):
                 await ctx.interaction.response.send_message(**kwargs)
                 return await ctx.interaction.original_response()
         else:
-            if reference is None and ctx.message:
-                reference = ctx.message.to_reference(fail_if_not_exists=False)
+            reference = await _resolve_reference(reference)
             try:
                 return await self._send_with_retry(
                     ctx.send,
@@ -11313,6 +11472,51 @@ class Ask(commands.Cog):
                         seen_attachment_ids.add(att_id)
                     attachments.append(att)
 
+        original_text = text or ""
+        latest_text = text or ""
+        edit_notice = None
+        message_deleted = False
+        message_edited = False
+        if getattr(ctx, "message", None) is not None and ctx.message:
+            try:
+                setattr(ctx, "ask_request_message_id", ctx.message.id)
+                setattr(ctx, "ask_request_channel_id", ctx.message.channel.id)
+            except Exception:
+                pass
+            message, error = await self._fetch_message_with_acl(
+                actor=ctx.author,
+                guild_id=getattr(getattr(ctx, "guild", None), "id", None),
+                channel_id=ctx.message.channel.id,
+                message_id=ctx.message.id,
+                channel=ctx.message.channel,
+                enforce_user_acl=True,
+            )
+            if message is None:
+                message_deleted = bool(error and error.get("error") == "message_not_found")
+            else:
+                latest_text = (
+                    self._extract_prompt_from_message(ctx, message, fallback_text=text)
+                    or text
+                    or ""
+                )
+                message_edited = latest_text != original_text
+                if message_edited:
+                    edit_notice = self._format_edit_notice(original_text, latest_text)
+
+        if latest_text:
+            text = latest_text
+        elif original_text:
+            text = original_text
+
+        if getattr(ctx, "message", None) is not None and ctx.message:
+            try:
+                setattr(ctx, "ask_request_text", latest_text or original_text or text)
+                setattr(ctx, "ask_request_edit_notice", edit_notice)
+                setattr(ctx, "ask_request_message_deleted", message_deleted)
+                setattr(ctx, "ask_request_message_edited", message_edited)
+            except Exception:
+                pass
+
         # Make collected attachments available to downstream bot_invoke commands (e.g., /image)
         # without changing the single-string arg contract.
         try:
@@ -11323,7 +11527,8 @@ class Ask(commands.Cog):
         # Also preserve the current request context for discord_fetch_message when called without a URL.
         try:
             setattr(ctx, "ask_request_attachments", list(attachments))
-            setattr(ctx, "ask_request_text", text)
+            if getattr(ctx, "ask_request_text", None) is None:
+                setattr(ctx, "ask_request_text", text)
             setattr(ctx, "ask_request_reply_url", reply_url)
             if interaction_embeds:
                 setattr(ctx, "ask_request_embeds", list(interaction_embeds))
