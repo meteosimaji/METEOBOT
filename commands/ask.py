@@ -298,6 +298,10 @@ ASK_OPERATOR_XVFB_DISPLAY_TRIES = int(os.getenv("ASK_OPERATOR_XVFB_DISPLAY_TRIES
 OPERATOR_SCREENSHOT_MIN_INTERVAL_S = float(
     os.getenv("ASK_OPERATOR_SCREENSHOT_MIN_INTERVAL_S", "0.3")
 )
+BROWSER_TRUSTED_HOST_SUFFIXES = (
+    "github.com",
+    "githubusercontent.com",
+)
 ASK_STATE_STORE_FILE = "ask_conversations.json"
 STATE_KEY_RE = re.compile(r"^\d+:\d+$")
 
@@ -3459,6 +3463,11 @@ class Ask(commands.Cog):
             return False
         if host in {"localhost"} or host.endswith(".local"):
             return False
+        if any(
+            host == suffix or host.endswith(f".{suffix}")
+            for suffix in BROWSER_TRUSTED_HOST_SUFFIXES
+        ):
+            return True
 
         def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
             return not (
@@ -9315,7 +9324,10 @@ class Ask(commands.Cog):
                             return {
                                 "ok": False,
                                 "error": "unsafe_redirect",
-                                "reason": "Navigation ended on a blocked host.",
+                                "reason": (
+                                    "Navigation ended on a blocked host: "
+                                    f"{observation.url or 'unknown'}"
+                                ),
                             }
                         upload_path = stored_original_path or dest_path
                         code_interpreter = None
@@ -9848,7 +9860,10 @@ class Ask(commands.Cog):
                         return {
                             "ok": False,
                             "error": "unsafe_redirect",
-                            "reason": "Navigation ended on a blocked host.",
+                            "reason": (
+                                "Navigation ended on a blocked host: "
+                                f"{observed_url or 'unknown'}"
+                            ),
                         }
                 return result
 
