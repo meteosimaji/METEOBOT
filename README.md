@@ -15,6 +15,7 @@
    - `ASK_CONTAINER_FILE_MAX_BYTES` — max size of a single container output file to mirror (defaults to `200MiB`).
    - `ASK_CONTAINER_FILE_MAX_COUNT` — max number of container output files mirrored per `/ask` run (defaults to `5`).
    - `ASK_CONTAINER_FILE_RETAIN_S` — how long mirrored container files stay on disk (defaults to `86400`).
+   - `ASK_CONTAINER_SYNC_INTERVAL_S` — how often to sync container files into the workspace to avoid data loss (defaults to `300`).
    - `ASK_LINK_CONTEXT_MAX_ENTRIES` — max stored link-context entries per channel (defaults to `50`).
    - `ASK_LINK_CONTEXT_MAX_PROMPT` — number of recent links included in `/ask` prompt context (defaults to `10`).
    - `ASK_OPERATOR_DEFAULT_URL` — initial URL to open in the operator browser (defaults to `https://www.google.com`).

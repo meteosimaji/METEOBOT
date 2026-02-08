@@ -1756,6 +1756,9 @@ ASK_CONTAINER_FILE_LIST_TIMEOUT_S = _env_int(
 ASK_CONTAINER_FILE_DOWNLOAD_TIMEOUT_S = _env_int(
     "ASK_CONTAINER_FILE_DOWNLOAD_TIMEOUT_S", 60, minimum=1
 )
+ASK_CONTAINER_SYNC_INTERVAL_S = _env_int(
+    "ASK_CONTAINER_SYNC_INTERVAL_S", 5 * 60, minimum=30
+)
 ASK_LINK_CONTEXT_MAX_ENTRIES = _env_int("ASK_LINK_CONTEXT_MAX_ENTRIES", 50, minimum=1)
 ASK_LINK_CONTEXT_MAX_PROMPT = _env_int("ASK_LINK_CONTEXT_MAX_PROMPT", 10, minimum=1)
 ASK_AUTO_DELETE_DELAY_S = 5
@@ -1784,6 +1787,26 @@ MESSAGE_LINK_RE = re.compile(
     r"^https?://(?:ptb\.|canary\.)?(?:discord(?:app)?\.com)/channels/"
     r"(?P<guild>\d+|@me)/(?P<channel>\d+)/(?P<message>\d+)(?:/)?(?:\?.*)?$"
 )
+
+
+def _extract_openai_error_message(exc: BaseException) -> str:
+    details = getattr(exc, "body", None)
+    if isinstance(details, dict):
+        error = details.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message:
+                return message
+    message_attr = getattr(exc, "message", None)
+    if isinstance(message_attr, str) and message_attr:
+        return message_attr
+    return str(exc)
+
+
+def _is_container_expired_error(message: str | None) -> bool:
+    if not message:
+        return False
+    return "container is expired" in message.lower()
 
 
 async def run_responses_agent(
@@ -2898,6 +2921,8 @@ class Ask(commands.Cog):
         self._ask_workspace_by_state: dict[str, Path] = {}
         self._ci_container_by_state: dict[str, str] = {}
         self._http_session: aiohttp.ClientSession | None = None
+        self._container_sync_task: asyncio.Task | None = None
+        self._container_sync_interval_s = ASK_CONTAINER_SYNC_INTERVAL_S
         self._attachment_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ask_attach")
         self._browser_by_channel: dict[str, BrowserAgent] = {}
         self._browser_lock_by_channel: dict[str, asyncio.Lock] = {}
@@ -2971,8 +2996,13 @@ class Ask(commands.Cog):
 
     async def cog_load(self) -> None:
         await self._task_manager.start()
+        if self._container_sync_task is None:
+            self._container_sync_task = asyncio.create_task(self._container_sync_loop())
 
     def cog_unload(self) -> None:
+        if self._container_sync_task is not None:
+            self._container_sync_task.cancel()
+            self._container_sync_task = None
         self._task_manager.shutdown()
 
     @staticmethod
@@ -6305,6 +6335,90 @@ class Ask(commands.Cog):
             if key[0] == guild_id and key[1] == channel_id:
                 self._attachment_cache.pop(key, None)
 
+    def _workspace_for_state_key(self, state_key: str) -> Path | None:
+        if state_key in self._ask_workspace_by_state:
+            return self._ask_workspace_by_state[state_key]
+        for raw_key, workspace_dir in self._ask_workspace_by_state.items():
+            if self._resolve_state_key(raw_key) == state_key:
+                return workspace_dir
+        return None
+
+    async def _container_sync_loop(self) -> None:
+        while True:
+            try:
+                await self._sync_container_files_once()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("Container sync loop failed")
+            await asyncio.sleep(self._container_sync_interval_s)
+
+    async def _sync_container_files_once(self) -> None:
+        if not self._openai_token:
+            return
+        state_items = list(self._ci_container_by_state.items())
+        for state_key, container_id in state_items:
+            workspace_dir = self._workspace_for_state_key(state_key)
+            if workspace_dir is None:
+                continue
+            if not await self._retrieve_ci_container(container_id):
+                continue
+            manifest = self._load_ask_workspace_manifest(workspace_dir)
+            if not isinstance(manifest, dict):
+                manifest = {}
+            downloads = manifest.get("downloads")
+            if not isinstance(downloads, list):
+                downloads = []
+            synced_ids = {
+                entry.get("file_id")
+                for entry in downloads
+                if isinstance(entry, dict) and entry.get("source") == "container_sync"
+            }
+            files = await self._list_container_files(container_id)
+            if not files:
+                continue
+            dest_dir = workspace_dir / "container_files"
+            updated = False
+            for item in files:
+                file_id = item.get("id")
+                if not isinstance(file_id, str) or not file_id or file_id in synced_ids:
+                    continue
+                path = item.get("path")
+                filename = Path(path).name if isinstance(path, str) else f"{file_id}.bin"
+                bytes_size = item.get("bytes")
+                if isinstance(bytes_size, int) and bytes_size > ASK_CONTAINER_FILE_MAX_BYTES:
+                    continue
+                safe_name = self._sanitize_workspace_name(filename)
+                dest_path = dest_dir / f"sync_{uuid.uuid4().hex[:8]}_{safe_name}"
+                size, content_type = await self._download_container_file(
+                    container_id=container_id,
+                    file_id=file_id,
+                    dest_path=dest_path,
+                )
+                if size is None:
+                    with contextlib.suppress(Exception):
+                        dest_path.unlink()
+                    continue
+                downloads.append(
+                    {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "size": size,
+                        "stored_at": datetime.now(timezone.utc).isoformat(),
+                        "source": "container_sync",
+                        "container_path": path,
+                        "file_id": file_id,
+                        "original_path": str(dest_path.relative_to(self._repo_root)),
+                    }
+                )
+                updated = True
+                if len(downloads) >= ASK_CONTAINER_FILE_MAX_COUNT:
+                    break
+            if updated:
+                manifest["downloads"] = downloads
+                manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._write_ask_workspace_manifest(workspace_dir, manifest)
+
     def _ask_workspace_dir(self, run_id: str) -> Path:
         return self._ask_workspace_root / run_id
 
@@ -6850,6 +6964,7 @@ class Ask(commands.Cog):
         payload = {
             "name": f"ask-{state_key}",
             "memory_limit": "4g",
+            "expires_after": {"anchor": "last_active_at", "minutes": 20},
         }
         try:
             async with session.post(url, headers=headers, json=payload) as resp:
@@ -6883,7 +6998,34 @@ class Ask(commands.Cog):
             log.exception("Container retrieve failed: container_id=%s", container_id)
             return False
 
+    async def _delete_ci_container(self, container_id: str) -> bool:
+        if not self._openai_token:
+            return False
+        session = await self._get_http_session()
+        url = f"https://api.openai.com/v1/containers/{container_id}"
+        headers = {"Authorization": f"Bearer {self._openai_token}"}
+        try:
+            async with session.delete(url, headers=headers) as resp:
+                if resp.status in {404, 410}:
+                    return True
+                if 200 <= resp.status < 300:
+                    return True
+                log.warning("Container delete failed: status=%s container_id=%s", resp.status, container_id)
+                return False
+        except Exception:
+            log.exception("Container delete failed: container_id=%s", container_id)
+            return False
+
     async def _ensure_ci_container(self, state_key: str) -> str | None:
+        cached = self._ci_container_by_state.get(state_key)
+        if cached and await self._retrieve_ci_container(cached):
+            return cached
+        container_id = await self._create_ci_container(state_key=state_key)
+        if container_id:
+            self._ci_container_by_state[state_key] = container_id
+        return container_id
+
+    async def _refresh_ci_container(self, state_key: str) -> str | None:
         cached = self._ci_container_by_state.get(state_key)
         if cached and await self._retrieve_ci_container(cached):
             return cached
@@ -6957,6 +7099,42 @@ class Ask(commands.Cog):
             file_path=file_path,
             filename=filename,
         )
+
+    async def _rehydrate_container_from_workspace(
+        self,
+        *,
+        ctx: commands.Context,
+        workspace_dir: Path,
+    ) -> list[str]:
+        manifest = self._load_ask_workspace_manifest(workspace_dir)
+        if not manifest:
+            return []
+        notes: list[str] = []
+        sources = ("attachments", "downloads")
+        for source in sources:
+            items = manifest.get(source)
+            if not isinstance(items, list):
+                continue
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                rel_path = entry.get("original_path")
+                if not isinstance(rel_path, str) or not rel_path:
+                    continue
+                file_path = Path(rel_path)
+                if not file_path.is_absolute():
+                    file_path = self._repo_root / file_path
+                if not file_path.exists():
+                    continue
+                filename = str(entry.get("filename") or file_path.name)
+                _, error = await self._upload_workspace_file_to_container(
+                    ctx=ctx,
+                    file_path=file_path,
+                    filename=filename,
+                )
+                if error:
+                    notes.append(f"{filename}: {error}")
+        return notes
 
     async def _collect_container_file_links(
         self,
@@ -11244,7 +11422,10 @@ class Ask(commands.Cog):
                 await self._clear_ask_queue(raw_state_key)
                 await self._close_browser_for_ctx_key(raw_state_key)
                 self._ask_workspace_by_state.pop(raw_state_key, None)
-                self._ci_container_by_state.pop(state_key, None)
+                container_id = self._ci_container_by_state.pop(state_key, None)
+                if container_id:
+                    with contextlib.suppress(Exception):
+                        await self._delete_ci_container(container_id)
                 self._set_browser_prefer_cdp(ctx, False)
                 profile_dir = self._browser_profile_path(raw_state_key)
                 profile_removed = False
@@ -11596,20 +11777,22 @@ class Ask(commands.Cog):
             " seconds:12 or size:720x1280 in arg. Allowed values: seconds=4|8|12, size=720x1280|1280x720."
         )
 
-        container_config: dict[str, Any] | str
-        if container_id:
-            container_config = container_id
-        else:
-            container_config = {"type": "auto", "memory_limit": "4g"}
-        tools = [
-            {"type": "web_search"},
-            {"type": "code_interpreter", "container": container_config},
-            {"type": "shell"},
-            *self._build_bot_tools(),
-            *self._build_browser_tools(),
-        ]
+        def _build_ask_tools(active_container_id: str | None) -> list[dict[str, Any]]:
+            container_config: dict[str, Any] | str
+            if active_container_id:
+                container_config = active_container_id
+            else:
+                container_config = {"type": "auto", "memory_limit": "4g"}
+            return [
+                {"type": "web_search"},
+                {"type": "code_interpreter", "container": container_config},
+                {"type": "shell"},
+                *self._build_bot_tools(),
+                *self._build_browser_tools(),
+            ]
 
         run_ids: list[str] = []
+        ask_error_message: str | None = None
         try:
             content_parts: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
 
@@ -11643,34 +11826,95 @@ class Ask(commands.Cog):
                 except Exception:
                     return
 
-            try:
-                resp, all_outputs, error = await run_responses_agent(
-                    self._responses_create,
-                    responses_stream=self._responses_stream,
-                    responses_retrieve=self._responses_retrieve,
-                    responses_cancel=self._responses_cancel,
-                    model="gpt-5.2-2025-12-11",
-                    input_items=input_items,
-                    tools=tools,
-                    include=["web_search_call.action.sources"],
-                    instructions=instructions,
-                    previous_response_id=prev_id,
-                    shell_executor=self.shell_executor,
-                    function_router=_router,
-                    event_cb=status_ui.emit,
-                    reasoning=_ask_reasoning_cfg(),
-                    text=_ask_structured_output_cfg(),
-                    toolgate=getattr(ctx, "task_toolgate", None),
-                    background=use_background,
-                    response_id_cb=_record_response_id,
-                )
-            except ToolGateDenied:
-                with contextlib.suppress(Exception):
-                    await status_ui.finish(ok=False)
-                run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
-                for run_id in run_ids:
-                    self._start_pending_ask_auto_delete(run_id)
-                return
+            resp = None
+            all_outputs: list[Any] = []
+            error = None
+            for attempt in range(2):
+                if action == "ask" and container_id:
+                    refreshed = await self._refresh_ci_container(state_key)
+                    if refreshed and refreshed != container_id:
+                        container_id = refreshed
+                        rehydrate_notes = await self._rehydrate_container_from_workspace(
+                            ctx=ctx,
+                            workspace_dir=workspace_dir,
+                        )
+                        if rehydrate_notes:
+                            log.info(
+                                "Ask container rehydration notes: %s",
+                                "; ".join(rehydrate_notes),
+                            )
+                tools = _build_ask_tools(container_id)
+                try:
+                    resp, all_outputs, error = await run_responses_agent(
+                        self._responses_create,
+                        responses_stream=self._responses_stream,
+                        responses_retrieve=self._responses_retrieve,
+                        responses_cancel=self._responses_cancel,
+                        model="gpt-5.2-2025-12-11",
+                        input_items=input_items,
+                        tools=tools,
+                        include=["web_search_call.action.sources"],
+                        instructions=instructions,
+                        previous_response_id=prev_id,
+                        shell_executor=self.shell_executor,
+                        function_router=_router,
+                        event_cb=status_ui.emit,
+                        reasoning=_ask_reasoning_cfg(),
+                        text=_ask_structured_output_cfg(),
+                        toolgate=getattr(ctx, "task_toolgate", None),
+                        background=use_background,
+                        response_id_cb=_record_response_id,
+                    )
+                except ToolGateDenied:
+                    with contextlib.suppress(Exception):
+                        await status_ui.finish(ok=False)
+                    run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
+                    for run_id in run_ids:
+                        self._start_pending_ask_auto_delete(run_id)
+                    return
+                except Exception as exc:
+                    ask_error_message = _extract_openai_error_message(exc)
+                    if (
+                        attempt == 0
+                        and action == "ask"
+                        and _is_container_expired_error(ask_error_message)
+                    ):
+                        log.info("Ask container expired; recreating and retrying.")
+                        self._ci_container_by_state.pop(state_key, None)
+                        container_id = await self._ensure_ci_container(state_key)
+                        rehydrate_notes = await self._rehydrate_container_from_workspace(
+                            ctx=ctx,
+                            workspace_dir=workspace_dir,
+                        )
+                        if rehydrate_notes:
+                            log.info(
+                                "Ask container rehydration notes: %s",
+                                "; ".join(rehydrate_notes),
+                            )
+                        continue
+                    raise
+
+                if (
+                    attempt == 0
+                    and action == "ask"
+                    and isinstance(error, str)
+                    and _is_container_expired_error(error)
+                ):
+                    ask_error_message = error
+                    log.info("Ask container expired; recreating and retrying.")
+                    self._ci_container_by_state.pop(state_key, None)
+                    container_id = await self._ensure_ci_container(state_key)
+                    rehydrate_notes = await self._rehydrate_container_from_workspace(
+                        ctx=ctx,
+                        workspace_dir=workspace_dir,
+                    )
+                    if rehydrate_notes:
+                        log.info(
+                            "Ask container rehydration notes: %s",
+                            "; ".join(rehydrate_notes),
+                        )
+                    continue
+                break
 
             if error or resp is None:
                 if isinstance(error, str) and "Task cancellation requested" in error:
@@ -11680,6 +11924,8 @@ class Ask(commands.Cog):
                     for run_id in run_ids:
                         self._start_pending_ask_auto_delete(run_id)
                     return
+                if isinstance(error, str):
+                    ask_error_message = error
                 raise RuntimeError(error or "Unknown tool loop failure")
 
             try:
@@ -11811,9 +12057,12 @@ class Ask(commands.Cog):
                 if "status_ui" in locals():
                     await status_ui.finish(ok=False)
             log.exception("Failed to execute ask command")
+            description = "An error occurred while calling the OpenAI API. Check the logs for details."
+            if ask_error_message:
+                description = f"{description}\n\nError: {ask_error_message}"
             error_embed = discord.Embed(
                 title="\u26A0\ufe0f Ask Failed",
-                description="An error occurred while calling the OpenAI API. Check the logs for details.",
+                description=description,
                 color=0xFF0000,
             )
             error_embed = tag_error_embed(error_embed)
