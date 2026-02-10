@@ -191,6 +191,24 @@ class TaskManager:
         )
         return len(queued)
 
+    async def queue_snapshot(self, *, state_key: str, lane: str) -> tuple[list[TaskRecord], int]:
+        queued = await self._store.list_tasks_by_state_key(
+            state_key=state_key,
+            lane=lane,
+            status="queued",
+        )
+        running = await self._store.list_tasks_by_state_key(
+            state_key=state_key,
+            lane=lane,
+            status="running",
+        )
+        recovering = await self._store.list_tasks_by_state_key(
+            state_key=state_key,
+            lane=lane,
+            status="recovering",
+        )
+        return queued, len(running) + len(recovering)
+
     async def cancel_state_key(self, state_key: str) -> int:
         cancelled = 0
         for status in ("queued", "running", "recovering"):
