@@ -1608,6 +1608,13 @@ def _extract_response_refusal(resp: Any) -> str | None:
     for item in outputs:
         if (getattr(item, "type", None) if not isinstance(item, dict) else item.get("type")) != "message":
             continue
+
+        message_refusal = (
+            getattr(item, "refusal", None) if not isinstance(item, dict) else item.get("refusal")
+        )
+        if isinstance(message_refusal, str) and message_refusal.strip():
+            return message_refusal.strip()
+
         content = getattr(item, "content", None) if not isinstance(item, dict) else item.get("content")
         if not isinstance(content, list):
             continue
@@ -2304,6 +2311,7 @@ class _AskStatusUI:
         *,
         title: str = "⚙️ Status",
         ephemeral: bool = False,
+        use_task_output: bool = True,
         max_lines: int | None = None,
         edit_interval: float = 0.25,
         reply_func: Callable[..., Awaitable[discord.Message | None]] | None = None,
@@ -2311,6 +2319,7 @@ class _AskStatusUI:
         self.ctx = ctx
         self.title = title
         self.ephemeral = ephemeral
+        self.use_task_output = use_task_output
         self.max_lines = max_lines
         self.edit_interval = edit_interval
 
@@ -2337,7 +2346,11 @@ class _AskStatusUI:
     async def _send(self, **kwargs: Any):
         try:
             if self._reply_func is not None:
-                return await self._reply_func(self.ctx, **kwargs)
+                return await self._reply_func(
+                    self.ctx,
+                    use_task_output=self.use_task_output,
+                    **kwargs,
+                )
             # Pull ephemerality once so we never forward duplicate keyword values
             # to Discord send/edit helpers, and ensure prefix sends ignore it.
             eph = kwargs.pop("ephemeral", self.ephemeral)
@@ -10970,6 +10983,7 @@ class Ask(commands.Cog):
         ctx: commands.Context,
         *,
         reference: discord.Message | discord.MessageReference | None = None,
+        use_task_output: bool = True,
         **kwargs: Any,
     ) -> discord.Message | None:
         def _channel_send_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -11025,9 +11039,11 @@ class Ask(commands.Cog):
                 return ref
             return None
 
-        task_message_id = getattr(ctx, "task_output_message_id", None)
-        task_channel_id = getattr(ctx, "task_output_channel_id", None)
-        task_output_ephemeral = getattr(ctx, "task_output_ephemeral", False) is True
+        task_message_id = getattr(ctx, "task_output_message_id", None) if use_task_output else None
+        task_channel_id = getattr(ctx, "task_output_channel_id", None) if use_task_output else None
+        task_output_ephemeral = (
+            getattr(ctx, "task_output_ephemeral", False) is True if use_task_output else False
+        )
         files_to_send = None
         if task_message_id and "files" in kwargs:
             files_to_send = kwargs.pop("files")
@@ -11081,9 +11097,21 @@ class Ask(commands.Cog):
                                         )
                         return message
                     except Exception:
+                        log.warning(
+                            "Failed to edit /ask task output message (channel_id=%s, message_id=%s). Falling back.",
+                            task_channel_id,
+                            task_message_id,
+                            exc_info=True,
+                        )
                         if files_to_send is not None:
                             kwargs["files"] = files_to_send
                         pass
+                else:
+                    log.warning(
+                        "Task output message not found for /ask reply (channel_id=%s, message_id=%s). Falling back.",
+                        task_channel_id,
+                        task_message_id,
+                    )
         if ctx.interaction:
             if ctx.interaction.response.is_done():
                 try:
@@ -11125,6 +11153,54 @@ class Ask(commands.Cog):
                     mention_author=False,
                 )
         return None
+
+    async def _reply_required(
+        self,
+        ctx: commands.Context,
+        *,
+        reference: discord.Message | discord.MessageReference | None = None,
+        use_task_output: bool = True,
+        **kwargs: Any,
+    ) -> discord.Message:
+        message = await self._reply(
+            ctx,
+            reference=reference,
+            use_task_output=use_task_output,
+            **kwargs,
+        )
+        if message is not None:
+            return message
+
+        if kwargs.get("ephemeral") is True:
+            raise RuntimeError(
+                "Failed to deliver ephemeral /ask reply; refusing public channel fallback."
+            )
+
+        channel = getattr(ctx, "channel", None)
+        if channel is not None:
+            fallback_payload = {
+                key: value
+                for key, value in kwargs.items()
+                if key
+                in {
+                    "content",
+                    "embed",
+                    "embeds",
+                    "files",
+                    "view",
+                    "allowed_mentions",
+                    "reference",
+                    "tts",
+                    "suppress_embeds",
+                }
+            }
+            try:
+                return await self._send_with_retry(channel.send, **fallback_payload)
+            except Exception:
+                log.exception("Fallback channel.send failed in _reply_required.")
+                raise
+
+        raise RuntimeError("Failed to deliver /ask reply message (no channel available).")
 
     @commands.command(
         name="ask",
@@ -11222,7 +11298,7 @@ class Ask(commands.Cog):
                 reply_kwargs: dict[str, Any] = {"embed": embed}
                 if ctx.interaction:
                     reply_kwargs["ephemeral"] = True
-                await self._reply(ctx, **reply_kwargs)
+                await self._reply_required(ctx, **reply_kwargs)
                 return
 
             self._set_browser_prefer_cdp(ctx, prefer_cdp)
@@ -11248,7 +11324,7 @@ class Ask(commands.Cog):
             reply_kwargs = {"embed": embed}
             if ctx.interaction:
                 reply_kwargs["ephemeral"] = True
-            await self._reply(ctx, **reply_kwargs)
+            await self._reply_required(ctx, **reply_kwargs)
 
     async def _ask_impl(
         self,
@@ -11274,7 +11350,7 @@ class Ask(commands.Cog):
             reply_kwargs: dict[str, Any] = {"embed": embed}
             if ctx.interaction:
                 reply_kwargs["ephemeral"] = True
-            await self._reply(ctx, **reply_kwargs)
+            await self._reply_required(ctx, **reply_kwargs)
             return
 
         if action not in {"ask", "reset"}:
@@ -11727,7 +11803,7 @@ class Ask(commands.Cog):
             if ctx.interaction:
                 reply_kwargs["ephemeral"] = True
 
-            await self._reply(ctx, **reply_kwargs)
+            await self._reply_required(ctx, **reply_kwargs)
             return
 
         skipped_notes: list[str] = []
@@ -12071,6 +12147,7 @@ class Ask(commands.Cog):
                 ctx,
                 title="⚙️ Status",
                 ephemeral=bool(ctx.interaction),
+                use_task_output=False,
                 reply_func=self._reply,
             )
             await status_ui.start()
@@ -12310,7 +12387,7 @@ class Ask(commands.Cog):
             reply_kwargs: dict[str, Any] = {"embed": embed}
             if files:
                 reply_kwargs["files"] = files
-            await self._reply(ctx, **reply_kwargs)
+            await self._reply_required(ctx, **reply_kwargs)
             run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
             for run_id in run_ids:
                 self._start_pending_ask_auto_delete(run_id)
@@ -12332,9 +12409,9 @@ class Ask(commands.Cog):
             )
             error_embed = tag_error_embed(error_embed)
             try:
-                await self._reply(ctx, embed=error_embed)
+                await self._reply_required(ctx, embed=error_embed)
             except Exception:
-                pass
+                log.exception("Failed to deliver /ask error notification.")
             run_ids = self._ask_run_ids_by_ctx.pop(self._ctx_key(ctx), [])
             for run_id in run_ids:
                 self._start_pending_ask_auto_delete(run_id)
