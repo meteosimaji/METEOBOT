@@ -8,7 +8,7 @@ from typing import Any
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from commands.ask import run_responses_agent  # noqa: E402
+from commands.ask import _extract_response_refusal, run_responses_agent  # noqa: E402
 
 
 class _DummyStream:
@@ -59,3 +59,19 @@ def test_run_responses_agent_emits_reasoning_delta_from_stream_event() -> None:
         evt.get("type") == "model_reasoning_delta" and evt.get("delta") == "step-1"
         for evt in events
     )
+
+
+def test_extract_response_refusal_supports_message_level_refusal() -> None:
+    response = types.SimpleNamespace(
+        output=[
+            types.SimpleNamespace(
+                type="message",
+                refusal="I'm sorry, I cannot assist with that request.",
+                content=[],
+            )
+        ]
+    )
+
+    refusal = _extract_response_refusal(response)
+
+    assert refusal == "I'm sorry, I cannot assist with that request."

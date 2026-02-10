@@ -83,3 +83,25 @@ def test_status_ui_uses_custom_reply_func() -> None:
 
     assert calls
     assert calls[0].get("embed") is not None
+
+
+def test_status_ui_passes_use_task_output_flag_to_custom_reply() -> None:
+    calls: list[dict[str, object]] = []
+
+    async def _custom_reply(ctx: object, **kwargs: object) -> None:
+        calls.append({"ctx": ctx, **kwargs})
+        return None
+
+    ui = ask_module._AskStatusUI(
+        _DummyCtx(),
+        reply_func=_custom_reply,
+        use_task_output=False,
+    )
+
+    async def _run() -> None:
+        await ui.start()
+
+    asyncio.run(_run())
+
+    assert calls
+    assert calls[0].get("use_task_output") is False
