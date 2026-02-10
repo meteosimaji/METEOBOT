@@ -1421,6 +1421,13 @@ def _clamp_embed_description(embed: discord.Embed, *, max_total: int = 6000) -> 
     return False
 
 
+def _queue_fraction(*, queued_index: int, queued_count: int) -> tuple[int, int]:
+    """Return display fraction for waiting queue only (excludes running task)."""
+    safe_index = max(1, queued_index)
+    safe_queued = max(safe_index, queued_count)
+    return safe_index, safe_queued
+
+
 def _extend_text_files(
     files: list[discord.File],
     filename: str,
@@ -5834,22 +5841,40 @@ class Ask(commands.Cog):
         if current == until:
             self._ask_queue_pause_until.pop(state_key, None)
 
-    def _build_queue_embed(self, position: int, total: int) -> discord.Embed:
+    def _build_queue_embed(self, position: int, total: int, *, running_count: int = 0) -> discord.Embed:
         embed = discord.Embed(
             title="⏳ /ask queued",
-            description="I will run this once the current /ask finishes.",
+            description=(
+                "Your request is waiting in line and this message will update automatically. "
+                "Use **Cancel task** if you no longer need it."
+            ),
             color=0xFEE75C,
         )
-        embed.add_field(name="Queue", value=f"{position} / {total}", inline=True)
-        embed.set_footer(text="If the original message disappears, this will be skipped.")
+        embed.add_field(name="In queue", value=f"{position} / {total} (waiting only)", inline=True)
+        status = "Waiting"
+        safe_running_count = max(0, running_count)
+        if safe_running_count > 0:
+            suffix = "task" if safe_running_count == 1 else "tasks"
+            status = f"Waiting ({safe_running_count} running {suffix})"
+        embed.add_field(name="Status", value=status, inline=True)
+        embed.set_footer(text="If the original message is deleted, this request is skipped.")
         return embed
 
     def _build_queue_start_embed(self) -> discord.Embed:
         return discord.Embed(
-            title="▶️ /ask starting",
-            description="Your turn is up, starting now.",
+            title="▶️ /ask processing started",
+            description="Your request is now running.",
             color=0x57F287,
         )
+
+    async def _send_processing_started_notice(self, ctx: commands.Context) -> None:
+        notice = await self._reply(
+            ctx,
+            embed=self._build_queue_start_embed(),
+            use_task_output=False,
+        )
+        if notice is not None:
+            self._schedule_message_delete(notice, delay=ASK_QUEUE_DELETE_DELAY_S)
 
     def _build_queue_skipped_embed(self, reason: str) -> discord.Embed:
         return discord.Embed(
@@ -5861,7 +5886,7 @@ class Ask(commands.Cog):
     def _build_queue_cleared_embed(self) -> discord.Embed:
         return discord.Embed(
             title="🧹 /ask queue cleared",
-            description="reset ran, so the waiting /ask requests were withdrawn.",
+            description="Reset was run, so the waiting /ask requests were withdrawn.",
             color=0xED4245,
         )
 
@@ -5897,18 +5922,23 @@ class Ask(commands.Cog):
             "interaction_id": getattr(getattr(ctx, "interaction", None), "id", None),
             "tool_policy": _tool_policy_payload(policy),
         }
-        queued_tasks, active_count = await self._task_manager.queue_snapshot(
+        queued_tasks, _active_count = await self._task_manager.queue_snapshot(
             state_key=state_key,
             lane="main",
         )
-        position = len(queued_tasks) + 1
-        total = position + active_count
+        queued_index = len(queued_tasks) + 1
+        queued_count = len(queued_tasks) + 1
+        position, total = _queue_fraction(
+            queued_index=queued_index,
+            queued_count=queued_count,
+        )
+        queue_embed = self._build_queue_embed(position, total, running_count=_active_count)
         cancel_view = None
         if ctx.author is not None:
             cancel_view = _AskTaskQueueView(self, task_id, ctx.author.id)
         placeholder = await self._reply(
             ctx,
-            embed=self._build_queue_embed(position, total),
+            embed=queue_embed,
             view=cancel_view,
         )
         output_message_id = str(placeholder.id) if placeholder else None
@@ -5935,13 +5965,13 @@ class Ask(commands.Cog):
         await self._refresh_task_queue_task_messages(state_key)
 
     async def _refresh_task_queue_task_messages(self, state_key: str) -> None:
-        queued_tasks, active_count = await self._task_manager.queue_snapshot(
+        queued_tasks, _active_count = await self._task_manager.queue_snapshot(
             state_key=state_key,
             lane="main",
         )
         if not queued_tasks:
             return
-        total = len(queued_tasks) + active_count
+        queued_count = len(queued_tasks)
         for index, queued_task in enumerate(queued_tasks, start=1):
             output_message_id = queued_task.output_message_id
             if not output_message_id:
@@ -5958,8 +5988,12 @@ class Ask(commands.Cog):
             )
             if message is None:
                 continue
+            position, total = _queue_fraction(
+                queued_index=index,
+                queued_count=queued_count,
+            )
             with contextlib.suppress(Exception):
-                await message.edit(embed=self._build_queue_embed(index, total))
+                await message.edit(embed=self._build_queue_embed(position, total, running_count=_active_count))
 
     async def _send_queue_embed(
         self,
@@ -5967,8 +6001,9 @@ class Ask(commands.Cog):
         *,
         position: int,
         total: int,
+        running_count: int = 0,
     ) -> discord.Message | None:
-        embed = self._build_queue_embed(position, total)
+        embed = self._build_queue_embed(position, total, running_count=running_count)
         try:
             if ctx.interaction:
                 if ctx.interaction.response.is_done():
@@ -6013,10 +6048,19 @@ class Ask(commands.Cog):
         queue = self._get_ask_queue(state_key)
         if not queue:
             return
-        total = len(queue)
+        queued_count = len(queue)
+        running_count = 1 if state_key in self._ask_queue_workers else 0
+        worker = self._ask_queue_workers.get(state_key)
+        if worker is None or worker.done():
+            running_count = 0
         for index, request in enumerate(queue, start=1):
+            position, total = _queue_fraction(
+                queued_index=index,
+                queued_count=queued_count,
+            )
             await self._update_queue_message(
-                request, embed=self._build_queue_embed(index, total)
+                request,
+                embed=self._build_queue_embed(position, total, running_count=running_count),
             )
 
     async def _validate_queued_request(self, request: QueuedAskRequest) -> bool:
@@ -6065,10 +6109,15 @@ class Ask(commands.Cog):
         existing_worker = self._ask_queue_workers.get(state_key)
         if existing_worker and not existing_worker.done():
             has_worker = True
-        position = len(queue) + 1
+        queued_index = len(queue) + 1
+        queued_count = len(queue) + 1
+        position, total = _queue_fraction(
+            queued_index=queued_index,
+            queued_count=queued_count,
+        )
         wait_message = None
         if has_worker or queue:
-            wait_message = await self._send_queue_embed(ctx, position=position, total=position)
+            wait_message = await self._send_queue_embed(ctx, position=position, total=total, running_count=int(has_worker))
         wait_channel_id = getattr(wait_message, "channel", None)
         wait_channel_id = getattr(wait_channel_id, "id", None)
         wait_guild_id = getattr(getattr(wait_message, "guild", None), "id", None)

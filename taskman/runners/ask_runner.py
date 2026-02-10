@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,6 +63,9 @@ class AskRunner:
         state_key = request.get("state_key")
         if isinstance(state_key, str):
             await self._ask._refresh_task_queue_task_messages(state_key)
+
+        with contextlib.suppress(Exception):
+            await self._ask._send_processing_started_notice(resolved_ctx)
 
         try:
             await self._ask._ask_impl(
