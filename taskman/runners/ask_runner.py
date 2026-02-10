@@ -59,6 +59,10 @@ class AskRunner:
         use_background = request.get("background")
         setattr(resolved_ctx, "task_background", use_background is True)
 
+        state_key = request.get("state_key")
+        if isinstance(state_key, str):
+            await self._ask._refresh_task_queue_task_messages(state_key)
+
         try:
             await self._ask._ask_impl(
                 resolved_ctx,
@@ -74,7 +78,6 @@ class AskRunner:
             )
             return TaskResult(status="cancelled", result={"error": str(exc)})
 
-        state_key = request.get("state_key")
         runner_state: dict[str, Any] = {}
         if isinstance(state_key, str):
             response_id = None

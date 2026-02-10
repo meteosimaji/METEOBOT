@@ -1834,6 +1834,13 @@ async def run_responses_agent(
     all_outputs: list[Any] = []
     prev_id = previous_response_id
 
+    def _extract_reasoning_delta_from_stream_event(event: Any) -> str | None:
+        for attr in ("delta", "text", "summary", "content"):
+            value = getattr(event, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
     def _normalize_function_args(args_raw: Any) -> dict[str, Any]:
         if isinstance(args_raw, dict):
             return args_raw
@@ -2000,6 +2007,16 @@ async def run_responses_agent(
                                         "turn": turn,
                                         "delta": delta,
                                         "text": "".join(streamed_chunks),
+                                    }
+                                )
+                        elif isinstance(event_type, str) and "reasoning" in event_type and event_type.endswith(".delta"):
+                            delta = _extract_reasoning_delta_from_stream_event(event)
+                            if isinstance(delta, str) and delta:
+                                await _emit(
+                                    {
+                                        "type": "model_reasoning_delta",
+                                        "turn": turn,
+                                        "delta": delta,
                                     }
                                 )
                         elif event_type == "response.refusal.delta":
@@ -2289,6 +2306,7 @@ class _AskStatusUI:
         ephemeral: bool = False,
         max_lines: int | None = None,
         edit_interval: float = 0.25,
+        reply_func: Callable[..., Awaitable[discord.Message | None]] | None = None,
     ) -> None:
         self.ctx = ctx
         self.title = title
@@ -2297,6 +2315,7 @@ class _AskStatusUI:
         self.edit_interval = edit_interval
 
         self._max_desc = 4096
+        self._reply_func = reply_func
         self.loading = os.getenv("STATUS_LOADING_EMOJI") or "⏳"
         self.ok = os.getenv("STATUS_OK_EMOJI") or "✅"
         self.fail = os.getenv("STATUS_FAIL_EMOJI") or "❌"
@@ -2317,6 +2336,8 @@ class _AskStatusUI:
 
     async def _send(self, **kwargs: Any):
         try:
+            if self._reply_func is not None:
+                return await self._reply_func(self.ctx, **kwargs)
             # Pull ephemerality once so we never forward duplicate keyword values
             # to Discord send/edit helpers, and ensure prefix sends ignore it.
             eph = kwargs.pop("ephemeral", self.ephemeral)
@@ -5863,16 +5884,18 @@ class Ask(commands.Cog):
             "interaction_id": getattr(getattr(ctx, "interaction", None), "id", None),
             "tool_policy": _tool_policy_payload(policy),
         }
-        position = await self._task_manager.queued_position(
-            state_key=state_key, lane="main"
+        queued_tasks, active_count = await self._task_manager.queue_snapshot(
+            state_key=state_key,
+            lane="main",
         )
-        position = position + 1
+        position = len(queued_tasks) + 1
+        total = position + active_count
         cancel_view = None
         if ctx.author is not None:
             cancel_view = _AskTaskQueueView(self, task_id, ctx.author.id)
         placeholder = await self._reply(
             ctx,
-            embed=self._build_queue_embed(position, position),
+            embed=self._build_queue_embed(position, total),
             view=cancel_view,
         )
         output_message_id = str(placeholder.id) if placeholder else None
@@ -5896,6 +5919,34 @@ class Ask(commands.Cog):
             },
         )
         await self._task_manager.submit(spec, task_id=task_id)
+        await self._refresh_task_queue_task_messages(state_key)
+
+    async def _refresh_task_queue_task_messages(self, state_key: str) -> None:
+        queued_tasks, active_count = await self._task_manager.queue_snapshot(
+            state_key=state_key,
+            lane="main",
+        )
+        if not queued_tasks:
+            return
+        total = len(queued_tasks) + active_count
+        for index, queued_task in enumerate(queued_tasks, start=1):
+            output_message_id = queued_task.output_message_id
+            if not output_message_id:
+                continue
+            request = queued_task.request if isinstance(queued_task.request, dict) else {}
+            task_channel_id = request.get("channel_id")
+            if not isinstance(task_channel_id, int):
+                continue
+            message = await self._fetch_message_from_channel(
+                channel_id=task_channel_id,
+                message_id=int(output_message_id),
+                channel=self.bot.get_channel(task_channel_id),
+                actor=None,
+            )
+            if message is None:
+                continue
+            with contextlib.suppress(Exception):
+                await message.edit(embed=self._build_queue_embed(index, total))
 
     async def _send_queue_embed(
         self,
@@ -6091,7 +6142,11 @@ class Ask(commands.Cog):
         log.info("Cleared /ask queue (state_key=%s, cleared=%s).", state_key, cleared_count)
 
     async def cancel_task(self, task_id: str) -> None:
+        task = await self._task_manager.get_task(task_id)
         await self._task_manager.cancel(task_id)
+        if task is None:
+            return
+        await self._refresh_task_queue_task_messages(task.state_key)
 
     async def _rebuild_context_from_task_request(
         self, request: dict[str, Any]
@@ -12012,7 +12067,12 @@ class Ask(commands.Cog):
 
             input_items = [{"role": "user", "content": content_parts}]
 
-            status_ui = _AskStatusUI(ctx, title="⚙️ Status", ephemeral=bool(ctx.interaction))
+            status_ui = _AskStatusUI(
+                ctx,
+                title="⚙️ Status",
+                ephemeral=bool(ctx.interaction),
+                reply_func=self._reply,
+            )
             await status_ui.start()
 
             async def _router(fname: str, fargs: dict[str, Any]):

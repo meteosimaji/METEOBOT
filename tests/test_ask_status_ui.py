@@ -65,3 +65,21 @@ def test_refusal_delta_caps_at_2000_chars() -> None:
     assert out.startswith("refusal: ")
     assert out.endswith("...")
     assert len(out) == 2000
+
+
+def test_status_ui_uses_custom_reply_func() -> None:
+    calls: list[dict[str, object]] = []
+
+    async def _custom_reply(ctx: object, **kwargs: object) -> None:
+        calls.append({"ctx": ctx, **kwargs})
+        return None
+
+    ui = ask_module._AskStatusUI(_DummyCtx(), reply_func=_custom_reply)
+
+    async def _run() -> None:
+        await ui.start()
+
+    asyncio.run(_run())
+
+    assert calls
+    assert calls[0].get("embed") is not None
