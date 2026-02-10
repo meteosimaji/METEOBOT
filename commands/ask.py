@@ -1775,6 +1775,13 @@ ASK_CONTAINER_SYNC_INTERVAL_S = _env_int(
 )
 ASK_LINK_CONTEXT_MAX_ENTRIES = _env_int("ASK_LINK_CONTEXT_MAX_ENTRIES", 50, minimum=1)
 ASK_LINK_CONTEXT_MAX_PROMPT = _env_int("ASK_LINK_CONTEXT_MAX_PROMPT", 10, minimum=1)
+ASK_PROMPT_CACHE_RETENTION = ((os.getenv("ASK_PROMPT_CACHE_RETENTION") or "in_memory").strip() or "in_memory").lower()
+if ASK_PROMPT_CACHE_RETENTION not in {"in_memory", "24h"}:
+    ASK_PROMPT_CACHE_RETENTION = "in_memory"
+ASK_PROMPT_CACHE_BASE_KEY = (
+    os.getenv("ASK_PROMPT_CACHE_BASE_KEY") or "ask:v2"
+).strip() or "ask:v2"
+ASK_COMPACT_INTERVAL = _env_int("ASK_COMPACT_INTERVAL", 0, minimum=0)
 ASK_AUTO_DELETE_DELAY_S = 5
 ASK_QUEUE_DELETE_DELAY_S = 3
 ASK_RESET_PROMPT_DELETE_DELAY_S = 3
@@ -1817,6 +1824,32 @@ def _extract_openai_error_message(exc: BaseException) -> str:
     return str(exc)
 
 
+def _normalize_compaction_output_items(raw_items: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_items, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_items:
+        candidate: Any = None
+        if isinstance(raw, dict):
+            candidate = dict(raw)
+        elif hasattr(raw, "model_dump"):
+            with contextlib.suppress(Exception):
+                candidate = raw.model_dump()
+        elif hasattr(raw, "dict"):
+            with contextlib.suppress(Exception):
+                candidate = raw.dict()
+
+        if not isinstance(candidate, dict):
+            continue
+
+        candidate.pop("id", None)
+        candidate.pop("status", None)
+        normalized.append(candidate)
+
+    return normalized
+
+
 def _is_container_expired_error(message: str | None) -> bool:
     if not message:
         return False
@@ -1840,6 +1873,8 @@ async def run_responses_agent(
     event_cb=None,
     reasoning: dict[str, Any] | None = None,
     text: dict[str, Any] | None = None,
+    prompt_cache_retention: str | None = None,
+    prompt_cache_key: str | None = None,
     toolgate: ToolGate | None = None,
     background: bool = False,
     response_id_cb=None,
@@ -1912,11 +1947,11 @@ async def run_responses_agent(
         await _emit({"type": "turn_start", "turn": turn, "max_turns": MAX_TOOL_TURNS})
         request: dict[str, Any] = {
             "model": model,
-            "tools": tools,
         }
-        request["input"] = inputs
         if instructions:
             request["instructions"] = instructions
+        request["tools"] = tools
+        request["input"] = inputs
         if include:
             request["include"] = include
         if prev_id:
@@ -1925,6 +1960,10 @@ async def run_responses_agent(
             request["reasoning"] = reasoning
         if text is not None:
             request["text"] = text
+        if prompt_cache_retention:
+            request["prompt_cache_retention"] = prompt_cache_retention
+        if prompt_cache_key:
+            request["prompt_cache_key"] = prompt_cache_key
 
         if background:
             request["background"] = True
@@ -2083,6 +2122,8 @@ async def run_responses_agent(
                     resp = completed_response
                 else:
                     resp = await responses_create(**request)
+            else:
+                resp = await responses_create(**request)
         if not background:
             response_id = getattr(resp, "id", None)
             if response_id_cb and isinstance(response_id, str) and response_id:
@@ -2094,6 +2135,18 @@ async def run_responses_agent(
                     pass
         outputs = getattr(resp, "output", []) or []
         all_outputs.extend(outputs)
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+        details = getattr(usage, "prompt_tokens_details", None) if usage is not None else None
+        cached_tokens = getattr(details, "cached_tokens", None) if details is not None else None
+        if isinstance(cached_tokens, int):
+            log.info(
+                "ask usage (turn=%s, prompt_tokens=%s, cached_tokens=%s, cache_key=%s)",
+                turn,
+                prompt_tokens,
+                cached_tokens,
+                prompt_cache_key,
+            )
         await _emit({"type": "model_response", "turn": turn, "output_items": len(outputs)})
 
         tool_outputs: list[dict[str, Any]] = []
@@ -2960,6 +3013,7 @@ class Ask(commands.Cog):
         self._ask_queue_workers: dict[str, asyncio.Task] = {}
         self._ask_queue_pause_until: dict[str, datetime] = {}
         self._ask_workspace_by_state: dict[str, Path] = {}
+        self._ask_turn_count_by_state: dict[str, int] = {}
         self._ci_container_by_state: dict[str, str] = {}
         self._http_session: aiohttp.ClientSession | None = None
         self._container_sync_task: asyncio.Task | None = None
@@ -3169,6 +3223,7 @@ class Ask(commands.Cog):
         removed = False
         try:
             removed = bool(self.bot.ai_last_response_id.pop(root, None))  # type: ignore[attr-defined]
+            self._ask_turn_count_by_state.pop(root, None)
         except Exception:
             removed = False
         self._save_ask_state_store()
@@ -10837,6 +10892,14 @@ class Ask(commands.Cog):
             return await self.client.responses.create(**kwargs)
         return await asyncio.to_thread(self.client.responses.create, **kwargs)
 
+    async def _responses_compact(self, **kwargs: Any):
+        compact_fn = getattr(self.client.responses, "compact", None)
+        if compact_fn is None:
+            return None
+        if self._async_client:
+            return await compact_fn(**kwargs)
+        return await asyncio.to_thread(compact_fn, **kwargs)
+
     async def _responses_retrieve(self, response_id: str):
         retrieve_fn = getattr(self.client.responses, "retrieve", None)
         if retrieve_fn is None:
@@ -10860,6 +10923,37 @@ class Ask(commands.Cog):
             return await self.client.responses.create(stream=True, **kwargs)
         except Exception:
             return None
+
+    async def _maybe_compact_previous_response(
+        self,
+        *,
+        prev_id: str | None,
+        state_key: str,
+        model: str,
+        instructions: str,
+    ) -> tuple[str | None, list[dict[str, Any]] | None]:
+        if not prev_id or ASK_COMPACT_INTERVAL <= 0:
+            return prev_id, None
+        turn_count = self._ask_turn_count_by_state.get(state_key, 0)
+        if turn_count < ASK_COMPACT_INTERVAL:
+            return prev_id, None
+        try:
+            compacted = await self._responses_compact(
+                model=model,
+                previous_response_id=prev_id,
+                instructions=instructions,
+            )
+        except Exception:
+            log.warning("Failed to compact ask response chain (state_key=%s).", state_key, exc_info=True)
+            return prev_id, None
+
+        compacted_items = _normalize_compaction_output_items(getattr(compacted, "output", None))
+        if compacted_items:
+            self._ask_turn_count_by_state[state_key] = 0
+            log.info("Compacted ask response chain (state_key=%s, items=%s).", state_key, len(compacted_items))
+            return None, compacted_items
+
+        return prev_id, None
 
     async def _collect_bot_messages(
         self, ctx: commands.Context, *, after: datetime, limit: int = 5
@@ -12024,18 +12118,10 @@ class Ask(commands.Cog):
         current_time = datetime.now(tz).strftime("%Y-%m-%d %H:%M") + f" {tz_label}"
         commands_text = self._format_command_list()
         required_arg_commands = self._get_required_single_arg_commands()
-        if required_arg_commands:
-            required_arg_cmds = ", ".join(f"/{name}" for name in required_arg_commands)
-            required_arg_note = (
-                f"For required single-argument commands ({required_arg_cmds}), always provide the arg value. "
-            )
-        else:
-            required_arg_note = "For commands that require a single argument, always provide the arg value. "
         link_context_prompt = self._format_link_context_for_prompt(ctx)
         instructions = (
             "You are a buddy AI in a Discord bot. "
-            f"Speak casually (no polite speech) and address the user as \"{username}\". "
-            f"Current time: {current_time}. "
+            "Speak casually (no polite speech). "
             "Your built-in knowledge might be wrong or outdated; question it and seek fresh verification. "
             "Respond in JSON matching the provided schema. "
             "Provide a short, user-facing title in title. "
@@ -12058,11 +12144,11 @@ class Ask(commands.Cog):
             "Shell rules: one command at a time; pipes are allowed to chain builtins, but never use redirects, subshells, or &&. Builtins are always used; OS binaries are never invoked. "
             "For rg/grep/find always include -m <limit> and an explicit path (rg/grep can omit the path only when reading stdin in a pipeline); tree requires -L <depth> and an explicit path. Lines requires -s/-e and a path unless reading stdin in a pipeline. Only the listed flags work (rg -n/-i/-m/-C/-A/-B, grep -n/-i/-m/-C/-A/-B, find -m, tree -L/-a, ls -l/-la/-al/-a/-lh, lines -s/-e, diff -u). "
             "If a shell call is denied, simplify to a single safe command like `rg -n -m 200 PATTERN path`, `find -m 200 PATTERN path`, `tree -L 2 path`, or `cat path`. "
-            f"The ask workspace for this run lives at `{workspace_rel}` inside the repo. "
+            "The ask workspace path for this run is provided in a dynamic context message. "
             "Attachments and downloads are saved there with full extracted text files plus manifest.json. "
             "Note: the bot workspace is separate from the python tool container (/mnt/data). The shell cannot read python tool files. "
             "When discord_read_attachment or browser download returns code_interpreter.path, use that /mnt/data path inside the python tool (do not use workspace paths). "
-            f"{link_context_prompt}"
+            "Link context for this request is provided in a dynamic context message. "
             "When you create files with the python tool, note that generated files are not listed in Discord replies. "
             "List the filenames you created and briefly describe what each contains. Do NOT invent or guess download URLs. "
             "When creating files, use clear deterministic names like output.csv, results.json, or plot.png. "
@@ -12076,7 +12162,7 @@ class Ask(commands.Cog):
             "If no recipe exists, build a custom flow rather than giving up. "
             "To find recipes, use shell search (e.g., `rg -n -m 50 \"^## \" docs/skills/ask-recipes/SKILL.md` for titles and `rg -n -m 1 \"@-- BEGIN:id:music --\" docs/skills/ask-recipes/SKILL.md -A 120` for the section) and only read the matching section. "
             "Prefer the code interpreter tool for calculations. Writing files is OK when the user needs a downloadable artifact. "
-            f"Use the bot_commands function tool to look up available bot commands before suggesting bot actions. Available commands: {commands_text}. "
+            "Use the bot_commands function tool to look up available bot commands before suggesting bot actions. "
             "If the user wants the bot to post a plain message in channel, use /say via bot_invoke and put the message text in arg. "
             "Use the discord_fetch_message function tool to pull full context from a Discord message link or reply (author, time, content, attachments with URLs, embeds, reply link) instead of guessing. "
             "Call discord_fetch_message with url:'' to fetch the current request so you can see this message's attachments/links before invoking other tools. "
@@ -12103,7 +12189,7 @@ class Ask(commands.Cog):
             "use arg:'' only when the command truly takes no argument or you want to omit an optional one. "
             "Replies from commands run via bot_invoke auto-delete after 5 seconds (use the stop button to cancel). "
             "However, /image, /video, /tex, /help, /queue, and /settime usually remain (errors are deleted). "
-            f"{required_arg_note}"
+            "For commands that require a single argument, always provide the arg value. The exact required-command list is in dynamic context. "
             "For optional single-argument commands (e.g., /help topic or /userinfo @name), include arg when needed; "
             "otherwise pass ''. "
             "If the user only wants the help text, prefer bot_commands instead of invoking /help. "
@@ -12162,22 +12248,48 @@ class Ask(commands.Cog):
             " seconds:12 or size:720x1280 in arg. Allowed values: seconds=4|8|12, size=720x1280|1280x720."
         )
 
-        def _build_ask_tools(active_container_id: str | None) -> list[dict[str, Any]]:
+        def _pick_tool_profile(user_text: str) -> str:
+            lowered = user_text.lower()
+            if re.search(
+                r"https?://|\b(url|browser|screenshot|screen|site|website|click|form|login|captcha|navigate)\b",
+                lowered,
+            ):
+                return "full"
+            if re.search(
+                r"\b(code|python|script|csv|xlsx|spreadsheet|dataset|analy[sz]e|plot|graph|notebook|file)\b",
+                lowered,
+            ):
+                return "full"
+            if re.search(r"\b(web|search|latest|news|today|current|source|citation)\b", lowered):
+                return "standard"
+            return "lite"
+
+        def _build_ask_tools(active_container_id: str | None, tool_profile: str) -> list[dict[str, Any]]:
             container_config: dict[str, Any] | str
             if active_container_id:
                 container_config = active_container_id
             else:
                 container_config = {"type": "auto", "memory_limit": "4g"}
+            base_tools: list[dict[str, Any]] = [{"type": "shell"}, *self._build_bot_tools()]
+            if tool_profile == "lite":
+                return base_tools
+            if tool_profile == "standard":
+                return [{"type": "web_search"}, *base_tools]
             return [
                 {"type": "web_search"},
                 {"type": "code_interpreter", "container": container_config},
-                {"type": "shell"},
-                *self._build_bot_tools(),
+                *base_tools,
                 *self._build_browser_tools(),
             ]
 
         run_ids: list[str] = []
         ask_error_message: str | None = None
+        prev_id, compacted_prefix_items = await self._maybe_compact_previous_response(
+            prev_id=prev_id,
+            state_key=state_key,
+            model="gpt-5.2-2025-12-11",
+            instructions=instructions,
+        )
         try:
             content_parts: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
 
@@ -12190,7 +12302,29 @@ class Ask(commands.Cog):
 
                 content_parts.append({"type": "input_image", "image_url": image_url})
 
-            input_items = [{"role": "user", "content": content_parts}]
+            tool_profile = _pick_tool_profile(text)
+            prompt_cache_key = f"{ASK_PROMPT_CACHE_BASE_KEY}:{tool_profile}"
+
+            dynamic_context_lines = [
+                "# Dynamic request context",
+                f"Discord username: {username}",
+                f"Current time: {current_time}",
+                f"Ask workspace: {workspace_rel}",
+                f"Required single-arg commands: {', '.join(f'/{name}' for name in required_arg_commands) if required_arg_commands else '(none listed)'}",
+                f"Available commands snapshot: {commands_text}",
+                link_context_prompt.strip() if link_context_prompt.strip() else "Link context: (none)",
+            ]
+            content_parts.append(
+                {
+                    "type": "input_text",
+                    "text": "\n".join(dynamic_context_lines),
+                }
+            )
+
+            input_items: list[dict[str, Any]] = []
+            if compacted_prefix_items:
+                input_items.extend(compacted_prefix_items)
+            input_items.append({"role": "user", "content": content_parts})
 
             status_ui = _AskStatusUI(
                 ctx,
@@ -12234,7 +12368,7 @@ class Ask(commands.Cog):
                                 "Ask container rehydration notes: %s",
                                 "; ".join(rehydrate_notes),
                             )
-                tools = _build_ask_tools(container_id)
+                tools = _build_ask_tools(container_id, tool_profile)
                 try:
                     resp, all_outputs, error = await run_responses_agent(
                         self._responses_create,
@@ -12252,6 +12386,8 @@ class Ask(commands.Cog):
                         event_cb=status_ui.emit,
                         reasoning=_ask_reasoning_cfg(),
                         text=_ask_structured_output_cfg(),
+                        prompt_cache_retention=ASK_PROMPT_CACHE_RETENTION,
+                        prompt_cache_key=prompt_cache_key,
                         toolgate=getattr(ctx, "task_toolgate", None),
                         background=use_background,
                         response_id_cb=_record_response_id,
@@ -12323,6 +12459,7 @@ class Ask(commands.Cog):
                 response_id = getattr(resp, "id", None)
                 if isinstance(response_id, str) and response_id:
                     self.bot.ai_last_response_id[state_key] = response_id  # type: ignore[attr-defined]
+                    self._ask_turn_count_by_state[state_key] = self._ask_turn_count_by_state.get(state_key, 0) + 1
                     self._save_ask_state_store()
             except Exception:
                 pass

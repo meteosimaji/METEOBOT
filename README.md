@@ -18,6 +18,7 @@
    - `ASK_CONTAINER_SYNC_INTERVAL_S` — how often to sync container files into the workspace to avoid data loss (defaults to `300`).
    - `ASK_LINK_CONTEXT_MAX_ENTRIES` — max stored link-context entries per channel (defaults to `50`).
    - `ASK_LINK_CONTEXT_MAX_PROMPT` — number of recent links included in `/ask` prompt context (defaults to `10`).
+   - `ASK_COMPACT_INTERVAL` — when greater than `0`, `/ask` compacts the `previous_response_id` chain every N completed turns using `responses.compact` to control context growth (defaults to `0`, disabled).
    - `ASK_OPERATOR_DEFAULT_URL` — initial URL to open in the operator browser (defaults to `https://www.google.com`).
    - `ASK_OPERATOR_HEADLESS` — whether `/operator` starts headless (`true`/`false`, defaults to `false`).
    - `ASK_OPERATOR_AUTOSTART_XVFB` — when headed mode needs an X server and `$DISPLAY` is missing, start `Xvfb` automatically (`true`/`false`, defaults to `true`).
