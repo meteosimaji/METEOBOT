@@ -1796,6 +1796,24 @@ def _format_sources_block(*, main_sources: list[dict[str, str]], sauce_sources: 
     return "\n\n".join(sections)
 
 
+def _build_sources_embed(
+    *,
+    main_sources: list[dict[str, str]],
+    sauce_sources: list[dict[str, str]],
+) -> discord.Embed | None:
+    sources_block = _format_sources_block(
+        main_sources=main_sources,
+        sauce_sources=sauce_sources,
+    )
+    if not sources_block:
+        return None
+    return discord.Embed(
+        title="🔎 Source links",
+        description=_truncate_discord(sources_block, 4096),
+        color=0x2F3136,
+    )
+
+
 def _question_preview(text: str, limit: int = 15) -> str:
     """Return the first ``limit`` characters of ``text``, appending an ellipsis if truncated."""
     trimmed = (text or "").strip()
@@ -12789,12 +12807,10 @@ class Ask(commands.Cog):
                     main_source_entries = _normalize_source_entries(structured_sources)
 
             sauce_entries = _extract_web_search_action_sources(all_outputs)
-            sources_block = _format_sources_block(
+            sources_embed = _build_sources_embed(
                 main_sources=main_source_entries,
                 sauce_sources=sauce_entries,
             )
-            if sources_block:
-                answer = f"{answer}\n\n{sources_block}"
 
             link_context_entries = self._prune_link_context(self._load_link_context(ctx))
             answer = self._expand_link_placeholders(answer, [], link_context_entries)
@@ -12876,7 +12892,13 @@ class Ask(commands.Cog):
                 preview_limit = max(1, 4096 - len(note))
                 embed.description = f"{note}{_truncate_discord(answer, preview_limit)}"
                 _clamp_embed_description(embed)
+            reply_embeds: list[discord.Embed] = [embed]
+            if sources_embed is not None:
+                reply_embeds.append(sources_embed)
+
             reply_kwargs: dict[str, Any] = {"embed": embed}
+            if len(reply_embeds) > 1:
+                reply_kwargs = {"embeds": reply_embeds}
             if files:
                 reply_kwargs["files"] = files
             await self._reply_required(ctx, **reply_kwargs)
