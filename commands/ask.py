@@ -1505,8 +1505,20 @@ def _ask_structured_output_cfg() -> dict[str, Any]:
                             "required": ["name", "kind", "value"],
                         },
                     },
+                    "sources": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "title": {"type": "string"},
+                                "url": {"type": "string"},
+                            },
+                            "required": ["title", "url"],
+                        },
+                    },
                 },
-                "required": ["title", "answer", "reasoning_summary", "tool_timeline", "artifacts"],
+                "required": ["title", "answer", "reasoning_summary", "tool_timeline", "artifacts", "sources"],
             },
         }
     }
@@ -1535,6 +1547,7 @@ def _parse_ask_structured_output(raw_text: str) -> dict[str, Any] | None:
     reasoning_summary = parsed.get("reasoning_summary")
     tool_timeline = parsed.get("tool_timeline")
     artifacts = parsed.get("artifacts")
+    sources = parsed.get("sources")
 
     if not isinstance(title, str):
         return None
@@ -1563,12 +1576,22 @@ def _parse_ask_structured_output(raw_text: str) -> dict[str, Any] | None:
     ):
         return None
 
+    if not isinstance(sources, list) or not all(
+        isinstance(item, dict)
+        and isinstance(item.get("title"), str)
+        and isinstance(item.get("url"), str)
+        and set(item.keys()) <= {"title", "url"}
+        for item in sources
+    ):
+        return None
+
     return {
         "title": title,
         "answer": answer,
         "reasoning_summary": reasoning_summary,
         "tool_timeline": tool_timeline,
         "artifacts": artifacts,
+        "sources": sources,
     }
 
 
@@ -1656,6 +1679,121 @@ def _extract_response_text(resp: Any) -> str:
             if isinstance(text, str) and text:
                 parts.append(text)
     return "".join(parts)
+
+
+def _get_output_field_value(item: Any, key: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(key)
+    return getattr(item, key, None)
+
+
+def _normalize_source_url(url: str) -> str | None:
+    normalized = (url or "").strip()
+    if not normalized:
+        return None
+    try:
+        parsed = urlparse(normalized)
+    except Exception:
+        return None
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if not parsed.netloc:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    cleaned = parsed._replace(fragment="").geturl().strip()
+    return cleaned or None
+
+
+def _normalize_source_entries(raw_sources: list[Any]) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+
+    for item in raw_sources:
+        if not isinstance(item, dict):
+            continue
+        url_value = item.get("url")
+        if not isinstance(url_value, str):
+            continue
+        normalized_url = _normalize_source_url(url_value)
+        if not normalized_url:
+            continue
+        title_value = item.get("title")
+        title = title_value.strip() if isinstance(title_value, str) else ""
+        entries.append({"title": title, "url": normalized_url})
+
+    return entries
+
+
+def _extract_message_url_citations(outputs: list[Any]) -> list[dict[str, str]]:
+    """Fallback source extraction from assistant message url_citation annotations."""
+
+    entries: list[dict[str, str]] = []
+
+    for item in outputs:
+        item_type = _get_output_field_value(item, "type")
+        if item_type != "message":
+            continue
+
+        content = _get_output_field_value(item, "content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            annotations = _get_output_field_value(part, "annotations")
+            if not isinstance(annotations, list):
+                continue
+            for annotation in annotations:
+                if _get_output_field_value(annotation, "type") != "url_citation":
+                    continue
+                entries.append(
+                    {
+                        "url": _get_output_field_value(annotation, "url"),
+                        "title": _get_output_field_value(annotation, "title"),
+                    }
+                )
+
+    return _normalize_source_entries(entries)
+
+
+def _extract_web_search_action_sources(outputs: list[Any]) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for item in outputs:
+        if _get_output_field_value(item, "type") != "web_search_call":
+            continue
+        action = _get_output_field_value(item, "action")
+        if action is None:
+            continue
+        sources = _get_output_field_value(action, "sources")
+        if not isinstance(sources, list):
+            continue
+        for source in sources:
+            if isinstance(source, dict):
+                entries.append({"title": "", "url": source.get("url")})
+            else:
+                entries.append(
+                    {
+                        "title": "",
+                        "url": _get_output_field_value(source, "url"),
+                    }
+                )
+    return _normalize_source_entries(entries)
+
+
+def _format_source_section(label: str, sources: list[dict[str, str]]) -> str:
+    if not sources:
+        return ""
+    lines = [f"[{idx}] {item['url']}" for idx, item in enumerate(sources, start=1)]
+    return f"{label}\n" + "\n".join(lines)
+
+
+def _format_sources_block(*, main_sources: list[dict[str, str]], sauce_sources: list[dict[str, str]]) -> str:
+    sections: list[str] = []
+    main_section = _format_source_section("🧭Main sauce", main_sources)
+    if main_section:
+        sections.append(main_section)
+    sauce_section = _format_source_section("🔗Sources", sauce_sources)
+    if sauce_section:
+        sections.append(sauce_section)
+    return "\n\n".join(sections)
 
 
 def _question_preview(text: str, limit: int = 15) -> str:
@@ -12359,11 +12497,14 @@ class Ask(commands.Cog):
             "Speak casually (no polite speech). "
             "Your built-in knowledge might be wrong or outdated; question it and seek fresh verification. "
             "Respond in JSON matching the provided schema. "
-            "Provide a short, user-facing title in title. "
+            "Provide a short, user-facing title in title. Start title with exactly one emoji that reflects the tone/direction of the answer. "
             "Write concise user-facing content in answer. "
             "reasoning_summary must be safe-to-share bullet-style observations, not private chain-of-thought. "
             "tool_timeline should summarize what tools you used and why. "
             "artifacts should list files/links/notes you produced; use kind='none' with a short note when there are no artifacts. "
+            "sources must list the main external URLs you actually used to support the answer (main sauce), "
+            "with each entry as {title, url}. Keep it empty when no external source was used. "
+            "Keep each source title concise (roughly <= 80 characters) and specific. "
             "Be brief and start with the conclusion; add details only when necessary. "
             "Avoid shaky overconfident claims; verify with web_search when needed. "
             "Use the browser tool to navigate web pages when search snippets are not enough; prefer role-based actions "
@@ -12641,6 +12782,20 @@ class Ask(commands.Cog):
             else:
                 answer = output_text.strip() or "(no output)"
 
+            main_source_entries: list[dict[str, str]] = []
+            if structured is not None:
+                structured_sources = structured.get("sources")
+                if isinstance(structured_sources, list):
+                    main_source_entries = _normalize_source_entries(structured_sources)
+
+            sauce_entries = _extract_web_search_action_sources(all_outputs)
+            sources_block = _format_sources_block(
+                main_sources=main_source_entries,
+                sauce_sources=sauce_entries,
+            )
+            if sources_block:
+                answer = f"{answer}\n\n{sources_block}"
+
             link_context_entries = self._prune_link_context(self._load_link_context(ctx))
             answer = self._expand_link_placeholders(answer, [], link_context_entries)
 
@@ -12648,10 +12803,9 @@ class Ask(commands.Cog):
             if structured is not None:
                 title_text = (structured.get("title") or "").strip()
             if not title_text:
-                title_text = _question_preview(text, limit=200) or "Ask"
+                title_text = f"💬 {_question_preview(text, limit=200) or 'Ask'}"
             else:
                 title_text = _truncate_discord(title_text, 200)
-            title_text = f"\U0001F4AC {title_text}"
             files: list[discord.File] = []
             max_file_bytes = (
                 getattr(getattr(ctx, "guild", None), "filesize_limit", None)
