@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from commands.ask import (  # noqa: E402
+    _build_sources_embed,
     _extract_message_url_citations,
     _extract_web_search_action_sources,
     _format_sources_block,
@@ -105,6 +106,21 @@ def test_format_sources_block_supports_main_and_sauce_sections() -> None:
 
 def test_format_sources_block_empty_when_no_sources() -> None:
     assert _format_sources_block(main_sources=[], sauce_sources=[]) == ""
+
+
+def test_build_sources_embed_returns_discord_embed_with_sources() -> None:
+    embed = _build_sources_embed(
+        main_sources=[{"title": "OpenAI", "url": "https://openai.com"}],
+        sauce_sources=[{"title": "", "url": "https://youtube.com"}],
+    )
+
+    assert embed is not None
+    assert embed.title == "🔎 Source links"
+    assert embed.description == "🧭Main sauce\n[1] https://openai.com\n\n🔗Sources\n[1] https://youtube.com"
+
+
+def test_build_sources_embed_returns_none_when_sources_are_empty() -> None:
+    assert _build_sources_embed(main_sources=[], sauce_sources=[]) is None
 
 
 def test_parse_structured_output_accepts_sources_field() -> None:
