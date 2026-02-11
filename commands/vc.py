@@ -29,6 +29,8 @@ class VC(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Join, move, or leave voice/stage channels.",
+            "plus": "No argument joins your channel; specifying channel/ID moves there; repeating on the same channel disconnects with 30s queue hold.",
             "pro": (
                 "Use without arguments to join your voice channel. Provide a channel or ID "
                 "to move the bot between voice channels; if already in that channel, "

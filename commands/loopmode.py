@@ -24,6 +24,8 @@ class LoopMode(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Set repeat mode for playback (track, queue, or off).",
+            "plus": "Use TRACK/QUEUE/OFF (ON maps to QUEUE); omitting the argument shows the current loop mode.",
             "pro": (
                 "Sets loop to repeat the current track, the whole queue, or turn looping off. "
                 "Shows the current mode when no value is provided. `ON` aliases to `QUEUE`. "

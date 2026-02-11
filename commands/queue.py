@@ -373,6 +373,8 @@ class Queue(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Display queued tracks and manage playback controls.",
+            "plus": "Queue view includes buttons/modals for pause, resume, loop, skip, remove, tuning, and Auto Leave controls.",
             "pro": (
                 "List songs waiting to play with interactive controls (pause/resume, loop, skip, bye, remove). "
                 "Also provides modals to adjust speed and pitch, plus an Auto Leave toggle that "

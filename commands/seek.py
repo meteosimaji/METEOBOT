@@ -57,6 +57,8 @@ class Seek(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Jump playback to an absolute timestamp or relative offset.",
+            "plus": "Examples: 1:23 (absolute), +30 / -15 (relative seconds).",
             "pro": "Seeks within the current track. Relative seeks use + or -.",
         },
     )

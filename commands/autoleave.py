@@ -24,6 +24,8 @@ class AutoLeave(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Toggle or check Auto Leave behavior for voice sessions.",
+            "plus": "Use ON/OFF/NOW; omitting the argument behaves like NOW and shows current status.",
             "pro": (
                 "Auto Leave will disconnect when the bot is idle or alone in voice. "
                 "Passing no value shows the current state, ON enables, OFF disables. "

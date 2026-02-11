@@ -55,6 +55,8 @@ class SearchPlay(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Find candidate tracks without adding them to the queue yet.",
+            "plus": "Returns up to five ranked results with durations so you can choose one URL for /play.",
             "pro": (
                 "Runs a yt-dlp search and lists up to five candidates with durations. "
                 "Pick one result and pass its URL to /play when you are ready."

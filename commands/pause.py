@@ -25,6 +25,8 @@ class Pause(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Pause the current track without clearing the queue.",
+            "plus": "Pair with /resume to continue from the paused position.",
             "pro": "Pauses playback and keeps your place so you can /resume later.",
         },
     )

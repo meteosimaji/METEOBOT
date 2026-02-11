@@ -415,6 +415,8 @@ class CodexRun(commands.Cog):
         ),
         extras={
             "category": "Tools",
+            "destination": "Run Codex CLI in an isolated workspace and return the patch result.",
+            "plus": "Accepts plain prompts or JSON spec input; owner-only and can optionally open a PR when configured.",
             "pro": (
                 "Owner-only: runs Codex CLI in a temporary workspace, returns the git diff, "
                 "and can open a GitHub PR when configured."

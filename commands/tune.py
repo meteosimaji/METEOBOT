@@ -39,6 +39,8 @@ class Tune(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Adjust playback speed and pitch with one command string.",
+            "plus": "Accepts compact key:value style input so it can be safely invoked from /ask tool flows.",
             "pro": (
                 "Fine-tune playback speed and pitch. Implemented as a single string argument "
                 "so the LLM can invoke it via bot_invoke."

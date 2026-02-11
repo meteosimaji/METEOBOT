@@ -477,6 +477,8 @@ class Purge(commands.Cog):
         ),
         extras={
             "category": "Moderation",
+            "destination": "Bulk-delete messages with optional filters and safety checks.",
+            "plus": "Supports amount/user/channel/link/keyword targeting and asks confirmation for wide or risky deletions.",
             "pro": (
                 "Combine filters such as amount, user, channel, message links or "
                 "wildcard phrases to target specific messages. The bot summarises "

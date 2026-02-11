@@ -742,6 +742,8 @@ class Messages(commands.Cog):
         ),
         extras={
             "category": "Utility",
+            "destination": "Search and display recent Discord messages with filters.",
+            "plus": "Supports rich filters (from:, mentions:, role:, has:, keyword:, before:/after:, in:, scope:, server:, scan:) and defaults display count to 50.",
             "pro": (
                 "If no count is provided the command shows 50 messages by default. "
                 "The count is clamped to a maximum of 50. Query filters like from:, "

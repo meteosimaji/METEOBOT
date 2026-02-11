@@ -25,6 +25,8 @@ class Resume(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Resume paused playback from the saved position.",
+            "plus": "Works after /pause; if nothing is paused it reports the current state.",
             "pro": "Restarts the paused track from the exact spot it stopped.",
         },
     )

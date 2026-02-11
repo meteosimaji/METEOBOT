@@ -176,6 +176,8 @@ class Play(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Queue and start music playback from URLs, search terms, or attachments.",
+            "plus": "Supports YouTube/Spotify/Niconico links and text search; empty argument joins voice, and attachments are treated as playable media.",
             "pro": (
                 "Supports URLs from YouTube, Spotify and Niconico as well as "
                 "plain search terms. Prefix usage can also attach media files; "

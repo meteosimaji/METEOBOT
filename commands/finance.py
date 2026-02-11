@@ -1775,6 +1775,8 @@ class Finance(commands.Cog):
         ),
         extras={
             "category": "Tools",
+            "destination": "Analyze market data with quote, indicators, forecast, and chart actions.",
+            "plus": "Use key:value arguments (e.g., symbol:, action:, period:, interval:); action:search helps when you only know a company name.",
             "pro": (
                 "Flexible symbol matching (tickers or Yahoo search resolution) plus "
                 "best-effort data pulls from Yahoo Finance via yfinance, "
