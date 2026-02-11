@@ -338,6 +338,8 @@ class Say(commands.Cog):
         ),
         extras={
             "category": "Utility",
+            "destination": "Post immediate or scheduled announcement messages.",
+            "plus": "Supports recurring schedules (weekday/everyday/--HH:MM) and one-shot delays via in:<duration> syntax.",
             "pro": (
                 "Append `--HH:MM` times and weekday tokens (mon/tue/...) to schedule recurring posts. "
                 "Use `everyday` for daily repeats, or `in:30m` for a one-time delay."

@@ -25,6 +25,8 @@ class Bye(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Stop playback, clear queue state, and disconnect from voice.",
+            "plus": "Use when you want an immediate hard stop; this leaves voice even if Auto Leave is disabled.",
             "pro": "Always leaves the voice channel after clearing playback, regardless of Auto Leave.",
         },
     )

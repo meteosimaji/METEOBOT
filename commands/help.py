@@ -11,6 +11,8 @@ from utils import (
     tag_error_text,
 )
 from datetime import datetime, timezone
+import inspect
+import re
 from difflib import SequenceMatcher
 from typing import Iterable, List, Tuple
 
@@ -66,7 +68,10 @@ def make_help_pages(bot: commands.Bot, category: str) -> List[discord.Embed]:
         cat = c.extras.get("category", "Utility")
         if category != "All" and cat != category:
             continue
-        text = c.description if category == "All" else (c.help or c.description or "-")
+        extras = getattr(c, "extras", {}) or {}
+        destination = extras.get("destination") or c.description or "-"
+        plus = extras.get("plus") or c.help or c.description or "-"
+        text = destination if category == "All" else f"{plus}\n{destination}"
         entries.append((f"/{c.qualified_name}", text or "-"))
     for e in events:
         cat = getattr(e, "category", "Utility")
@@ -91,6 +96,58 @@ def make_help_pages(bot: commands.Bot, category: str) -> List[discord.Embed]:
     return pages
 
 
+def _build_arg_help_text(cmd: commands.Command) -> str:
+    try:
+        sig = inspect.signature(cmd.callback)
+    except (TypeError, ValueError):
+        return "Unknown"
+
+    params = [
+        p
+        for p in sig.parameters.values()
+        if p.name not in {"self", "ctx", "interaction", "context"}
+    ]
+
+    if not params:
+        return "No argument (use empty arg in bot_invoke)."
+
+    details: list[str] = []
+    for param in params:
+        if param.kind in {param.VAR_POSITIONAL, param.VAR_KEYWORD}:
+            details.append(f"{param.name} (variadic)")
+            continue
+
+        required = param.default is inspect._empty
+        requirement = "required" if required else "optional"
+        anno = param.annotation
+        if anno in {inspect._empty, str}:
+            type_name = "string"
+        elif anno is int:
+            type_name = "integer"
+        elif getattr(anno, "__name__", "") in {"Member", "User"}:
+            type_name = "member/user"
+        else:
+            type_name = getattr(anno, "__name__", str(anno))
+
+        details.append(f"{param.name} ({type_name}, {requirement})")
+
+    return "\n".join(details)
+
+
+def _extract_help_examples(help_text: str | None) -> str:
+    if not help_text:
+        return "(no examples)"
+    samples: list[str] = []
+    for match in re.findall(r"`([^`]+)`", help_text):
+        text = match.strip()
+        if not text:
+            continue
+        samples.append(text)
+    if not samples:
+        return "(no examples)"
+    return "\n".join(f"• `{sample}`" for sample in samples[:5])
+
+
 def make_command_help_embed(bot: commands.Bot, name: str) -> discord.Embed | None:
     """Build a help embed for a command or event."""
     cmd = bot.get_command(name)
@@ -101,20 +158,21 @@ def make_command_help_embed(bot: commands.Bot, name: str) -> discord.Embed | Non
             color=0xE67E22,
             timestamp=datetime.now(timezone.utc),
         )
-        destination = cmd.description
+        destination = extras.get("destination") or cmd.description
         if destination:
             embed.add_field(name="Destination", value=destination, inline=False)
-        if cmd.help:
-            embed.add_field(name="Plus", value=cmd.help, inline=False)
+        plus = extras.get("plus") or cmd.help
+        if plus:
+            embed.add_field(name="Plus", value=plus, inline=False)
         pro = extras.get("pro")
         if pro:
             embed.add_field(name="Pro", value=pro, inline=False)
-        if cmd.usage:
-            embed.add_field(
-                name="Usage",
-                value=f"/{cmd.qualified_name} {cmd.usage}",
-                inline=False,
-            )
+        usage_value = f"/{cmd.qualified_name}" + (f" {cmd.usage}" if cmd.usage else "")
+        embed.add_field(name="Usage", value=usage_value, inline=False)
+        aliases = ", ".join(f"`{alias}`" for alias in cmd.aliases) if cmd.aliases else "(none)"
+        embed.add_field(name="Aliases", value=aliases, inline=False)
+        embed.add_field(name="Arg (bot_invoke)", value=_build_arg_help_text(cmd), inline=False)
+        embed.add_field(name="Examples", value=_extract_help_examples(cmd.help), inline=False)
         embed.set_footer(text="Crafted with care ✨")
         return embed
     info = next((e for e in getattr(bot, "events", []) if e.name == name), None)
@@ -295,11 +353,12 @@ class Help(commands.Cog):
         ),
         extras={
             "category": "Utility",
+            "destination": "Browse all commands/events by category or open detailed help for one target.",
+            "plus": "Use /help with no argument for interactive category pages, or /help <name> for Destination/Plus/Pro/Usage/Aliases/Arg/Examples details.",
             "pro": (
                 "Running `/help` opens a button-driven menu showing AI, Games, "
                 "Moderation, Music, Tools and Utility sections. Selecting a "
-                "category filters the commands. `/help <command>` jumps straight "
-                "to a detailed embed with usage notes and any extra tips."
+                "category filters the commands. `/help <command>` shows Destination, Plus, Pro, Usage, aliases, argument shape, and extracted runnable examples."
             )
         },
     )

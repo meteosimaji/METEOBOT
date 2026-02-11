@@ -53,6 +53,8 @@ class Upload(commands.Cog):
         usage="<path?>",
         extras={
             "category": "Tools",
+            "destination": "Publish a temporary download link for a file path or attachment.",
+            "plus": "Use with /ask outputs (e.g., /mnt/data paths) or direct attachments; returns expiring simajilord.com/save links.",
             "pro": (
                 "Accepts a /mnt/data path from /ask outputs or file attachments, then returns a "
                 "temporary simajilord.com/save link. Links expire automatically."

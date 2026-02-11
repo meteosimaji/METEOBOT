@@ -31,6 +31,8 @@ class Remove(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Remove queued tracks by add-order number or track ID.",
+            "plus": "Run without an argument to list removable entries first, then pass index/ID (comma-separated values supported).",
             "pro": (
                 "Counts by addition order rather than queue position. Looping or reordering won't change the index. "
                 "Call without a number to show a numbered list (with IDs), then pass a number or ID to remove. "

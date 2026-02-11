@@ -91,3 +91,45 @@ def test_bot_commands_marks_hack_and_unhack_as_llm_blocked() -> None:
         assert unhack_info["llm_blocked_reason"] == "blocked_command"
 
     asyncio.run(_run())
+
+
+def test_bot_commands_includes_help_level_metadata() -> None:
+    ask = _make_ask()
+
+    @commands.command(
+        name="demo",
+        description="Demo description",
+        help="Demo long help",
+        usage="<value>",
+        extras={"category": "Utility", "destination": "Demo destination", "plus": "Demo plus", "pro": "Demo pro"},
+    )
+    async def demo_cmd(ctx: commands.Context, *, value: str) -> None:
+        return None
+
+    ask.bot.add_command(demo_cmd)
+
+    async def _always_can_run(ctx: commands.Context, command: commands.Command) -> tuple[bool, str]:
+        return True, ""
+
+    ask._can_run_command = _always_can_run  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        ctx = cast(commands.Context[Any], _make_ctx())
+        info = await ask._function_router(ctx, "bot_commands", {"name": "demo"})
+
+        assert isinstance(info, dict)
+        assert info["description"] == "Demo description"
+        assert info["destination"] == "Demo destination"
+        assert info["help"] == "Demo long help"
+        assert info["plus"] == "Demo plus"
+        assert info["pro"] == "Demo pro"
+        assert info["usage"].endswith("<value>")
+        assert info["supports_argument"] is True
+        assert info["argument_required"] is True
+        assert info["argument_name"] == "value"
+        assert info["argument_type"] == "string"
+        assert isinstance(info["arg_guide"], str) and info["arg_guide"]
+        assert "bot_invoke" in info["invoke_example"]
+        assert info["admin_only"] is False
+
+    asyncio.run(_run())

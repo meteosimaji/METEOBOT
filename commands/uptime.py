@@ -43,6 +43,8 @@ class Uptime(commands.Cog):
         ),
         extras={
             "category": "Utility",
+            "destination": "Show bot runtime duration and current-day progress.",
+            "plus": "Reports human-readable uptime plus a day-progress bar using the configured guild timezone.",
             "pro": (
                 "Shows how long the bot has been running since its last restart. "
                 "A progress bar illustrates how much of the current day has passed "

@@ -26,6 +26,8 @@ class Now(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Show the currently playing track and playback progress.",
+            "plus": "Includes elapsed/total time, a visual progress bar, and metadata from the active player state.",
             "pro": (
                 "Display details about the currently playing track, including a progress bar, "
                 "elapsed/total time and duration when available."

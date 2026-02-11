@@ -25,6 +25,8 @@ class Skip(commands.Cog):
         ),
         extras={
             "category": "Music",
+            "destination": "Skip the current track and move to the next queued item.",
+            "plus": "If no next track exists, playback stops until a new item is queued.",
             "pro": "Instantly jumps to the next track in the queue.",
         },
     )

@@ -26,6 +26,8 @@ class Ping(commands.Cog):
         ),
         extras={
             "category": "Utility",
+            "destination": "Measure bot/API/Gateway latency and heartbeat delay.",
+            "plus": "Shows separate timings so you can distinguish Discord API delay from websocket heartbeat delay.",
             "pro": (
                 "A short deferral measures API latency, a bare GET /gateway call "
                 "reports Gateway latency, and the heartbeat delay provides WebSocket "
