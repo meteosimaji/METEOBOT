@@ -1919,6 +1919,8 @@ ASK_CONTAINER_FILE_MAX_BYTES = _env_int(
     "ASK_CONTAINER_FILE_MAX_BYTES", 200 * 1024 * 1024, minimum=1
 )
 ASK_CONTAINER_FILE_MAX_COUNT = _env_int("ASK_CONTAINER_FILE_MAX_COUNT", 5, minimum=1)
+ASK_CONTAINER_FILE_LIST_LIMIT = min(100, _env_int("ASK_CONTAINER_FILE_LIST_LIMIT", 100, minimum=1))
+ASK_CONTAINER_FILE_SCAN_LIMIT = _env_int("ASK_CONTAINER_FILE_SCAN_LIMIT", 1000, minimum=1)
 ASK_CONTAINER_FILE_RETAIN_S = _env_int("ASK_CONTAINER_FILE_RETAIN_S", 24 * 60 * 60, minimum=60)
 ASK_CONTAINER_FILE_LIST_TIMEOUT_S = _env_int(
     "ASK_CONTAINER_FILE_LIST_TIMEOUT_S", 10, minimum=1
@@ -7192,30 +7194,50 @@ class Ask(commands.Cog):
                     container_ids.append(container)
         return container_ids
 
-    async def _list_container_files(self, container_id: str) -> list[dict[str, Any]]:
+    async def _list_container_files_page(
+        self,
+        container_id: str,
+        *,
+        after: str | None = None,
+        limit: int = ASK_CONTAINER_FILE_LIST_LIMIT,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
         if not self._openai_token:
-            return []
-        url = f"https://api.openai.com/v1/containers/{container_id}/files?order=desc&limit=100"
+            return [], None, False
+        safe_limit = max(1, min(limit, 100))
+        params: dict[str, str] = {"order": "desc", "limit": str(safe_limit)}
+        if isinstance(after, str) and after:
+            params["after"] = after
+        url = f"https://api.openai.com/v1/containers/{container_id}/files"
         session = await self._get_http_session()
         timeout = aiohttp.ClientTimeout(total=ASK_CONTAINER_FILE_LIST_TIMEOUT_S)
         headers = {"Authorization": f"Bearer {self._openai_token}"}
         try:
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
+            async with session.get(url, params=params, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
+                    body = (await resp.text())[:500]
                     log.warning(
-                        "Container file list failed: status=%s container_id=%s",
+                        "Container file list failed: status=%s container_id=%s after=%s body=%s",
                         resp.status,
                         container_id,
+                        after,
+                        body,
                     )
-                    return []
+                    return [], None, False
                 payload = await resp.json()
         except Exception:
-            log.exception("Container file list failed: container_id=%s", container_id)
-            return []
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, list):
-            return []
-        return [item for item in data if isinstance(item, dict)]
+            log.exception("Container file list failed: container_id=%s after=%s", container_id, after)
+            return [], None, False
+        if not isinstance(payload, dict):
+            return [], None, False
+        data = payload.get("data")
+        files = [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+        last_id = payload.get("last_id")
+        has_more = bool(payload.get("has_more"))
+        return files, (last_id if isinstance(last_id, str) and last_id else None), has_more
+
+    async def _list_container_files(self, container_id: str) -> list[dict[str, Any]]:
+        files, _, _ = await self._list_container_files_page(container_id)
+        return files
 
     async def _download_container_file(
         self,
@@ -7236,11 +7258,13 @@ class Ask(commands.Cog):
         try:
             async with session.get(url, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
+                    body = (await resp.text())[:500]
                     log.warning(
-                        "Container file download failed: status=%s container_id=%s file_id=%s",
+                        "Container file download failed: status=%s container_id=%s file_id=%s body=%s",
                         resp.status,
                         container_id,
                         file_id,
+                        body,
                     )
                     return None, None
                 content_type = resp.headers.get("Content-Type")
@@ -7320,7 +7344,13 @@ class Ask(commands.Cog):
                     return True
                 if resp.status in {404, 410}:
                     return False
-                log.warning("Container retrieve failed: status=%s", resp.status)
+                body = (await resp.text())[:500]
+                log.warning(
+                    "Container retrieve failed: status=%s container_id=%s body=%s",
+                    resp.status,
+                    container_id,
+                    body,
+                )
                 return False
         except Exception:
             log.exception("Container retrieve failed: container_id=%s", container_id)
@@ -7464,28 +7494,84 @@ class Ask(commands.Cog):
                     notes.append(f"{filename}: {error}")
         return notes
 
+    @staticmethod
+    def _extract_link_placeholder_keys(text: str) -> set[str]:
+        if not text:
+            return set()
+        keys = {match.strip() for match in re.findall(r"\{\{link:([^}]+)\}\}", text)}
+        return {key for key in keys if key}
+
     async def _collect_container_file_links(
         self,
         *,
         ctx: commands.Context,
         workspace_dir: Path,
         outputs: list[Any],
+        fallback_container_id: str | None = None,
+        preferred_link_keys: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         notes: list[str] = []
         citations = self._iter_container_file_citations(outputs)
         if not self._openai_token:
             notes.append("Container files could not be saved (OPENAI_TOKEN missing).")
             return [], notes
-        if not citations:
-            container_ids = self._extract_container_ids(outputs)
-            for container_id in container_ids:
-                files = await self._list_container_files(container_id)
+
+        normalized_preferred_keys = {
+            key.strip() for key in (preferred_link_keys or set()) if isinstance(key, str) and key.strip()
+        }
+
+        def citation_keys(citation: dict[str, Any]) -> set[str]:
+            keys: set[str] = set()
+            for field in ("filename", "path", "id", "file_id"):
+                value = citation.get(field)
+                if isinstance(value, str) and value:
+                    keys.add(value)
+            filename = citation.get("filename")
+            if isinstance(filename, str) and filename:
+                basename = Path(filename).name
+                keys.add(basename)
+                keys.add(f"/mnt/data/{basename}")
+            path = citation.get("path")
+            if isinstance(path, str) and path:
+                basename = Path(path).name
+                keys.add(basename)
+                keys.add(f"/mnt/data/{basename}")
+            return keys
+
+        container_ids = self._extract_container_ids(outputs)
+        if isinstance(fallback_container_id, str) and fallback_container_id:
+            if fallback_container_id not in container_ids:
+                container_ids.append(fallback_container_id)
+
+        known_file_keys: set[tuple[str, str]] = set()
+        for citation in citations:
+            container_id = citation.get("container_id")
+            file_id = citation.get("file_id")
+            if isinstance(container_id, str) and container_id and isinstance(file_id, str) and file_id:
+                known_file_keys.add((container_id, file_id))
+
+        scanned_files = 0
+        for container_id in container_ids:
+            next_after: str | None = None
+            has_more = True
+            while has_more:
+                files, last_id, has_more = await self._list_container_files_page(
+                    container_id,
+                    after=next_after,
+                )
+                next_after = last_id
+                if not files:
+                    break
                 for item in files:
+                    scanned_files += 1
+                    if scanned_files > ASK_CONTAINER_FILE_SCAN_LIMIT:
+                        has_more = False
+                        break
                     file_id = item.get("id")
                     if not isinstance(file_id, str) or not file_id:
                         continue
-                    source = item.get("source")
-                    if isinstance(source, str) and source not in {"assistant", "user", "userassistant"}:
+                    file_key = (container_id, file_id)
+                    if file_key in known_file_keys:
                         continue
                     path = item.get("path")
                     filename = Path(path).name if isinstance(path, str) else file_id
@@ -7500,18 +7586,54 @@ class Ask(commands.Cog):
                             "path": path,
                         }
                     )
-                    if len(citations) >= ASK_CONTAINER_FILE_MAX_COUNT:
+                    known_file_keys.add(file_key)
+                    if not normalized_preferred_keys and len(citations) >= ASK_CONTAINER_FILE_MAX_COUNT:
+                        has_more = False
                         break
-                if len(citations) >= ASK_CONTAINER_FILE_MAX_COUNT:
+                if normalized_preferred_keys:
+                    matched_keys = set()
+                    for citation in citations:
+                        matched_keys.update(citation_keys(citation).intersection(normalized_preferred_keys))
+                    if matched_keys == normalized_preferred_keys:
+                        has_more = False
+                if not has_more:
                     break
-        if not citations:
-            notes.append("No container file citations found.")
-            return [], notes
-        if len(citations) > ASK_CONTAINER_FILE_MAX_COUNT:
+                if not next_after:
+                    break
+
+        if scanned_files > ASK_CONTAINER_FILE_SCAN_LIMIT:
             notes.append(
-                f"Only the first {ASK_CONTAINER_FILE_MAX_COUNT} generated files were saved."
+                f"Container file scan reached the safety limit ({ASK_CONTAINER_FILE_SCAN_LIMIT})."
             )
-            citations = citations[:ASK_CONTAINER_FILE_MAX_COUNT]
+            log.warning(
+                "Container file scan limit reached: scanned=%s limit=%s containers=%s preferred_keys=%s",
+                scanned_files,
+                ASK_CONTAINER_FILE_SCAN_LIMIT,
+                container_ids,
+                sorted(normalized_preferred_keys),
+            )
+
+        if not citations:
+            notes.append("No container files found.")
+            return [], notes
+
+        if len(citations) > ASK_CONTAINER_FILE_MAX_COUNT:
+            prioritized = [
+                (
+                    0
+                    if normalized_preferred_keys
+                    and citation_keys(citation).intersection(normalized_preferred_keys)
+                    else 1,
+                    idx,
+                    citation,
+                )
+                for idx, citation in enumerate(citations)
+            ]
+            prioritized.sort(key=lambda item: (item[0], item[1]))
+            citations = [citation for _, _, citation in prioritized[:ASK_CONTAINER_FILE_MAX_COUNT]]
+            notes.append(
+                f"Only the first {ASK_CONTAINER_FILE_MAX_COUNT} container files were saved."
+            )
         manifest = self._load_ask_workspace_manifest(workspace_dir)
         if not isinstance(manifest, dict):
             manifest = {}
@@ -12812,8 +12934,23 @@ class Ask(commands.Cog):
                 sauce_sources=sauce_entries,
             )
 
+            placeholder_keys = self._extract_link_placeholder_keys(answer)
+            generated_file_entries, generated_file_notes = await self._collect_container_file_links(
+                ctx=ctx,
+                workspace_dir=workspace_dir,
+                outputs=all_outputs,
+                fallback_container_id=container_id,
+                preferred_link_keys=placeholder_keys,
+            )
+            if generated_file_notes:
+                skipped_notes.extend(generated_file_notes)
+
             link_context_entries = self._prune_link_context(self._load_link_context(ctx))
-            answer = self._expand_link_placeholders(answer, [], link_context_entries)
+            answer = self._expand_link_placeholders(
+                answer,
+                generated_file_entries,
+                link_context_entries,
+            )
 
             title_text = ""
             if structured is not None:
