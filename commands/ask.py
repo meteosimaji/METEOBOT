@@ -12308,6 +12308,16 @@ class Ask(commands.Cog):
             else:
                 container_config = {"type": "auto", "memory_limit": "4g"}
             base_tools: list[dict[str, Any]] = [{"type": "shell"}, *self._build_bot_tools()]
+            ask_core_tools: list[dict[str, Any]] = [
+                {"type": "web_search"},
+                {"type": "code_interpreter", "container": container_config},
+            ]
+
+            if action == "ask":
+                if tool_profile == "full":
+                    return [*ask_core_tools, *base_tools, *self._build_browser_tools()]
+                return [*ask_core_tools, *base_tools]
+
             if tool_profile == "lite":
                 return base_tools
             if tool_profile == "standard":
