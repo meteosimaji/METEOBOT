@@ -9285,6 +9285,143 @@ class Ask(commands.Cog):
                 return True
         return False
 
+
+    @staticmethod
+    def _tool_signature(tool: dict[str, Any]) -> tuple[str, str]:
+        tool_type = str(tool.get("type") or "")
+        canonical = json.dumps(tool, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return tool_type, canonical
+
+    def _merge_tools(self, *tool_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for group in tool_groups:
+            for tool in group:
+                signature = self._tool_signature(tool)
+                if signature in seen:
+                    continue
+                merged.append(tool)
+                seen.add(signature)
+        return merged
+
+    def _build_declared_function_tools(self) -> list[dict[str, Any]]:
+        builder_names = [
+            name
+            for name in dir(self)
+            if name.startswith("_build_")
+            and name.endswith("_tools")
+            and name not in {"_build_declared_function_tools", "_build_tools_for_action"}
+        ]
+        tools: list[dict[str, Any]] = []
+        for builder_name in sorted(builder_names):
+            builder = getattr(self, builder_name, None)
+            if not callable(builder):
+                log.warning("Ask tool builder '%s' is not callable and was skipped.", builder_name)
+                continue
+            try:
+                built = builder()
+            except Exception:
+                log.exception("Ask tool builder '%s' failed.", builder_name)
+                continue
+            if not isinstance(built, list):
+                log.warning(
+                    "Ask tool builder '%s' returned %s (expected list); skipped.",
+                    builder_name,
+                    type(built).__name__,
+                )
+                continue
+            for index, item in enumerate(built):
+                if not isinstance(item, dict):
+                    log.warning(
+                        "Ask tool builder '%s' returned non-dict item at index %s; skipped.",
+                        builder_name,
+                        index,
+                    )
+                    continue
+                tools.append(item)
+        return tools
+
+    def _log_missing_tools_for_action(
+        self,
+        *,
+        action: str,
+        tool_profile: str,
+        expected_tools: list[dict[str, Any]],
+        assembled_tools: list[dict[str, Any]],
+    ) -> None:
+        expected_signatures = {self._tool_signature(tool) for tool in expected_tools}
+        assembled_signatures = {self._tool_signature(tool) for tool in assembled_tools}
+        missing_signatures = expected_signatures - assembled_signatures
+        if missing_signatures:
+            log.error(
+                "Missing tools detected for action=%s profile=%s: %s",
+                action,
+                tool_profile,
+                sorted(missing_signatures),
+            )
+
+        duplicate_counts: dict[tuple[str, str], int] = {}
+        for tool in assembled_tools:
+            signature = self._tool_signature(tool)
+            duplicate_counts[signature] = duplicate_counts.get(signature, 0) + 1
+        duplicates = sorted(sig for sig, count in duplicate_counts.items() if count > 1)
+        if duplicates:
+            log.error(
+                "Duplicate tools detected for action=%s profile=%s: %s",
+                action,
+                tool_profile,
+                duplicates,
+            )
+
+    def _build_tools_for_action(
+        self,
+        *,
+        action: str,
+        tool_profile: str,
+        container_config: dict[str, Any] | str,
+    ) -> list[dict[str, Any]]:
+        function_tools = self._build_declared_function_tools()
+        shell_tools: list[dict[str, Any]] = [{"type": "shell"}]
+        web_search_tools: list[dict[str, Any]] = [{"type": "web_search"}]
+        code_interpreter_tools: list[dict[str, Any]] = [
+            {"type": "code_interpreter", "container": container_config}
+        ]
+
+        if action == "ask":
+            expected_tools = [
+                *web_search_tools,
+                *code_interpreter_tools,
+                *shell_tools,
+                *function_tools,
+            ]
+            merged_tools = self._merge_tools(
+                web_search_tools,
+                code_interpreter_tools,
+                shell_tools,
+                function_tools,
+            )
+            self._log_missing_tools_for_action(
+                action=action,
+                tool_profile=tool_profile,
+                expected_tools=expected_tools,
+                assembled_tools=merged_tools,
+            )
+            return merged_tools
+
+        bot_tools = self._build_bot_tools()
+        browser_tools = self._build_browser_tools()
+        if tool_profile == "lite":
+            return self._merge_tools(shell_tools, bot_tools)
+        if tool_profile == "standard":
+            return self._merge_tools(web_search_tools, shell_tools, bot_tools)
+        return self._merge_tools(
+            web_search_tools,
+            code_interpreter_tools,
+            shell_tools,
+            bot_tools,
+            browser_tools,
+        )
+
     async def _function_router(
         self, ctx: commands.Context, name: str, args: dict[str, Any]
     ) -> dict[str, Any] | str:
@@ -12307,27 +12444,11 @@ class Ask(commands.Cog):
                 container_config = active_container_id
             else:
                 container_config = {"type": "auto", "memory_limit": "4g"}
-            base_tools: list[dict[str, Any]] = [{"type": "shell"}, *self._build_bot_tools()]
-            ask_core_tools: list[dict[str, Any]] = [
-                {"type": "web_search"},
-                {"type": "code_interpreter", "container": container_config},
-            ]
-
-            if action == "ask":
-                if tool_profile == "full":
-                    return [*ask_core_tools, *base_tools, *self._build_browser_tools()]
-                return [*ask_core_tools, *base_tools]
-
-            if tool_profile == "lite":
-                return base_tools
-            if tool_profile == "standard":
-                return [{"type": "web_search"}, *base_tools]
-            return [
-                {"type": "web_search"},
-                {"type": "code_interpreter", "container": container_config},
-                *base_tools,
-                *self._build_browser_tools(),
-            ]
+            return self._build_tools_for_action(
+                action=action,
+                tool_profile=tool_profile,
+                container_config=container_config,
+            )
 
         run_ids: list[str] = []
         ask_error_message: str | None = None
