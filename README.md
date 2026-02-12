@@ -67,6 +67,7 @@
 - `operator` — Open the operator panel link for manual browser control (use when the AI hits logins or CAPTCHA). The panel prioritizes ref-based clicks from observation bboxes and falls back to XY click only when no ref target is available.
 - `pause` / `resume` — Pause or resume playback.
 - `ping` — Check the bot's responsiveness with style and speed!
+- `poker` — Create a simajilord.com heads-up NLHE room link bound to your Discord identity; ranked rooms disable the in-match GTO button, and casual rooms keep the analysis button available. Current in-match GTO is a lightweight blueprint approximation (not a mathematically solved equilibrium) and replay shows separated A/B style scores with off-tree flags.
 - `play` — Queue music by URL or search phrase (YouTube/Spotify/Niconico), or run with no args to join your voice channel. Prefix usage also supports file attachments.
 - `purge` — Bulk delete messages using flexible filters.
 - `queue` — Show interactive queue panel (pause/resume, loop, skip, bye, remove, speed/pitch, toggle Auto Leave).
