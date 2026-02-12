@@ -33,6 +33,7 @@ class Room:
     sockets: set[web.WebSocketResponse]
     lock: asyncio.Lock
     last_client_action_id_by_user: dict[str, int]
+    socket_user_ids: dict[web.WebSocketResponse, str]
 
 
 class PokerService:
@@ -109,6 +110,23 @@ class PokerService:
                 )
                 """
             )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ranked_hand_reports (
+                    room_id TEXT NOT NULL,
+                    hand_no INTEGER NOT NULL,
+                    winner_user_id TEXT NOT NULL,
+                    loser_user_id TEXT NOT NULL,
+                    reported_by_user_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (room_id, hand_no)
+                )
+                """
+            )
+            try:
+                con.execute("ALTER TABLE blackjack_sessions ADD COLUMN double_up_used INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
 
     def _room(self, room_id: str, *, ranked: bool) -> Room:
         room = self._rooms.get(room_id)
@@ -117,7 +135,7 @@ class PokerService:
                 room.table.ranked = True
             return room
         table = TableState(room_id=room_id, config=TableConfig(), ranked=ranked)
-        room = Room(table=table, sockets=set(), lock=asyncio.Lock(), last_client_action_id_by_user={})
+        room = Room(table=table, sockets=set(), lock=asyncio.Lock(), last_client_action_id_by_user={}, socket_user_ids={})
         self._rooms[room_id] = room
         return room
 
@@ -147,6 +165,7 @@ class PokerService:
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
         room.sockets.add(ws)
+        room.socket_user_ids[ws] = str(profile["user_id"])
 
         async with room.lock:
             self._join_if_needed(room.table, profile)
@@ -195,11 +214,13 @@ class PokerService:
                             await ws.send_json({"type": "error", "error": str(exc)})
                         else:
                             self._persist_action(room.table.room_id, rec)
+                    self._run_bot_until_human_turn(room)
                     if client_action_id:
                         room.last_client_action_id_by_user[user_id] = client_action_id
                     await self._broadcast(room, ack_action_id=client_action_id or None)
         finally:
             room.sockets.discard(ws)
+            room.socket_user_ids.pop(ws, None)
         return ws
 
     async def handle_gto(self, request: web.Request) -> web.Response:
@@ -240,11 +261,12 @@ class PokerService:
         ranked = bool(profile.get("ranked", False))
         room = self._room(room_id, ranked=ranked)
         replay = replay_scores(room.table)
+        reveal_hole_cards = room.table.street == "showdown"
         players = [
             {
                 "user_id": p.user_id,
                 "nickname": p.nickname,
-                "hole": [str(card) for card in p.hole],
+                "hole": [str(card) for card in p.hole] if reveal_hole_cards else [],
             }
             for p in room.table.players
         ]
@@ -267,19 +289,44 @@ class PokerService:
             raise web.HTTPUnauthorized(text="invalid_token")
         if not bool(profile.get("ranked", False)):
             return web.json_response({"ok": False, "error": "ranked_only"}, status=400)
-        body = await request.json()
-        winner_user_id = str(body.get("winner_user_id") or "")
+
         room_id = request.match_info.get("room_id", "")
         room = self._rooms.get(room_id)
         if room is None:
             return web.json_response({"ok": False, "error": "room_not_found"}, status=404)
+
+        reporter_user_id = str(profile["user_id"])
         player_ids = [p.user_id for p in room.table.players]
-        if winner_user_id not in player_ids:
-            return web.json_response({"ok": False, "error": "winner_not_in_room"}, status=400)
-        loser_ids = [uid for uid in player_ids if uid != winner_user_id]
-        if not loser_ids:
+        if reporter_user_id not in player_ids:
+            return web.json_response({"ok": False, "error": "reporter_not_in_room"}, status=403)
+        if len(player_ids) != 2:
             return web.json_response({"ok": False, "error": "need_two_players"}, status=400)
-        loser_user_id = loser_ids[0]
+        if room.table.street != "showdown":
+            return web.json_response({"ok": False, "error": "hand_not_finished"}, status=400)
+        if room.table.winner is None:
+            return web.json_response({"ok": False, "error": "tie_hand_no_winner"}, status=400)
+
+        body = await request.json()
+        expected_hand_no = int(body.get("hand_no") or room.table.hand_no)
+        if expected_hand_no != room.table.hand_no:
+            return web.json_response({"ok": False, "error": "hand_no_mismatch"}, status=400)
+
+        winner_user_id = room.table.players[room.table.winner].user_id
+        requested_winner = str(body.get("winner_user_id") or winner_user_id)
+        if requested_winner != winner_user_id:
+            return web.json_response({"ok": False, "error": "winner_mismatch"}, status=400)
+        loser_user_id = next(uid for uid in player_ids if uid != winner_user_id)
+
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self._db_path) as con:
+            try:
+                con.execute(
+                    "INSERT INTO ranked_hand_reports (room_id, hand_no, winner_user_id, loser_user_id, reported_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (room_id, room.table.hand_no, winner_user_id, loser_user_id, reporter_user_id, now),
+                )
+            except sqlite3.IntegrityError:
+                return web.json_response({"ok": False, "error": "already_reported"}, status=409)
+
         winner_state = self._load_rating_state(winner_user_id)
         loser_state = self._load_rating_state(loser_user_id)
 
@@ -302,6 +349,7 @@ class PokerService:
                 "ok": True,
                 "winner": {"user_id": winner_user_id, **winner_state},
                 "loser": {"user_id": loser_user_id, **loser_state},
+                "hand_no": room.table.hand_no,
             }
         )
 
@@ -432,15 +480,18 @@ class PokerService:
 
         tip_paid = 0
         if result == "win" and tip_mode:
-            tip_paid = ((bet * 5 + 99) // 100 // 100) * 100
+            tip_raw = (bet * 5 + 99) // 100
+            tip_paid = ((tip_raw + 99) // 100) * 100
             delta -= tip_paid
 
         now = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self._db_path) as con:
-            con.execute(
+            cur = con.execute(
                 "INSERT INTO blackjack_sessions (user_id, bet, result, tip_mode, tip_paid, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (user_id, bet, result, int(tip_mode), tip_paid, now),
             )
+            session_row_id = cur.lastrowid
+            session_id = int(session_row_id) if session_row_id is not None else 0
             con.execute(
                 "INSERT INTO coin_ledger (user_id, delta, reason, created_at) VALUES (?, ?, ?, ?)",
                 (user_id, delta, f"blackjack:{result}", now),
@@ -455,6 +506,7 @@ class PokerService:
                 "player": player,
                 "dealer": dealer,
                 "can_double_up": result == "win",
+                "double_up_session_id": session_id if result == "win" else None,
             }
         )
 
@@ -464,19 +516,38 @@ class PokerService:
         if not profile:
             raise web.HTTPUnauthorized(text="invalid_token")
         body = await request.json()
-        amount = int(body.get("amount") or 0)
-        if amount <= 0:
-            return web.json_response({"ok": False, "error": "invalid_amount"}, status=400)
-        win = bool(self._rng.randint(0, 1))
-        delta = amount if win else -amount
+        session_id = int(body.get("session_id") or 0)
         user_id = str(profile["user_id"])
-        now = datetime.now(timezone.utc).isoformat()
+        if session_id <= 0:
+            return web.json_response({"ok": False, "error": "invalid_session_id"}, status=400)
+
         with sqlite3.connect(self._db_path) as con:
+            row = con.execute(
+                "SELECT bet, tip_paid, result, COALESCE(double_up_used, 0) FROM blackjack_sessions WHERE id=? AND user_id=?",
+                (session_id, user_id),
+            ).fetchone()
+            if row is None:
+                return web.json_response({"ok": False, "error": "session_not_found"}, status=404)
+            bet = int(row[0])
+            tip_paid = int(row[1])
+            result = str(row[2])
+            double_up_used = int(row[3])
+            if result != "win":
+                return web.json_response({"ok": False, "error": "session_not_winning"}, status=400)
+            if double_up_used:
+                return web.json_response({"ok": False, "error": "double_up_already_used"}, status=409)
+
+            amount = bet - tip_paid
+            win = bool(self._rng.randint(0, 1))
+            delta = amount if win else -amount
+            now = datetime.now(timezone.utc).isoformat()
+            con.execute("UPDATE blackjack_sessions SET double_up_used=1 WHERE id=?", (session_id,))
             con.execute(
                 "INSERT INTO coin_ledger (user_id, delta, reason, created_at) VALUES (?, ?, ?, ?)",
-                (user_id, delta, "blackjack:double_up", now),
+                (user_id, delta, f"blackjack:double_up:{session_id}", now),
             )
-        return web.json_response({"ok": True, "win": win, "delta": delta})
+
+        return web.json_response({"ok": True, "win": win, "delta": delta, "amount": amount, "session_id": session_id})
 
     async def handle_rankings(self, request: web.Request) -> web.Response:
         with sqlite3.connect(self._db_path) as con:
@@ -563,6 +634,42 @@ class PokerService:
                 stack=stack,
             )
         )
+        if table.room_id.startswith("bot-") and len(table.players) == 1:
+            table.players.append(
+                PlayerState(
+                    user_id=f"bot:{table.room_id}",
+                    nickname="MeteoBot",
+                    avatar_url="",
+                    stack=stack,
+                )
+            )
+
+    def _is_bot_turn(self, table: TableState) -> bool:
+        if table.street not in {"preflop", "flop", "turn", "river"}:
+            return False
+        if table.to_act not in {0, 1}:
+            return False
+        return table.players[table.to_act].user_id.startswith("bot:")
+
+    def _bot_action(self, table: TableState) -> tuple[str, int]:
+        seat = table.to_act
+        me = table.players[seat]
+        opp = table.players[1 - seat]
+        to_call = max(0, opp.committed - me.committed)
+        if to_call > 0:
+            if to_call >= me.stack:
+                return "allin", 0
+            return "call", 0
+        return "check", 0
+
+    def _run_bot_until_human_turn(self, room: Room) -> None:
+        while self._is_bot_turn(room.table):
+            action, amount = self._bot_action(room.table)
+            try:
+                rec = apply_action(room.table, room.table.to_act, action, amount)
+            except GameRuleError:
+                break
+            self._persist_action(room.table.room_id, rec)
 
     def _seat_for_user(self, table: TableState, user_id: str) -> int | None:
         for seat, player_state in enumerate(table.players):
@@ -570,18 +677,29 @@ class PokerService:
                 return seat
         return None
 
+    def _private_state_for_user(self, table: TableState, user_id: str) -> dict[str, Any]:
+        state = table.public()
+        seat = self._seat_for_user(table, user_id)
+        if seat is None:
+            return state
+        state["my_seat"] = seat
+        state["my_hole"] = [str(card) for card in table.players[seat].hole]
+        return state
+
     async def _broadcast(self, room: Room, *, ack_action_id: int | None) -> None:
         table = room.table
-        payload = {
-            "type": "state",
-            "state": table.public(),
-            "ack_action_id": ack_action_id,
-            "server_seq": table.server_seq,
-        }
         for ws in list(room.sockets):
             if ws.closed:
                 room.sockets.discard(ws)
+                room.socket_user_ids.pop(ws, None)
                 continue
+            user_id = room.socket_user_ids.get(ws, "")
+            payload = {
+                "type": "state",
+                "state": self._private_state_for_user(table, user_id),
+                "ack_action_id": ack_action_id,
+                "server_seq": table.server_seq,
+            }
             await ws.send_json(payload)
 
 
@@ -627,27 +745,96 @@ _LOBBY_HTML = """<!doctype html><html><body style='background:#111;color:#fff;fo
 
 def _room_html(room_id: str, token: str, ranked: bool) -> str:
     return f"""<!doctype html>
-<html><body style='background:#111;color:#fff;font-family:sans-serif'>
-<h2>HU NLHE Room {room_id}</h2>
-<p>mode: {'ranked' if ranked else 'casual'} / GTO: {'disabled' if ranked else 'enabled'}</p>
-<div id='s' style='white-space:pre-wrap'></div>
-<div>
-<button onclick=send('start')>start</button>
-<button onclick=send('next_hand')>next_hand</button>
-<button onclick=send('fold')>fold</button>
-<button onclick=send('check')>check</button>
-<button onclick=send('call')>call</button>
-<button onclick="send('raise_to', parseInt(prompt('raise_to?')||'0',10))">raise_to</button>
-<button onclick="fetch('/poker/api/gto/{room_id}?token={token}').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)))">GTO</button>
-<button onclick="fetch('/poker/api/replay/{room_id}?token={token}').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)))">Replay</button>
+<html lang='ja'>
+<head>
+<meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<title>Poker Room {room_id}</title>
+<style>
+  body {{ background:#0b1220; color:#e5e7eb; font-family:Inter,system-ui,sans-serif; margin:0; }}
+  .wrap {{ max-width:960px; margin:0 auto; padding:16px; }}
+  .card {{ background:#111827; border:1px solid #374151; border-radius:10px; padding:12px; margin-bottom:12px; }}
+  button {{ background:#2563eb; color:#fff; border:0; border-radius:8px; padding:8px 12px; margin:4px; cursor:pointer; }}
+  button.secondary {{ background:#374151; }}
+  input {{ background:#111827; color:#fff; border:1px solid #4b5563; border-radius:8px; padding:6px 8px; width:120px; }}
+  .mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }}
+  #state {{ white-space:pre-wrap; font-size:12px; max-height:260px; overflow:auto; }}
+</style>
+</head>
+<body>
+<div class='wrap'>
+  <h2>HU NLHE Room {room_id}</h2>
+  <p>mode: <b>{'ranked' if ranked else 'casual'}</b> / GTO: <b>{'disabled' if ranked else 'enabled'}</b></p>
+
+  <div class='card'>
+    <div><b>My hole cards:</b> <span id='myHole' class='mono'>-</span></div>
+    <div><b>Board:</b> <span id='board' class='mono'>-</span></div>
+    <div><b>Street:</b> <span id='street'>waiting</span> / <b>Pot:</b> <span id='pot'>0</span></div>
+    <div><b>To act seat:</b> <span id='toAct'>-</span> / <b>My seat:</b> <span id='mySeat'>-</span></div>
+  </div>
+
+  <div class='card'>
+    <button onclick="send('start')">start</button>
+    <button onclick="send('next_hand')" class='secondary'>next_hand</button>
+    <button onclick="send('fold')" class='secondary'>fold</button>
+    <button onclick="send('check')">check</button>
+    <button onclick="send('call')">call</button>
+    <input id='raiseTo' type='number' step='100' min='0' placeholder='raise_to' />
+    <button onclick="sendRaise()">raise_to</button>
+    <button onclick="showGto()" class='secondary'>GTO</button>
+    <button onclick="showReplay()" class='secondary'>Replay</button>
+  </div>
+
+  <div class='card'>
+    <div><b>Players</b></div>
+    <div id='players' class='mono'>-</div>
+  </div>
+
+  <div class='card'>
+    <div><b>Raw state</b></div>
+    <div id='state' class='mono'></div>
+  </div>
 </div>
+
 <script>
 let cid = 0;
+const $ = (id) => document.getElementById(id);
 const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/poker/ws/{room_id}?token={token}');
-ws.onmessage = (e) => {{ const j = JSON.parse(e.data); document.getElementById('s').textContent = JSON.stringify(j, null, 2); }};
+
+ws.onmessage = (e) => {{
+  const j = JSON.parse(e.data);
+  if (j.type !== 'state') return;
+  const st = j.state || {{}};
+  $('state').textContent = JSON.stringify(j, null, 2);
+  $('myHole').textContent = (st.my_hole || []).join(' ') || '-';
+  $('board').textContent = (st.board || []).join(' ') || '-';
+  $('street').textContent = st.street || '-';
+  $('pot').textContent = String(st.pot ?? '-');
+  $('toAct').textContent = String(st.to_act ?? '-');
+  $('mySeat').textContent = String(st.my_seat ?? '-');
+  const players = (st.players || []).map((p) => `seat${{p.seat}} ${{p.nickname}} stack=${{p.stack}} committed=${{p.committed}}`);
+  $('players').textContent = players.join(' | ') || '-';
+}};
+
 function send(action, amount) {{
   cid += 1;
   ws.send(JSON.stringify({{action, amount: amount||0, client_action_id: cid}}));
 }}
+
+function sendRaise() {{
+  const n = parseInt(($('raiseTo').value || '0'), 10);
+  send('raise_to', Number.isFinite(n) ? n : 0);
+}}
+
+async function showGto() {{
+  const r = await fetch('/poker/api/gto/{room_id}?token={token}');
+  alert(JSON.stringify(await r.json(), null, 2));
+}}
+
+async function showReplay() {{
+  const r = await fetch('/poker/api/replay/{room_id}?token={token}');
+  alert(JSON.stringify(await r.json(), null, 2));
+}}
 </script>
-</body></html>"""
+</body>
+</html>"""

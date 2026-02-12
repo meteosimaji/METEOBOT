@@ -164,21 +164,49 @@ def start_hand(table: TableState, rng: random.Random) -> None:
         player_state.folded = False
         player_state.all_in = False
 
-    _post_blind(table.players[sb_idx], table.sb)
-    _post_blind(table.players[bb_idx], table.bb)
-    table.pot = table.sb + table.bb
+    _post_blind(table, table.players[sb_idx], table.sb)
+    _post_blind(table, table.players[bb_idx], table.bb)
     table.to_act = sb_idx
     table.server_seq += 1
 
 
-def _post_blind(player: PlayerState, amount: int) -> None:
-    if amount >= player.stack:
-        player.committed += player.stack
-        player.stack = 0
-        player.all_in = True
+def _post_blind(table: TableState, player_state: PlayerState, amount: int) -> None:
+    if amount >= player_state.stack:
+        posted = player_state.stack
+        player_state.committed += posted
+        player_state.stack = 0
+        player_state.all_in = True
+        table.pot += posted
         return
-    player.stack -= amount
-    player.committed += amount
+    player_state.stack -= amount
+    player_state.committed += amount
+    table.pot += amount
+
+
+def _collect_committed_for_new_street(table: TableState) -> None:
+    # Pot is incremented when chips are committed, so only the per-street trackers reset here.
+    for player_state in table.players:
+        player_state.committed = 0
+        player_state.acted = False
+
+
+def _post_all_in(table: TableState, player_state: PlayerState) -> None:
+    committed = player_state.stack
+    player_state.committed += committed
+    table.pot += committed
+    player_state.stack = 0
+    player_state.all_in = True
+
+
+def _put_chips(table: TableState, player_state: PlayerState, amount: int) -> None:
+    if amount < 0:
+        raise GameRuleError("negative_amount")
+    if amount >= player_state.stack:
+        _post_all_in(table, player_state)
+        return
+    player_state.stack -= amount
+    player_state.committed += amount
+    table.pot += amount
 
 
 def _active_indexes(table: TableState) -> list[int]:
@@ -207,9 +235,7 @@ def _next_street(table: TableState) -> None:
     draw = _street_cards(table.street)
     for _ in range(draw):
         table.board.append(table.deck.pop())
-    for player_state in table.players:
-        player_state.committed = 0
-        player_state.acted = False
+    _collect_committed_for_new_street(table)
     table.current_bet = 0
     table.min_raise_to = table.bb
     table.to_act = _other(table.button_index)
@@ -291,6 +317,7 @@ def apply_action(table: TableState, seat: int, action: str, amount: int = 0) -> 
     gto_freq = 0.0
     gto_evloss_bb = 0.0
 
+    action_street = table.street
     if action == "fold":
         player_state.folded = True
         table.winner = _other(seat)
@@ -300,7 +327,7 @@ def apply_action(table: TableState, seat: int, action: str, amount: int = 0) -> 
             raise GameRuleError("cannot_check")
         player_state.acted = True
     elif action == "call":
-        _put_chips(player_state, to_call)
+        _put_chips(table, player_state, to_call)
         player_state.acted = True
     elif action in {"bet", "raise", "raise_to", "allin"}:
         target = player_state.committed + player_state.stack if action == "allin" else amount
@@ -312,7 +339,7 @@ def apply_action(table: TableState, seat: int, action: str, amount: int = 0) -> 
         if target < table.min_raise_to and target < player_state.committed + player_state.stack:
             raise GameRuleError("below_min_raise")
         delta = target - player_state.committed
-        _put_chips(player_state, delta)
+        _put_chips(table, player_state, delta)
         previous_bet = table.current_bet
         table.current_bet = max(table.current_bet, player_state.committed)
         last_raise = player_state.committed - opponent_state.committed
@@ -362,7 +389,7 @@ def apply_action(table: TableState, seat: int, action: str, amount: int = 0) -> 
     table.server_seq += 1
     rec = ActionRecord(
         hand_no=table.hand_no,
-        street=table.street,
+        street=action_street,
         seat=seat,
         action=action,
         amount=amount,
@@ -406,22 +433,8 @@ def replay_scores(table: TableState) -> dict[str, Any]:
     }
 
 
-def _put_chips(player_state: PlayerState, amount: int) -> None:
-    if amount < 0:
-        raise GameRuleError("negative_amount")
-    if amount >= player_state.stack:
-        player_state.committed += player_state.stack
-        player_state.stack = 0
-        player_state.all_in = True
-        return
-    player_state.stack -= amount
-    player_state.committed += amount
-
-
 def _award_fold(table: TableState) -> None:
-    for player_state in table.players:
-        table.pot += player_state.committed
-        player_state.committed = 0
+    _collect_committed_for_new_street(table)
     if table.winner is None:
         return
     table.players[table.winner].stack += table.pot
@@ -436,9 +449,7 @@ def _runout_and_showdown(table: TableState) -> None:
 
 
 def _resolve_showdown(table: TableState) -> None:
-    for player_state in table.players:
-        table.pot += player_state.committed
-        player_state.committed = 0
+    _collect_committed_for_new_street(table)
     rank0 = best_rank(table.players[0].hole + table.board)
     rank1 = best_rank(table.players[1].hole + table.board)
     if rank0 > rank1:

@@ -65,3 +65,23 @@ def test_replay_scores_produced_after_actions() -> None:
     scores = replay_scores(table)
     assert "A" in scores and "B" in scores
     assert isinstance(scores["actions"], list)
+
+
+def test_fold_payout_uses_single_pot_and_action_street_recorded() -> None:
+    table = _table()
+    start_hand(table, random.Random(10))
+    seat = table.to_act
+    rec = apply_action(table, seat, "fold")
+    winner = table.players[table.winner or 0]
+    assert table.street == "showdown"
+    assert winner.stack == 20_100
+    assert rec.street == "preflop"
+
+
+def test_commits_are_kept_in_pot_across_streets() -> None:
+    table = _table()
+    start_hand(table, random.Random(11))
+    apply_action(table, table.to_act, "call")
+    apply_action(table, table.to_act, "check")
+    assert table.street == "flop"
+    assert table.pot == 400
