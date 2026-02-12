@@ -66,6 +66,7 @@ from utils import (
 )
 from cogs.settime import fmt_ofs, get_guild_offset
 from music import get_player
+from web.poker import PokerService, register_poker_routes
 
 log = logging.getLogger(__name__)
 
@@ -3228,6 +3229,8 @@ class Ask(commands.Cog):
             or ""
         ).strip()
         self._operator_token_secret = operator_secret.encode() if operator_secret else None
+        self._poker_token_secret = self._operator_token_secret
+        self._poker_service = PokerService(repo_root / "data", self._resolve_poker_identity)
         strict_schema_issues = _validate_strict_tool_schemas(
             [*self._build_bot_tools(), *self._build_browser_tools()]
         )
@@ -3830,6 +3833,69 @@ class Ask(commands.Cog):
             return cleaned
         return cleaned[: max(0, limit - 1)] + "…"
 
+    def _encode_poker_access_token(self, *, user_id: int, nickname: str, avatar_url: str, ranked: bool) -> str:
+        if not self._poker_token_secret:
+            raise RuntimeError("poker token secret is not configured")
+        payload = {
+            "v": 1,
+            "user_id": int(user_id),
+            "nickname": nickname[:64],
+            "avatar_url": avatar_url[:512],
+            "ranked": bool(ranked),
+            "created_at": int(datetime.now(timezone.utc).timestamp()),
+        }
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        sig = hmac.new(self._poker_token_secret, body, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(body + sig).decode("ascii").rstrip("=")
+
+    def _resolve_poker_identity(self, token: str) -> dict[str, Any] | None:
+        if not token or not self._poker_token_secret:
+            return None
+        pad = "=" * ((4 - len(token) % 4) % 4)
+        try:
+            raw = base64.urlsafe_b64decode((token + pad).encode("ascii"))
+        except Exception:
+            return None
+        if len(raw) <= 32:
+            return None
+        body = raw[:-32]
+        sig = raw[-32:]
+        expected = hmac.new(self._poker_token_secret, body, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        user_id = payload.get("user_id")
+        if not isinstance(user_id, int):
+            return None
+        return {
+            "user_id": str(user_id),
+            "nickname": str(payload.get("nickname") or f"user-{user_id}"),
+            "avatar_url": str(payload.get("avatar_url") or ""),
+            "ranked": bool(payload.get("ranked", False)),
+        }
+
+    async def create_poker_room_link(self, ctx: commands.Context, *, ranked: bool = False) -> dict[str, Any]:
+        await self._ensure_operator_server()
+        room_id = secrets.token_hex(4)
+        display_name = getattr(ctx.author, "display_name", None) or getattr(ctx.author, "name", "player")
+        avatar_url = ""
+        avatar = getattr(ctx.author, "display_avatar", None)
+        if avatar is not None:
+            avatar_url = str(getattr(avatar, "url", "") or "")
+        token = self._encode_poker_access_token(
+            user_id=int(ctx.author.id),
+            nickname=str(display_name),
+            avatar_url=avatar_url,
+            ranked=ranked,
+        )
+        url = f"{self._operator_public_base_url()}/poker/room/{room_id}?token={token}"
+        return {"url": url, "room_id": room_id, "ranked": ranked}
+
     async def _ensure_operator_server(self) -> bool:
         if self._operator_runner is not None:
             return True
@@ -3841,6 +3907,7 @@ class Ask(commands.Cog):
         app.router.add_post("/operator/{token}/action", self._operator_handle_action)
         app.router.add_post("/operator/{token}/mode", self._operator_handle_mode)
         app.router.add_get("/save/{token}", self._operator_handle_download)
+        register_poker_routes(app, self._poker_service)
         runner = web.AppRunner(app)
         try:
             await runner.setup()
