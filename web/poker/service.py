@@ -117,6 +117,19 @@ class PokerService:
             )
             con.execute(
                 """
+                CREATE TABLE IF NOT EXISTS matchmaking_ready (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    room_id TEXT NOT NULL,
+                    bot INTEGER NOT NULL DEFAULT 0,
+                    opponent_user_id TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            con.execute(
+                """
                 CREATE TABLE IF NOT EXISTS ranked_hand_reports (
                     room_id TEXT NOT NULL,
                     hand_no INTEGER NOT NULL,
@@ -462,19 +475,30 @@ class PokerService:
                 "INSERT INTO matchmaking_queue (user_id, mode, queued_at, active) VALUES (?, ?, ?, 1)",
                 (user_id, mode, now),
             )
+            my_queue_id = int(con.execute("SELECT last_insert_rowid()").fetchone()[0])
             row = con.execute(
                 "SELECT id, user_id FROM matchmaking_queue WHERE mode=? AND active=1 AND user_id != ? ORDER BY id ASC LIMIT 1",
                 (mode, user_id),
             ).fetchone()
             if row is not None:
-                con.execute("UPDATE matchmaking_queue SET active=0 WHERE id IN (?, ?)", (int(row[0]), con.execute("SELECT last_insert_rowid()").fetchone()[0]))
+                opponent_queue_id = int(row[0])
+                opponent_user_id = str(row[1])
+                con.execute("UPDATE matchmaking_queue SET active=0 WHERE id IN (?, ?)", (opponent_queue_id, my_queue_id))
                 room_id = f"mm-{secrets_token(self._rng)}"
+                con.execute(
+                    "INSERT INTO matchmaking_ready (user_id, mode, room_id, bot, opponent_user_id, created_at) VALUES (?, ?, ?, 0, ?, ?)",
+                    (user_id, mode, room_id, opponent_user_id, now),
+                )
+                con.execute(
+                    "INSERT INTO matchmaking_ready (user_id, mode, room_id, bot, opponent_user_id, created_at) VALUES (?, ?, ?, 0, ?, ?)",
+                    (opponent_user_id, mode, room_id, user_id, now),
+                )
                 return web.json_response(
                     {
                         "ok": True,
                         "matched": True,
                         "room_id": room_id,
-                        "opponent_user_id": str(row[1]),
+                        "opponent_user_id": opponent_user_id,
                         "mode": mode,
                     }
                 )
@@ -493,6 +517,28 @@ class PokerService:
 
         now_dt = datetime.now(timezone.utc)
         with sqlite3.connect(self._db_path) as con:
+            match_row = con.execute(
+                "SELECT id, room_id, bot, opponent_user_id FROM matchmaking_ready WHERE user_id=? AND mode=? ORDER BY id ASC LIMIT 1",
+                (user_id, mode),
+            ).fetchone()
+            if match_row is not None:
+                ready_id = int(match_row[0])
+                room_id = str(match_row[1])
+                is_bot = bool(match_row[2])
+                opponent_user_id = str(match_row[3] or "")
+                con.execute("DELETE FROM matchmaking_ready WHERE id=?", (ready_id,))
+                payload: dict[str, Any] = {
+                    "ok": True,
+                    "queued": False,
+                    "matched": True,
+                    "room_id": room_id,
+                    "mode": mode,
+                }
+                if is_bot:
+                    payload["bot"] = True
+                elif opponent_user_id:
+                    payload["opponent_user_id"] = opponent_user_id
+                return web.json_response(payload)
             row = con.execute(
                 "SELECT id, queued_at FROM matchmaking_queue WHERE user_id=? AND mode=? AND active=1 ORDER BY id DESC LIMIT 1",
                 (user_id, mode),

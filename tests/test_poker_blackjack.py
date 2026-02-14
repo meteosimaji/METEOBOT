@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 
 from aiohttp import web
@@ -243,3 +244,63 @@ def test_idle_room_expired_is_deleted_and_not_recreated(tmp_path: Path) -> None:
         assert "room_expired" in exc.text
     else:
         raise AssertionError("expected room_expired")
+
+
+def test_matchmaking_poll_returns_room_for_both_human_players(tmp_path: Path) -> None:
+    svc = PokerService(tmp_path, _resolver)
+
+    enqueue_req_1 = make_mocked_request("POST", "/poker/api/matchmaking/enqueue?token=ok")
+
+    async def _enqueue_quick() -> dict[str, str]:
+        return {"mode": "quick"}
+
+    enqueue_req_1.json = _enqueue_quick  # type: ignore[assignment,method-assign]
+    first_resp = asyncio.run(svc.handle_matchmaking_enqueue(enqueue_req_1))
+    first_payload = _json_payload(first_resp)
+    assert first_payload["matched"] is False
+
+    def _resolver_second(token: str):
+        if token == "ok":
+            return {"user_id": "1", "nickname": "n", "avatar_url": "", "ranked": False}
+        if token == "other":
+            return {"user_id": "9", "nickname": "o", "avatar_url": "", "ranked": False}
+        return None
+
+    svc_second = PokerService(tmp_path, _resolver_second)
+    enqueue_req_2 = make_mocked_request("POST", "/poker/api/matchmaking/enqueue?token=other")
+    enqueue_req_2.json = _enqueue_quick  # type: ignore[assignment,method-assign]
+
+    second_resp = asyncio.run(svc_second.handle_matchmaking_enqueue(enqueue_req_2))
+    second_payload = _json_payload(second_resp)
+    assert second_payload["matched"] is True
+    room_id = str(second_payload["room_id"])
+
+    poll_req_1 = make_mocked_request("GET", "/poker/api/matchmaking/poll?token=ok&mode=quick")
+    poll_resp_1 = asyncio.run(svc.handle_matchmaking_poll(poll_req_1))
+    poll_payload_1 = _json_payload(poll_resp_1)
+    assert poll_payload_1["matched"] is True
+    assert poll_payload_1["room_id"] == room_id
+
+
+def test_matchmaking_poll_starts_bot_match_after_wait(tmp_path: Path) -> None:
+    svc = PokerService(tmp_path, _resolver)
+    enqueue_req = make_mocked_request("POST", "/poker/api/matchmaking/enqueue?token=ok")
+
+    async def _enqueue_quick() -> dict[str, str]:
+        return {"mode": "quick"}
+
+    enqueue_req.json = _enqueue_quick  # type: ignore[assignment,method-assign]
+    _ = asyncio.run(svc.handle_matchmaking_enqueue(enqueue_req))
+
+    with sqlite3.connect(svc._db_path) as con:
+        con.execute(
+            "UPDATE matchmaking_queue SET queued_at=? WHERE user_id=? AND mode=? AND active=1",
+            ("2000-01-01T00:00:00+00:00", "1", "quick"),
+        )
+
+    poll_req = make_mocked_request("GET", "/poker/api/matchmaking/poll?token=ok&mode=quick")
+    poll_resp = asyncio.run(svc.handle_matchmaking_poll(poll_req))
+    poll_payload = _json_payload(poll_resp)
+    assert poll_payload["matched"] is True
+    assert poll_payload["bot"] is True
+    assert str(poll_payload["room_id"]).startswith("bot-")
