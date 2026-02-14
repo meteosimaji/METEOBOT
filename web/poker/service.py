@@ -784,58 +784,254 @@ def _room_html(room_id: str, token: str, ranked: bool) -> str:
 <title>Meteo Poker {room_id}</title>
 <style>
 :root {{
-  --bg:#020617;
-  --panel:rgba(15,23,42,.72);
-  --line:rgba(148,163,184,.35);
-  --soft:#cbd5e1;
-  --accent:#38bdf8;
-  --danger:#ef4444;
-  --ok:#22c55e;
-  --shadow:0 24px 60px rgba(0,0,0,.45);
+  --night:#05060d;
+  --ink:#0e1627;
+  --glass:rgba(8, 13, 24, 0.62);
+  --edge:rgba(165, 186, 224, 0.3);
+  --soft:#bfd2f4;
+  --accent:#8ad8ff;
+  --ruby:#ff4c6a;
+  --emerald:#2ce09f;
+  --shadow:0 24px 80px rgba(0, 0, 0, 0.5);
 }}
-*{{box-sizing:border-box}}
+* {{ box-sizing:border-box }}
 body {{
   margin:0;
-  font-family:Inter,system-ui,sans-serif;
-  color:#f8fafc;
-  background:
-    radial-gradient(1000px 500px at 20% -10%, rgba(56,189,248,.25), transparent),
-    radial-gradient(1200px 500px at 90% 0%, rgba(239,68,68,.18), transparent),
-    linear-gradient(180deg, #0b1120 0%, var(--bg) 65%);
+  font-family: Inter, "Noto Sans JP", system-ui, sans-serif;
+  color:#eff6ff;
   min-height:100vh;
+  background:
+    radial-gradient(900px 600px at 15% -8%, rgba(83,142,255,.28), transparent 72%),
+    radial-gradient(1000px 700px at 80% -16%, rgba(255,83,140,.2), transparent 76%),
+    linear-gradient(180deg, #11192a 0%, #090d17 58%, var(--night) 100%);
+  overflow-x:hidden;
 }}
-.wrap{{max-width:1200px;margin:0 auto;padding:22px;display:grid;gap:16px}}
-.hud{{display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:18px;padding:12px 16px}}
-.brand{{font-size:1.1rem;letter-spacing:.08em;font-weight:700}}
-.brand small{{display:block;color:var(--soft);font-weight:500;opacity:.8}}
-.chip{{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:rgba(15,23,42,.7)}}
-.grid{{display:grid;grid-template-columns:2fr 1fr;gap:16px}}
-@media (max-width:980px){{.grid{{grid-template-columns:1fr}}}}
-.panel{{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:14px;box-shadow:var(--shadow)}}
-.table{{position:relative;min-height:460px;background:radial-gradient(circle at 50% 35%, #0ea5a41f, #0f172a 58%, #020617);border-radius:26px;border:1px solid rgba(148,163,184,.3);overflow:hidden;padding:22px}}
-.table::before{{content:'';position:absolute;inset:18px;border-radius:300px;border:2px solid rgba(56,189,248,.22)}}
-.seat{{position:absolute;width:44%;padding:10px;border-radius:14px;background:rgba(2,6,23,.55);border:1px solid transparent}}
-.seat.active{{border-color:var(--accent);box-shadow:0 0 18px rgba(56,189,248,.45)}}
-#seat0{{top:36px;left:28px}}
-#seat1{{bottom:36px;right:28px}}
-.meta{{display:flex;justify-content:space-between;color:var(--soft);font-size:.84rem}}
-.cards{{display:flex;gap:10px;margin-top:8px}}
-.card{{width:58px;height:84px;border-radius:10px;background:linear-gradient(160deg,#fff,#dbeafe);color:#0f172a;display:grid;place-items:center;font-size:1.6rem;font-weight:700;box-shadow:0 6px 18px rgba(15,23,42,.35)}}
-.card.red{{color:#dc2626}}
-.card.back{{background:linear-gradient(160deg,#334155,#0f172a);color:#e2e8f0;font-size:.8rem;letter-spacing:.08em}}
-.board{{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;z-index:2}}
-.board .cards{{justify-content:center}}
-.stat{{display:flex;justify-content:center;gap:12px;margin-bottom:10px}}
-.stat span{{padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:rgba(2,6,23,.58)}}
-.actions{{display:flex;gap:8px;flex-wrap:wrap}}
-button{{border:1px solid rgba(148,163,184,.35);border-radius:12px;padding:10px 12px;background:rgba(15,23,42,.85);color:#f8fafc;cursor:pointer;transition:.15s}}
-button:hover{{transform:translateY(-1px);border-color:var(--accent)}}
-button.primary{{background:linear-gradient(110deg,#0284c7,#2563eb)}}
-button.warn{{border-color:rgba(239,68,68,.5);color:#fecaca}}
-input{{flex:1;min-width:120px;border-radius:12px;border:1px solid var(--line);background:#0f172a;color:#fff;padding:10px}}
-#log{{max-height:360px;overflow:auto;display:grid;gap:6px}}
-.log-item{{padding:8px 10px;border-radius:10px;background:rgba(15,23,42,.6);border:1px solid rgba(148,163,184,.2);font-size:.88rem}}
-.muted{{opacity:.78;color:var(--soft)}}
+body::before {{
+  content:"";
+  position:fixed;
+  inset:0;
+  background-image: radial-gradient(rgba(255,255,255,.08) 1px, transparent 1px);
+  background-size: 3px 3px;
+  opacity:.08;
+  pointer-events:none;
+}}
+.wrap {{ max-width:1280px; margin:0 auto; padding:22px; display:grid; gap:18px; }}
+.hud {{
+  display:flex;
+  gap:12px;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:space-between;
+  background:linear-gradient(120deg, rgba(12,23,42,.9), rgba(20,31,54,.76));
+  border:1px solid var(--edge);
+  box-shadow:var(--shadow);
+  border-radius:18px;
+  padding:13px 16px;
+}}
+.brand {{font-size:1.12rem;letter-spacing:.12em;font-weight:800}}
+.brand small {{display:block;opacity:.8;color:var(--soft);font-weight:500;letter-spacing:.05em}}
+.chip {{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  border-radius:999px;
+  padding:7px 12px;
+  border:1px solid var(--edge);
+  background:rgba(7,15,30,.72);
+}}
+.chip b {{color:#f8fbff}}
+.grid {{display:grid;grid-template-columns:2.1fr 1fr;gap:16px}}
+@media (max-width:1020px) {{ .grid {{grid-template-columns:1fr}} }}
+.panel {{
+  position:relative;
+  border-radius:20px;
+  border:1px solid var(--edge);
+  background:var(--glass);
+  box-shadow:var(--shadow);
+  backdrop-filter: blur(10px);
+  padding:16px;
+}}
+.table {{
+  min-height:560px;
+  overflow:hidden;
+  background: radial-gradient(circle at 50% 33%, rgba(8,26,42,.85), rgba(6,10,18,.95));
+}}
+.stage {{
+  position:relative;
+  width:100%;
+  height:100%;
+  min-height:520px;
+  perspective:1200px;
+}}
+.table-3d {{
+  position:absolute;
+  inset:30px 24px;
+  border-radius:180px;
+  background: radial-gradient(circle at 50% 40%, rgba(40,53,76,.95), rgba(11,16,30,.98));
+  transform: rotateX(14deg);
+  border:2px solid rgba(168, 199, 255, .28);
+  box-shadow: inset 0 -18px 30px rgba(0,0,0,.42), 0 25px 40px rgba(0,0,0,.55);
+}}
+.table-3d::before {{
+  content:"";
+  position:absolute;
+  inset:20px;
+  border-radius:140px;
+  background: radial-gradient(circle at 50% 35%, rgba(31, 109, 119, .2), rgba(5, 12, 18, .65));
+  border:1px solid rgba(133,177,255,.25);
+}}
+.table-3d::after {{
+  content:"";
+  position:absolute;
+  inset:0;
+  border-radius:180px;
+  box-shadow: inset 0 0 80px rgba(92,173,255,.22);
+}}
+.orbit {{
+  position:absolute;
+  inset:60px;
+  border-radius:150px;
+  border:1px dashed rgba(138,216,255,.2);
+  animation: spin 18s linear infinite;
+}}
+.orbit::before, .orbit::after {{
+  content:"";
+  position:absolute;
+  width:12px;
+  height:12px;
+  border-radius:50%;
+  background:radial-gradient(circle, #dbf4ff, #61c8ff);
+  box-shadow:0 0 16px rgba(124,214,255,.8);
+}}
+.orbit::before {{top:-6px;left:20%}}
+.orbit::after {{bottom:-6px;right:16%}}
+@keyframes spin {{ from {{transform:rotate(0deg)}} to {{transform:rotate(360deg)}} }}
+.seat {{
+  position:absolute;
+  width:min(45%, 360px);
+  padding:11px;
+  border-radius:16px;
+  border:1px solid rgba(156,197,255,.24);
+  background:linear-gradient(130deg, rgba(11,20,37,.95), rgba(9,16,29,.65));
+  z-index:4;
+  transition:transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+}}
+.seat.active {{
+  border-color:rgba(138,216,255,.8);
+  box-shadow:0 0 26px rgba(98,190,255,.35);
+  transform:translateY(-3px);
+}}
+#seat0 {{ top:68px; left:46px; }}
+#seat1 {{ bottom:48px; right:52px; }}
+.meta {{display:flex;justify-content:space-between;gap:8px;color:var(--soft);font-size:.85rem}}
+.cards {{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}}
+.card {{
+  width:62px;
+  height:92px;
+  border-radius:12px;
+  display:grid;
+  place-items:center;
+  font-size:1.65rem;
+  font-weight:800;
+  color:#0e1422;
+  background:linear-gradient(160deg,#fff,#d6e7ff 70%);
+  border:1px solid rgba(126,162,220,.45);
+  box-shadow:0 10px 20px rgba(0,0,0,.35);
+  transform-style:preserve-3d;
+  animation:cardEnter .35s ease;
+}}
+.card::before {{
+  content:"";
+  position:absolute;
+  inset:0;
+  border-radius:12px;
+  background:linear-gradient(130deg,rgba(255,255,255,.58),transparent 50%);
+  pointer-events:none;
+}}
+.card.red {{ color:#e11d48; }}
+.card.back {{
+  background:linear-gradient(140deg,#1f2f48,#0a1220);
+  color:#d7e7ff;
+  font-size:.7rem;
+  letter-spacing:.16em;
+  border-color:rgba(160,196,255,.28);
+}}
+@keyframes cardEnter {{ from {{transform:translateY(8px) rotateX(15deg);opacity:.4}} to {{transform:none;opacity:1}} }}
+.board {{
+  position:absolute;
+  left:50%;
+  top:50%;
+  transform:translate(-50%,-50%);
+  z-index:5;
+  width:min(640px,80%);
+  text-align:center;
+}}
+.board .cards {{justify-content:center;min-height:98px}}
+.pot-core {{
+  margin:0 auto 12px;
+  width:140px;
+  height:140px;
+  border-radius:50%;
+  background:radial-gradient(circle at 35% 30%, rgba(165,224,255,.28), rgba(24,40,69,.92));
+  border:1px solid rgba(158,191,255,.4);
+  box-shadow:inset 0 0 26px rgba(100,156,255,.3), 0 0 25px rgba(66,136,240,.2);
+  display:grid;
+  place-items:center;
+  animation: breathe 3.2s ease-in-out infinite;
+}}
+@keyframes breathe {{ 0%,100% {{transform:scale(1)}} 50% {{transform:scale(1.03)}} }}
+.pot-core strong {{display:block;font-size:1.6rem}}
+.pot-core span {{font-size:.72rem;color:var(--soft);letter-spacing:.16em}}
+.stat {{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}}
+.stat span {{
+  border-radius:999px;
+  padding:6px 11px;
+  border:1px solid rgba(158,191,255,.35);
+  background:rgba(7,14,26,.66);
+}}
+.chips-decor {{position:absolute;right:80px;top:102px;z-index:6;display:flex;gap:10px;align-items:flex-end;pointer-events:none;}}
+.stack {{
+  width:24px;
+  border-radius:999px;
+  background:linear-gradient(180deg,#9ec7ff,#3e5c9a);
+  box-shadow:0 8px 14px rgba(0,0,0,.35);
+  animation:floatChip 3s ease-in-out infinite;
+}}
+.stack:nth-child(1) {{height:38px}}
+.stack:nth-child(2) {{height:58px;animation-delay:-.8s}}
+.stack:nth-child(3) {{height:48px;animation-delay:-1.4s}}
+@keyframes floatChip {{0%,100%{{transform:translateY(0)}}50%{{transform:translateY(-4px)}}}}
+.actions {{display:flex;gap:8px;flex-wrap:wrap}}
+button {{
+  border:1px solid rgba(165,186,224,.35);
+  border-radius:12px;
+  padding:10px 12px;
+  color:#e7f1ff;
+  background:linear-gradient(150deg, rgba(19,30,51,.95), rgba(10,18,32,.78));
+  cursor:pointer;
+  transition:all .16s ease;
+}}
+button:hover {{transform:translateY(-1px);border-color:var(--accent);box-shadow:0 6px 14px rgba(85,173,255,.18)}}
+button.primary {{background:linear-gradient(120deg,#2e8bff,#2664ff)}}
+button.warn {{border-color:rgba(255,95,124,.5);color:#ffd3db}}
+input {{
+  flex:1;
+  min-width:130px;
+  border-radius:12px;
+  border:1px solid rgba(165,186,224,.35);
+  background:rgba(6,12,24,.92);
+  color:#eff6ff;
+  padding:10px;
+}}
+#log {{max-height:350px;overflow:auto;display:grid;gap:6px;scrollbar-width:thin}}
+.log-item {{
+  padding:8px 10px;
+  border-radius:11px;
+  border:1px solid rgba(165,186,224,.22);
+  background:linear-gradient(130deg, rgba(9,17,30,.92), rgba(11,21,37,.58));
+  font-size:.88rem;
+}}
+.muted {{opacity:.82;color:var(--soft)}}
 </style>
 </head>
 <body>
@@ -848,16 +1044,21 @@ input{{flex:1;min-width:120px;border-radius:12px;border:1px solid var(--line);ba
   </div>
   <div class='grid'>
     <section class='panel table'>
-      <div id='seat0' class='seat'><div class='meta'><b id='seat0Name'>Seat0</b><span id='seat0Stack'>0</span></div><div id='seat0Cards' class='cards'></div></div>
-      <div id='seat1' class='seat'><div class='meta'><b id='seat1Name'>Seat1</b><span id='seat1Stack'>0</span></div><div id='seat1Cards' class='cards'></div></div>
-      <div class='board'>
-        <div class='stat'>
-          <span>Street <b id='street'>waiting</b></span>
-          <span>Pot <b id='pot'>0</b></span>
-          <span>To Act <b id='toAct'>-</b></span>
+      <div class='stage'>
+        <div class='table-3d'></div>
+        <div class='orbit'></div>
+        <div class='chips-decor'><div class='stack'></div><div class='stack'></div><div class='stack'></div></div>
+        <div id='seat0' class='seat'><div class='meta'><b id='seat0Name'>Seat0</b><span id='seat0Stack'>0</span></div><div id='seat0Cards' class='cards'></div></div>
+        <div id='seat1' class='seat'><div class='meta'><b id='seat1Name'>Seat1</b><span id='seat1Stack'>0</span></div><div id='seat1Cards' class='cards'></div></div>
+        <div class='board'>
+          <div class='pot-core'><div><span>POT</span><strong id='pot'>0</strong></div></div>
+          <div class='stat'>
+            <span>Street <b id='street'>waiting</b></span>
+            <span>To Act <b id='toAct'>-</b></span>
+          </div>
+          <div id='boardCards' class='cards'></div>
+          <div class='muted' style='margin-top:10px'>Winner: <b id='winner'>-</b> / Reason: <b id='reason'>-</b></div>
         </div>
-        <div id='boardCards' class='cards'></div>
-        <div class='muted' style='margin-top:10px'>Winner: <b id='winner'>-</b> / Reason: <b id='reason'>-</b></div>
       </div>
     </section>
 
@@ -969,16 +1170,16 @@ function sendRaise() {{
 }}
 
 async function showGto() {{
-  const r = await fetch('/poker/api/gto/{room_id}?token={token}');
-  alert(JSON.stringify(await r.json(), null, 2));
+  const gtoResp = await fetch('/poker/api/gto/{room_id}?token={token}');
+  alert(JSON.stringify(await gtoResp.json(), null, 2));
 }}
 async function showReplay() {{
-  const r = await fetch('/poker/api/replay/{room_id}?token={token}');
-  alert(JSON.stringify(await r.json(), null, 2));
+  const replayResp = await fetch('/poker/api/replay/{room_id}?token={token}');
+  alert(JSON.stringify(await replayResp.json(), null, 2));
 }}
 async function refreshState() {{
-  const r = await fetch('/poker/api/state/{room_id}?token={token}');
-  const data = await r.json();
+  const stateResp = await fetch('/poker/api/state/{room_id}?token={token}');
+  const data = await stateResp.json();
   if (data?.state) renderState(data.state);
 }}
 </script>
