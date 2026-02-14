@@ -26,6 +26,8 @@ from .engine import (
 IdentityResolver = Callable[[str], dict[str, Any] | None]
 VIRTUAL_BOT_POPULATION = 10000
 MATCHMAKING_BOT_WAIT_S = 15
+ROOM_IDLE_DELETE_S = 30 * 60
+ROOM_IDLE_WARNING_S = 5 * 60
 
 
 @dataclass
@@ -35,11 +37,13 @@ class Room:
     lock: asyncio.Lock
     last_client_action_id_by_user: dict[str, int]
     socket_user_ids: dict[web.WebSocketResponse, str]
+    idle_delete_at_s: float
 
 
 class PokerService:
     def __init__(self, data_root: Path, identity_resolver: IdentityResolver) -> None:
         self._rooms: dict[str, Room] = {}
+        self._expired_room_ids: set[str] = set()
         self._rng = random.Random()
         self._identity_resolver = identity_resolver
         self._db_path = data_root / "poker.sqlite3"
@@ -130,20 +134,71 @@ class PokerService:
                 pass
 
     def _room(self, room_id: str, *, ranked: bool) -> Room:
+        if room_id in self._expired_room_ids:
+            raise web.HTTPGone(text="room_expired")
+        self._expire_idle_rooms()
         room = self._rooms.get(room_id)
         if room:
             if ranked and not room.table.ranked:
                 room.table.ranked = True
             return room
         table = TableState(room_id=room_id, config=TableConfig(), ranked=ranked)
-        room = Room(table=table, sockets=set(), lock=asyncio.Lock(), last_client_action_id_by_user={}, socket_user_ids={})
+        room = Room(
+            table=table,
+            sockets=set(),
+            lock=asyncio.Lock(),
+            last_client_action_id_by_user={},
+            socket_user_ids={},
+            idle_delete_at_s=self._now_s() + ROOM_IDLE_DELETE_S,
+        )
         self._rooms[room_id] = room
         return room
 
+    @staticmethod
+    def _now_s() -> float:
+        return datetime.now(timezone.utc).timestamp()
+
+    def _has_started_any_hand(self, room: Room) -> bool:
+        return room.table.hand_no > 0
+
+    def _idle_warning_payload(self, room: Room) -> dict[str, Any] | None:
+        if self._has_started_any_hand(room):
+            return None
+        remaining_s = int(max(0.0, room.idle_delete_at_s - self._now_s()))
+        if remaining_s > ROOM_IDLE_WARNING_S:
+            return None
+        return {
+            "active": True,
+            "remaining_seconds": remaining_s,
+            "message": "This room will be deleted soon due to inactivity. Press Extend to keep it for another 30 minutes.",
+            "can_extend": True,
+            "extend_seconds": ROOM_IDLE_DELETE_S,
+        }
+
+    def _expire_idle_rooms(self) -> None:
+        now_s = self._now_s()
+        expired_ids = [
+            room_id
+            for room_id, room in self._rooms.items()
+            if not self._has_started_any_hand(room) and room.idle_delete_at_s <= now_s
+        ]
+        for room_id in expired_ids:
+            room = self._rooms.pop(room_id, None)
+            if room is None:
+                continue
+            self._expired_room_ids.add(room_id)
+            for ws in list(room.sockets):
+                if ws.closed:
+                    continue
+                asyncio.create_task(ws.send_json({"type": "error", "error": "room_expired"}))
+                asyncio.create_task(ws.close(code=1001, message=b"room_expired"))
+
     async def handle_lobby(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         return web.Response(text=_LOBBY_HTML, content_type="text/html")
 
     async def handle_room(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
         if not profile:
@@ -155,6 +210,7 @@ class PokerService:
         return web.Response(text=_room_html(room_id, token, ranked), content_type="text/html")
 
     async def handle_ws(self, request: web.Request) -> web.WebSocketResponse:
+        self._expire_idle_rooms()
         room_id = request.match_info.get("room_id", "")
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
@@ -225,6 +281,7 @@ class PokerService:
         return ws
 
     async def handle_gto(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
         if not profile:
@@ -254,6 +311,7 @@ class PokerService:
         )
 
     async def handle_replay(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
         if not profile:
@@ -284,6 +342,7 @@ class PokerService:
         )
 
     async def handle_state(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
         if not profile:
@@ -295,6 +354,7 @@ class PokerService:
         return web.json_response({"ok": True, "state": self._private_state_for_user(room.table, user_id)})
 
     async def handle_ranked_report(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
         if not profile:
@@ -366,6 +426,7 @@ class PokerService:
         )
 
     async def handle_ranked_leaderboard(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         with sqlite3.connect(self._db_path) as con:
             rows = con.execute(
                 "SELECT user_id, mmr, rp, wcp FROM rating_state ORDER BY mmr DESC LIMIT 100"
@@ -381,6 +442,7 @@ class PokerService:
         )
 
     async def handle_matchmaking_enqueue(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
         if not profile:
@@ -419,6 +481,7 @@ class PokerService:
         return web.json_response({"ok": True, "matched": False, "mode": mode})
 
     async def handle_matchmaking_poll(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
         if not profile:
@@ -455,6 +518,7 @@ class PokerService:
         return web.json_response({"ok": True, "queued": True, "matched": False})
 
     async def handle_blackjack(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
         if not profile:
@@ -523,6 +587,7 @@ class PokerService:
         )
 
     async def handle_blackjack_double(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         token = request.query.get("token", "")
         profile = self._identity_resolver(token)
         if not profile:
@@ -562,6 +627,7 @@ class PokerService:
         return web.json_response({"ok": True, "win": win, "delta": delta, "amount": amount, "session_id": session_id})
 
     async def handle_rankings(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
         with sqlite3.connect(self._db_path) as con:
             top_coin = con.execute(
                 "SELECT user_id, COALESCE(SUM(delta),0) AS total FROM coin_ledger GROUP BY user_id ORDER BY total DESC LIMIT 20"
@@ -576,6 +642,44 @@ class PokerService:
                 "tip": [{"user_id": r[0], "tip_total": int(r[1]), "count": int(r[2])} for r in top_tip],
             }
         )
+
+    async def handle_create_bot_room(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
+        token = request.query.get("token", "")
+        profile = self._identity_resolver(token)
+        if not profile:
+            raise web.HTTPUnauthorized(text="invalid_token")
+        room_id = f"bot-{secrets_token(self._rng)}"
+        self._room(room_id, ranked=False)
+        return web.json_response(
+            {
+                "ok": True,
+                "room_id": room_id,
+                "url": f"/poker/room/{room_id}?token={token}",
+            }
+        )
+
+    async def handle_room_extend(self, request: web.Request) -> web.Response:
+        self._expire_idle_rooms()
+        token = request.query.get("token", "")
+        profile = self._identity_resolver(token)
+        if not profile:
+            raise web.HTTPUnauthorized(text="invalid_token")
+        room_id = request.match_info.get("room_id", "")
+        room = self._rooms.get(room_id)
+        if room is None:
+            if room_id in self._expired_room_ids:
+                return web.json_response({"ok": False, "error": "room_expired"}, status=410)
+            return web.json_response({"ok": False, "error": "room_not_found"}, status=404)
+        if self._has_started_any_hand(room):
+            return web.json_response({"ok": False, "error": "room_already_started"}, status=400)
+        warning = self._idle_warning_payload(room)
+        if warning is None:
+            return web.json_response({"ok": False, "error": "not_in_warning_window"}, status=400)
+        room.idle_delete_at_s = self._now_s() + ROOM_IDLE_DELETE_S
+        room.table.server_seq += 1
+        await self._broadcast(room, ack_action_id=None)
+        return web.json_response({"ok": True, "delete_after_seconds": ROOM_IDLE_DELETE_S})
 
     def _persist_action(self, room_id: str, rec: Any) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -655,6 +759,8 @@ class PokerService:
                     stack=stack,
                 )
             )
+        if table.room_id.startswith("bot-") and len(table.players) == 2 and table.street == "waiting" and table.hand_no == 0:
+            start_hand(table, self._rng)
 
     def _is_bot_turn(self, table: TableState) -> bool:
         if table.street not in {"preflop", "flop", "turn", "river"}:
@@ -691,6 +797,11 @@ class PokerService:
 
     def _private_state_for_user(self, table: TableState, user_id: str) -> dict[str, Any]:
         state = table.public()
+        room = self._rooms.get(table.room_id)
+        if room is not None:
+            idle_warning = self._idle_warning_payload(room)
+            if idle_warning:
+                state["idle_warning"] = idle_warning
         seat = self._seat_for_user(table, user_id)
         hand_actions = [
             {
@@ -747,6 +858,8 @@ def register_poker_routes(app: web.Application, service: PokerService) -> None:
     app.router.add_post("/poker/api/blackjack/play", service.handle_blackjack)
     app.router.add_post("/poker/api/blackjack/double", service.handle_blackjack_double)
     app.router.add_get("/poker/api/rankings", service.handle_rankings)
+    app.router.add_post("/poker/api/room/extend/{room_id}", service.handle_room_extend)
+    app.router.add_post("/poker/api/room/create-bot", service.handle_create_bot_room)
 
 
 def _bj_value(cards: list[int]) -> int:
@@ -1079,6 +1192,13 @@ input {{
         <button onclick='showGto()'>GTO</button>
         <button onclick='showReplay()'>Replay</button>
         <button onclick='refreshState()'>Refresh API</button>
+        <button onclick='createBotRoom()'>Play vs Bot</button>
+      </div>
+      <div id='idleWarning' class='log-item' style='display:none;margin-top:10px'>
+        <div id='idleWarningText'></div>
+        <div class='actions' style='margin-top:8px'>
+          <button id='idleExtendBtn' onclick='extendRoom()'>Extend 30 minutes</button>
+        </div>
       </div>
       <p class='muted'>My seat: <b id='mySeat'>-</b> / Legal: <span id='legal'>-</span></p>
       <div id='log'></div>
@@ -1136,6 +1256,19 @@ function renderState(st) {{
   $('reason').textContent = st.winner_reason || '-';
   $('legal').textContent = (st.legal?.actions || []).map((a)=>a.action + (a.amount?`(${{a.amount}})`:'' )).join(', ') || '-';
 
+  const idleWarning = st.idle_warning;
+  if (idleWarning?.active) {{
+    const sec = Math.max(0, Number(idleWarning.remaining_seconds || 0));
+    const min = Math.floor(sec / 60);
+    const rem = sec % 60;
+    const message = idleWarning.message || 'This room will be deleted soon due to inactivity.';
+    $('idleWarningText').textContent = `${{message}} (${{min}}:${{String(rem).padStart(2, '0')}})`;
+    $('idleWarning').style.display = 'block';
+    $('idleExtendBtn').disabled = idleWarning.can_extend === false;
+  }} else {{
+    $('idleWarning').style.display = 'none';
+  }}
+
   const players = st.players || [];
   [0,1].forEach((seat)=>{{
     const p = players.find((x)=>x.seat===seat);
@@ -1181,6 +1314,26 @@ async function refreshState() {{
   const stateResp = await fetch('/poker/api/state/{room_id}?token={token}');
   const data = await stateResp.json();
   if (data?.state) renderState(data.state);
+}}
+
+async function extendRoom() {{
+  const resp = await fetch('/poker/api/room/extend/{room_id}?token={token}', {{method: 'POST'}});
+  const data = await resp.json();
+  if (!data?.ok) {{
+    alert(data?.error || 'Failed to extend room lifetime.');
+    return;
+  }}
+  alert('Room lifetime extended by 30 minutes.');
+}}
+
+async function createBotRoom() {{
+  const resp = await fetch('/poker/api/room/create-bot?token={token}', {{method: 'POST'}});
+  const data = await resp.json();
+  if (!data?.ok || !data?.url) {{
+    alert(data?.error || 'Failed to create bot room.');
+    return;
+  }}
+  location.href = data.url;
 }}
 </script>
 </body>
