@@ -165,3 +165,21 @@ def test_bot_room_auto_seats_bot_player(tmp_path: Path) -> None:
     svc._join_if_needed(room.table, {"user_id": "1", "nickname": "n", "avatar_url": ""})
     assert len(room.table.players) == 2
     assert any(p.user_id.startswith("bot:") for p in room.table.players)
+
+
+def test_state_api_returns_private_view_with_legal_actions(tmp_path: Path) -> None:
+    svc = PokerService(tmp_path, _resolver)
+    room = svc._room("state-room", ranked=False)
+    svc._join_if_needed(room.table, {"user_id": "1", "nickname": "n", "avatar_url": ""})
+    svc._join_if_needed(room.table, {"user_id": "4", "nickname": "x", "avatar_url": ""})
+    start_hand(room.table, svc._rng)
+
+    req = make_mocked_request("GET", "/poker/api/state/state-room?token=ok", match_info={"room_id": "state-room"})
+    resp = asyncio.run(svc.handle_state(req))
+    payload = _json_payload(resp)
+
+    assert payload["ok"] is True
+    state = payload["state"]
+    assert len(state["my_hole"]) == 2
+    assert "actions" in state["legal"]
+    assert isinstance(state["recent_actions"], list)

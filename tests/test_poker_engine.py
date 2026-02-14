@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 
-from web.poker.engine import Card, GameRuleError, PlayerState, TableConfig, TableState, apply_action, best_rank, gto_recommendations, replay_scores, start_hand
+from web.poker.engine import Card, GameRuleError, PlayerState, TableConfig, TableState, apply_action, best_rank, gto_recommendations, legal_actions, replay_scores, start_hand
 
 
 def _table(*, ranked: bool = False) -> TableState:
@@ -85,3 +85,20 @@ def test_commits_are_kept_in_pot_across_streets() -> None:
     apply_action(table, table.to_act, "check")
     assert table.street == "flop"
     assert table.pot == 400
+
+
+def test_winner_reason_updates_for_fold_and_showdown() -> None:
+    table = _table()
+    start_hand(table, random.Random(12))
+    apply_action(table, table.to_act, "fold")
+    assert table.winner_reason == "fold"
+
+
+def test_legal_actions_present_for_player_turn() -> None:
+    table = _table()
+    start_hand(table, random.Random(13))
+    legal = legal_actions(table, table.to_act)
+    names = {item["action"] for item in legal["actions"]}
+    assert "call" in names
+    assert "allin" in names
+    assert any(item.get("action") == "raise_to" for item in legal["actions"])
