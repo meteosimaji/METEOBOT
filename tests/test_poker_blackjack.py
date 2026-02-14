@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
+from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from web.poker.engine import start_hand
@@ -165,6 +166,20 @@ def test_bot_room_auto_seats_bot_player(tmp_path: Path) -> None:
     svc._join_if_needed(room.table, {"user_id": "1", "nickname": "n", "avatar_url": ""})
     assert len(room.table.players) == 2
     assert any(p.user_id.startswith("bot:") for p in room.table.players)
+    assert room.table.hand_no == 1
+    assert room.table.street == "preflop"
+
+
+def test_create_bot_room_api_returns_room_url(tmp_path: Path) -> None:
+    svc = PokerService(tmp_path, _resolver)
+    req = make_mocked_request("POST", "/poker/api/room/create-bot?token=ok")
+    resp = asyncio.run(svc.handle_create_bot_room(req))
+    payload = _json_payload(resp)
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert str(payload["room_id"]).startswith("bot-")
+    assert str(payload["url"]).startswith(f"/poker/room/{payload['room_id']}?token=")
 
 
 def test_state_api_returns_private_view_with_legal_actions(tmp_path: Path) -> None:
@@ -183,3 +198,48 @@ def test_state_api_returns_private_view_with_legal_actions(tmp_path: Path) -> No
     assert len(state["my_hole"]) == 2
     assert "actions" in state["legal"]
     assert isinstance(state["recent_actions"], list)
+
+
+def test_idle_room_warning_shows_within_five_minutes(tmp_path: Path) -> None:
+    svc = PokerService(tmp_path, _resolver)
+    room = svc._room("idle-warning-room", ranked=False)
+    svc._join_if_needed(room.table, {"user_id": "1", "nickname": "n", "avatar_url": ""})
+    room.idle_delete_at_s = svc._now_s() + 120
+
+    state = svc._private_state_for_user(room.table, "1")
+    warning = state.get("idle_warning")
+    assert isinstance(warning, dict)
+    assert warning.get("active") is True
+    assert warning.get("can_extend") is True
+
+
+def test_idle_room_extend_api_resets_delete_timer(tmp_path: Path) -> None:
+    svc = PokerService(tmp_path, _resolver)
+    room = svc._room("extend-room", ranked=False)
+    svc._join_if_needed(room.table, {"user_id": "1", "nickname": "n", "avatar_url": ""})
+    room.idle_delete_at_s = svc._now_s() + 60
+    before = room.idle_delete_at_s
+
+    req = make_mocked_request("POST", "/poker/api/room/extend/extend-room?token=ok", match_info={"room_id": "extend-room"})
+    resp = asyncio.run(svc.handle_room_extend(req))
+    payload = _json_payload(resp)
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert room.idle_delete_at_s > before
+
+
+def test_idle_room_expired_is_deleted_and_not_recreated(tmp_path: Path) -> None:
+    svc = PokerService(tmp_path, _resolver)
+    room = svc._room("expired-room", ranked=False)
+    room.idle_delete_at_s = svc._now_s() - 1
+
+    svc._expire_idle_rooms()
+    assert "expired-room" not in svc._rooms
+
+    try:
+        svc._room("expired-room", ranked=False)
+    except web.HTTPGone as exc:
+        assert "room_expired" in exc.text
+    else:
+        raise AssertionError("expected room_expired")
