@@ -18,6 +18,7 @@ from .engine import (
     TableState,
     apply_action,
     gto_recommendations,
+    legal_actions,
     replay_scores,
     start_hand,
 )
@@ -281,6 +282,17 @@ class PokerService:
                 "replay": replay,
             }
         )
+
+    async def handle_state(self, request: web.Request) -> web.Response:
+        token = request.query.get("token", "")
+        profile = self._identity_resolver(token)
+        if not profile:
+            raise web.HTTPUnauthorized(text="invalid_token")
+        room_id = request.match_info.get("room_id", "")
+        ranked = bool(profile.get("ranked", False))
+        room = self._room(room_id, ranked=ranked)
+        user_id = str(profile["user_id"])
+        return web.json_response({"ok": True, "state": self._private_state_for_user(room.table, user_id)})
 
     async def handle_ranked_report(self, request: web.Request) -> web.Response:
         token = request.query.get("token", "")
@@ -680,10 +692,28 @@ class PokerService:
     def _private_state_for_user(self, table: TableState, user_id: str) -> dict[str, Any]:
         state = table.public()
         seat = self._seat_for_user(table, user_id)
+        hand_actions = [
+            {
+                "street": record.street,
+                "seat": record.seat,
+                "action": record.action,
+                "amount": record.amount,
+                "to_call": record.to_call,
+                "off_tree": record.off_tree,
+            }
+            for record in table.action_log
+            if record.hand_no == table.hand_no
+        ]
+        state["recent_actions"] = hand_actions[-10:]
         if seat is None:
             return state
         state["my_seat"] = seat
         state["my_hole"] = [str(card) for card in table.players[seat].hole]
+        state["legal"] = legal_actions(table, seat)
+        if table.street == "showdown":
+            state["showdown_hands"] = {
+                str(idx): [str(card) for card in player.hole] for idx, player in enumerate(table.players)
+            }
         return state
 
     async def _broadcast(self, room: Room, *, ack_action_id: int | None) -> None:
@@ -709,6 +739,7 @@ def register_poker_routes(app: web.Application, service: PokerService) -> None:
     app.router.add_get("/poker/ws/{room_id}", service.handle_ws)
     app.router.add_get("/poker/api/gto/{room_id}", service.handle_gto)
     app.router.add_get("/poker/api/replay/{room_id}", service.handle_replay)
+    app.router.add_get("/poker/api/state/{room_id}", service.handle_state)
     app.router.add_post("/poker/api/ranked/report/{room_id}", service.handle_ranked_report)
     app.router.add_get("/poker/api/ranked/leaderboard", service.handle_ranked_leaderboard)
     app.router.add_post("/poker/api/matchmaking/enqueue", service.handle_matchmaking_enqueue)
@@ -737,10 +768,11 @@ def secrets_token(rng: random.Random) -> str:
     return f"{rng.getrandbits(32):08x}"
 
 
-_LOBBY_HTML = """<!doctype html><html><body style='background:#111;color:#fff;font-family:sans-serif'>
-<h1>simajilord Poker</h1>
-<p>Discordの /poker コマンドでルームURLを発行してください。</p>
-</body></html>"""
+_LOBBY_HTML = """<!doctype html><html><body style='margin:0;background:radial-gradient(circle at 15% 10%,#334155 0,#020617 55%);color:#fff;font-family:Inter,system-ui,sans-serif;min-height:100vh;display:grid;place-items:center'>
+<div style='text-align:center;padding:32px;border:1px solid rgba(255,255,255,.2);border-radius:20px;background:rgba(15,23,42,.65);backdrop-filter:blur(8px)'>
+<h1 style='margin:0 0 10px;font-size:clamp(28px,4vw,44px);letter-spacing:.08em'>METEOBOT <span style='color:#38bdf8'>POKER</span></h1>
+<p style='margin:0;opacity:.8'>Discord の <b>/poker</b> コマンドで専用ルーム URL を作成してください。</p>
+</div></body></html>"""
 
 
 def _room_html(room_id: str, token: str, ranked: bool) -> str:
@@ -749,80 +781,190 @@ def _room_html(room_id: str, token: str, ranked: bool) -> str:
 <head>
 <meta charset='utf-8'/>
 <meta name='viewport' content='width=device-width,initial-scale=1'/>
-<title>Poker Room {room_id}</title>
+<title>Meteo Poker {room_id}</title>
 <style>
-  body {{ background:#0b1220; color:#e5e7eb; font-family:Inter,system-ui,sans-serif; margin:0; }}
-  .wrap {{ max-width:960px; margin:0 auto; padding:16px; }}
-  .card {{ background:#111827; border:1px solid #374151; border-radius:10px; padding:12px; margin-bottom:12px; }}
-  button {{ background:#2563eb; color:#fff; border:0; border-radius:8px; padding:8px 12px; margin:4px; cursor:pointer; }}
-  button.secondary {{ background:#374151; }}
-  input {{ background:#111827; color:#fff; border:1px solid #4b5563; border-radius:8px; padding:6px 8px; width:120px; }}
-  .mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }}
-  #state {{ white-space:pre-wrap; font-size:12px; max-height:260px; overflow:auto; }}
+:root {{
+  --bg:#020617;
+  --panel:rgba(15,23,42,.72);
+  --line:rgba(148,163,184,.35);
+  --soft:#cbd5e1;
+  --accent:#38bdf8;
+  --danger:#ef4444;
+  --ok:#22c55e;
+  --shadow:0 24px 60px rgba(0,0,0,.45);
+}}
+*{{box-sizing:border-box}}
+body {{
+  margin:0;
+  font-family:Inter,system-ui,sans-serif;
+  color:#f8fafc;
+  background:
+    radial-gradient(1000px 500px at 20% -10%, rgba(56,189,248,.25), transparent),
+    radial-gradient(1200px 500px at 90% 0%, rgba(239,68,68,.18), transparent),
+    linear-gradient(180deg, #0b1120 0%, var(--bg) 65%);
+  min-height:100vh;
+}}
+.wrap{{max-width:1200px;margin:0 auto;padding:22px;display:grid;gap:16px}}
+.hud{{display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:18px;padding:12px 16px}}
+.brand{{font-size:1.1rem;letter-spacing:.08em;font-weight:700}}
+.brand small{{display:block;color:var(--soft);font-weight:500;opacity:.8}}
+.chip{{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:rgba(15,23,42,.7)}}
+.grid{{display:grid;grid-template-columns:2fr 1fr;gap:16px}}
+@media (max-width:980px){{.grid{{grid-template-columns:1fr}}}}
+.panel{{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:14px;box-shadow:var(--shadow)}}
+.table{{position:relative;min-height:460px;background:radial-gradient(circle at 50% 35%, #0ea5a41f, #0f172a 58%, #020617);border-radius:26px;border:1px solid rgba(148,163,184,.3);overflow:hidden;padding:22px}}
+.table::before{{content:'';position:absolute;inset:18px;border-radius:300px;border:2px solid rgba(56,189,248,.22)}}
+.seat{{position:absolute;width:44%;padding:10px;border-radius:14px;background:rgba(2,6,23,.55);border:1px solid transparent}}
+.seat.active{{border-color:var(--accent);box-shadow:0 0 18px rgba(56,189,248,.45)}}
+#seat0{{top:36px;left:28px}}
+#seat1{{bottom:36px;right:28px}}
+.meta{{display:flex;justify-content:space-between;color:var(--soft);font-size:.84rem}}
+.cards{{display:flex;gap:10px;margin-top:8px}}
+.card{{width:58px;height:84px;border-radius:10px;background:linear-gradient(160deg,#fff,#dbeafe);color:#0f172a;display:grid;place-items:center;font-size:1.6rem;font-weight:700;box-shadow:0 6px 18px rgba(15,23,42,.35)}}
+.card.red{{color:#dc2626}}
+.card.back{{background:linear-gradient(160deg,#334155,#0f172a);color:#e2e8f0;font-size:.8rem;letter-spacing:.08em}}
+.board{{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;z-index:2}}
+.board .cards{{justify-content:center}}
+.stat{{display:flex;justify-content:center;gap:12px;margin-bottom:10px}}
+.stat span{{padding:6px 10px;border-radius:999px;border:1px solid var(--line);background:rgba(2,6,23,.58)}}
+.actions{{display:flex;gap:8px;flex-wrap:wrap}}
+button{{border:1px solid rgba(148,163,184,.35);border-radius:12px;padding:10px 12px;background:rgba(15,23,42,.85);color:#f8fafc;cursor:pointer;transition:.15s}}
+button:hover{{transform:translateY(-1px);border-color:var(--accent)}}
+button.primary{{background:linear-gradient(110deg,#0284c7,#2563eb)}}
+button.warn{{border-color:rgba(239,68,68,.5);color:#fecaca}}
+input{{flex:1;min-width:120px;border-radius:12px;border:1px solid var(--line);background:#0f172a;color:#fff;padding:10px}}
+#log{{max-height:360px;overflow:auto;display:grid;gap:6px}}
+.log-item{{padding:8px 10px;border-radius:10px;background:rgba(15,23,42,.6);border:1px solid rgba(148,163,184,.2);font-size:.88rem}}
+.muted{{opacity:.78;color:var(--soft)}}
 </style>
 </head>
 <body>
 <div class='wrap'>
-  <h2>HU NLHE Room {room_id}</h2>
-  <p>mode: <b>{'ranked' if ranked else 'casual'}</b> / GTO: <b>{'disabled' if ranked else 'enabled'}</b></p>
-
-  <div class='card'>
-    <div><b>My hole cards:</b> <span id='myHole' class='mono'>-</span></div>
-    <div><b>Board:</b> <span id='board' class='mono'>-</span></div>
-    <div><b>Street:</b> <span id='street'>waiting</span> / <b>Pot:</b> <span id='pot'>0</span></div>
-    <div><b>To act seat:</b> <span id='toAct'>-</span> / <b>My seat:</b> <span id='mySeat'>-</span></div>
+  <div class='hud'>
+    <div class='brand'>METEOBOT TEXAS HOLDEM<small>room {room_id}</small></div>
+    <div class='chip'>Mode: <b>{'RANKED' if ranked else 'CASUAL'}</b></div>
+    <div class='chip'>GTO: <b>{'LOCKED' if ranked else 'ENABLED'}</b></div>
+    <div class='chip'>Theme: <b>Neo Monochrome</b></div>
   </div>
+  <div class='grid'>
+    <section class='panel table'>
+      <div id='seat0' class='seat'><div class='meta'><b id='seat0Name'>Seat0</b><span id='seat0Stack'>0</span></div><div id='seat0Cards' class='cards'></div></div>
+      <div id='seat1' class='seat'><div class='meta'><b id='seat1Name'>Seat1</b><span id='seat1Stack'>0</span></div><div id='seat1Cards' class='cards'></div></div>
+      <div class='board'>
+        <div class='stat'>
+          <span>Street <b id='street'>waiting</b></span>
+          <span>Pot <b id='pot'>0</b></span>
+          <span>To Act <b id='toAct'>-</b></span>
+        </div>
+        <div id='boardCards' class='cards'></div>
+        <div class='muted' style='margin-top:10px'>Winner: <b id='winner'>-</b> / Reason: <b id='reason'>-</b></div>
+      </div>
+    </section>
 
-  <div class='card'>
-    <button onclick="send('start')">start</button>
-    <button onclick="send('next_hand')" class='secondary'>next_hand</button>
-    <button onclick="send('fold')" class='secondary'>fold</button>
-    <button onclick="send('check')">check</button>
-    <button onclick="send('call')">call</button>
-    <input id='raiseTo' type='number' step='100' min='0' placeholder='raise_to' />
-    <button onclick="sendRaise()">raise_to</button>
-    <button onclick="showGto()" class='secondary'>GTO</button>
-    <button onclick="showReplay()" class='secondary'>Replay</button>
-  </div>
-
-  <div class='card'>
-    <div><b>Players</b></div>
-    <div id='players' class='mono'>-</div>
-  </div>
-
-  <div class='card'>
-    <div><b>Raw state</b></div>
-    <div id='state' class='mono'></div>
+    <aside class='panel'>
+      <div class='actions'>
+        <button class='primary' onclick="send('start')">Start Hand</button>
+        <button onclick="send('next_hand')">Next Hand</button>
+        <button class='warn' onclick="send('fold')">Fold</button>
+        <button onclick="send('check')">Check</button>
+        <button onclick="send('call')">Call</button>
+      </div>
+      <div class='actions' style='margin-top:8px'>
+        <input id='raiseTo' type='number' step='100' min='0' placeholder='raise_to amount'>
+        <button onclick='sendRaise()'>Raise To</button>
+        <button onclick="send('allin')">All-in</button>
+      </div>
+      <div class='actions' style='margin-top:8px'>
+        <button onclick='showGto()'>GTO</button>
+        <button onclick='showReplay()'>Replay</button>
+        <button onclick='refreshState()'>Refresh API</button>
+      </div>
+      <p class='muted'>My seat: <b id='mySeat'>-</b> / Legal: <span id='legal'>-</span></p>
+      <div id='log'></div>
+    </aside>
   </div>
 </div>
 
 <script>
 let cid = 0;
+const SUIT = {{s:'♠', h:'♥', d:'♦', c:'♣'}};
+const isRed = (card) => card.endsWith('h') || card.endsWith('d');
 const $ = (id) => document.getElementById(id);
-const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/poker/ws/{room_id}?token={token}');
+const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host + '/poker/ws/{room_id}?token={token}');
 
-ws.onmessage = (e) => {{
-  const j = JSON.parse(e.data);
-  if (j.type !== 'state') return;
-  const st = j.state || {{}};
-  $('state').textContent = JSON.stringify(j, null, 2);
-  $('myHole').textContent = (st.my_hole || []).join(' ') || '-';
-  $('board').textContent = (st.board || []).join(' ') || '-';
+function cardNode(card, hidden) {{
+  const div = document.createElement('div');
+  if (hidden) {{
+    div.className = 'card back';
+    div.textContent = 'METEO';
+    return div;
+  }}
+  const rank = card.slice(0, -1);
+  const suit = SUIT[card.slice(-1)] || '?';
+  div.className = 'card' + (isRed(card) ? ' red' : '');
+  div.textContent = `${{rank}}${{suit}}`;
+  return div;
+}}
+
+function paintCards(nodeId, cards, hiddenCount=0) {{
+  const node = $(nodeId);
+  node.innerHTML = '';
+  if (!cards.length && hiddenCount===0) {{
+    node.appendChild(cardNode('', true));
+    return;
+  }}
+  if (hiddenCount > 0) {{
+    for (let i=0;i<hiddenCount;i++) node.appendChild(cardNode('', true));
+    return;
+  }}
+  cards.forEach((card)=> node.appendChild(cardNode(card, false)));
+}}
+
+function actionLabel(item) {{
+  const amount = item.amount ? ` ${{item.amount}}` : '';
+  const extra = item.off_tree ? ' ⚠off-tree' : '';
+  return `[${{item.street}}] seat${{item.seat}} ${{item.action}}${{amount}}${{extra}}`;
+}}
+
+function renderState(st) {{
   $('street').textContent = st.street || '-';
   $('pot').textContent = String(st.pot ?? '-');
   $('toAct').textContent = String(st.to_act ?? '-');
   $('mySeat').textContent = String(st.my_seat ?? '-');
-  const players = (st.players || []).map((p) => `seat${{p.seat}} ${{p.nickname}} stack=${{p.stack}} committed=${{p.committed}}`);
-  $('players').textContent = players.join(' | ') || '-';
+  $('winner').textContent = st.winner === null || st.winner === undefined ? '-' : `seat${{st.winner}}`;
+  $('reason').textContent = st.winner_reason || '-';
+  $('legal').textContent = (st.legal?.actions || []).map((a)=>a.action + (a.amount?`(${{a.amount}})`:'' )).join(', ') || '-';
+
+  const players = st.players || [];
+  [0,1].forEach((seat)=>{{
+    const p = players.find((x)=>x.seat===seat);
+    if (!p) return;
+    $(`seat${{seat}}Name`).textContent = `${{p.nickname}}${{st.my_seat===seat?' (YOU)':''}}`;
+    $(`seat${{seat}}Stack`).textContent = `stack ${{p.stack}} | commit ${{p.committed}}`;
+    const showdown = st.showdown_hands?.[String(seat)] || [];
+    const visible = st.my_seat===seat ? (st.my_hole || []) : showdown;
+    paintCards(`seat${{seat}}Cards`, visible, visible.length ? 0 : 2);
+    $(`seat${{seat}}`).classList.toggle('active', st.to_act===seat);
+  }});
+
+  paintCards('boardCards', st.board || []);
+  const logs = st.recent_actions || [];
+  $('log').innerHTML = logs.length ? logs.slice().reverse().map((item)=>`<div class='log-item'>${{actionLabel(item)}}</div>`).join('') : "<div class='log-item muted'>No actions yet.</div>";
+}}
+
+ws.onmessage = (e) => {{
+  const j = JSON.parse(e.data);
+  if (j.type === 'error') {{ alert(j.error); return; }}
+  if (j.type !== 'state') return;
+  renderState(j.state || {{}});
 }};
 
 function send(action, amount) {{
   cid += 1;
-  ws.send(JSON.stringify({{action, amount: amount||0, client_action_id: cid}}));
+  ws.send(JSON.stringify({{action, amount: amount || 0, client_action_id: cid}}));
 }}
-
 function sendRaise() {{
-  const n = parseInt(($('raiseTo').value || '0'), 10);
+  const n = parseInt($('raiseTo').value || '0', 10);
   send('raise_to', Number.isFinite(n) ? n : 0);
 }}
 
@@ -830,10 +972,14 @@ async function showGto() {{
   const r = await fetch('/poker/api/gto/{room_id}?token={token}');
   alert(JSON.stringify(await r.json(), null, 2));
 }}
-
 async function showReplay() {{
   const r = await fetch('/poker/api/replay/{room_id}?token={token}');
   alert(JSON.stringify(await r.json(), null, 2));
+}}
+async function refreshState() {{
+  const r = await fetch('/poker/api/state/{room_id}?token={token}');
+  const data = await r.json();
+  if (data?.state) renderState(data.state);
 }}
 </script>
 </body>

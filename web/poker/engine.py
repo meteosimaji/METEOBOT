@@ -73,6 +73,7 @@ class TableState:
     min_raise_to: int = 0
     current_bet: int = 0
     winner: int | None = None
+    winner_reason: str = ""
     action_log: list[ActionRecord] = field(default_factory=list)
     server_seq: int = 0
     seed_commit: str = ""
@@ -108,6 +109,7 @@ class TableState:
             "min_raise_to": self.min_raise_to,
             "current_bet": self.current_bet,
             "winner": self.winner,
+            "winner_reason": self.winner_reason,
             "server_seq": self.server_seq,
             "seed_commit": self.seed_commit,
             "seed_reveal": self.seed_reveal if self.street == "showdown" else "",
@@ -145,6 +147,7 @@ def start_hand(table: TableState, rng: random.Random) -> None:
     table.pot = 0
     table.street = "preflop"
     table.winner = None
+    table.winner_reason = ""
     table.current_bet = table.bb
     table.min_raise_to = table.bb * 2
     table.seed_reveal = f"{table.room_id}:{table.hand_no}:{rng.random():.24f}"
@@ -300,6 +303,48 @@ def gto_recommendations(table: TableState, seat: int) -> dict[str, Any]:
     }
 
 
+def legal_actions(table: TableState, seat: int) -> dict[str, Any]:
+    if table.street not in STREETS:
+        return {"actions": []}
+    if seat != table.to_act:
+        return {"actions": []}
+    player_state = table.players[seat]
+    opponent_state = table.players[_other(seat)]
+    if player_state.folded or player_state.all_in:
+        return {"actions": []}
+
+    to_call = max(0, opponent_state.committed - player_state.committed)
+    can_raise_to = max(table.min_raise_to, player_state.committed + to_call + table.bb)
+    all_in_to = player_state.committed + player_state.stack
+    min_raise_to = min(can_raise_to, all_in_to)
+    raise_targets = sorted({
+        min(all_in_to, target)
+        for target in _raise_sizes_for_state(table)
+        if target > player_state.committed
+    })
+    if min_raise_to > player_state.committed:
+        raise_targets.append(min_raise_to)
+    raise_targets = sorted({target for target in raise_targets if target > player_state.committed and target <= all_in_to})
+
+    actions: list[dict[str, Any]] = []
+    if to_call == 0:
+        actions.append({"action": "check"})
+    else:
+        actions.append({"action": "fold"})
+        actions.append({"action": "call", "amount": to_call})
+    for target in raise_targets:
+        if target == all_in_to:
+            continue
+        actions.append({"action": "raise_to", "amount": target})
+    actions.append({"action": "allin", "amount": all_in_to})
+    return {
+        "to_call": to_call,
+        "min_raise_to": min_raise_to,
+        "all_in_to": all_in_to,
+        "actions": actions,
+    }
+
+
 def apply_action(table: TableState, seat: int, action: str, amount: int = 0) -> ActionRecord:
     if table.street not in STREETS:
         raise GameRuleError("hand_not_running")
@@ -437,6 +482,7 @@ def _award_fold(table: TableState) -> None:
     _collect_committed_for_new_street(table)
     if table.winner is None:
         return
+    table.winner_reason = "fold"
     table.players[table.winner].stack += table.pot
     table.pot = 0
     table.street = "showdown"
@@ -454,17 +500,35 @@ def _resolve_showdown(table: TableState) -> None:
     rank1 = best_rank(table.players[1].hole + table.board)
     if rank0 > rank1:
         table.winner = 0
+        table.winner_reason = hand_rank_name(rank0[0])
         table.players[0].stack += table.pot
     elif rank1 > rank0:
         table.winner = 1
+        table.winner_reason = hand_rank_name(rank1[0])
         table.players[1].stack += table.pot
     else:
         split = table.pot // 2
         table.players[0].stack += split
         table.players[1].stack += table.pot - split
         table.winner = None
+        table.winner_reason = "split_pot"
     table.pot = 0
     table.street = "showdown"
+
+
+def hand_rank_name(rank_index: int) -> str:
+    names = {
+        0: "high_card",
+        1: "one_pair",
+        2: "two_pair",
+        3: "three_of_a_kind",
+        4: "straight",
+        5: "flush",
+        6: "full_house",
+        7: "four_of_a_kind",
+        8: "straight_flush",
+    }
+    return names.get(rank_index, "unknown")
 
 
 def best_rank(cards: list[Card]) -> tuple[int, list[int]]:
